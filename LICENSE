@@ -1,0 +1,150 @@
+The Glassbox License — Version 1.0
+
+Copyright (c) 2026 Cube1ber ("Licensor")
+Contact: @Cube1ber on X (https://x.com/Cube1ber) or the official upstream
+repository designated by the Licensor.
+
+================================================================================
+
+1. Acceptance
+   By copying, modifying, running, hosting, or distributing the Software, You
+   agree to this License. If You act on behalf of an organization, You confirm
+   You have authority to bind it, and "You" includes that organization and its
+   Affiliates. If You do not agree, You have no rights in the Software beyond
+   those applicable law grants without a license.
+
+2. Definitions
+   (a) "Software" means the source code, binaries, and documentation made
+       available by the Licensor under this License.
+   (b) "Licensor" means Cube1ber and Cube1ber's heirs, successors, assigns,
+       and any entity Cube1ber designates or controls to hold rights in the
+       upstream project.
+   (c) "Contributor" means anyone who submits a Contribution. "Contribution"
+       means any code, documentation, or other material intentionally
+       submitted to the Licensor for inclusion in the Software, including by
+       pull request, patch, or issue.
+   (d) "Downstream Code" means any fork, modified version, derivative work, or
+       combined program that incorporates or is based on the Software or a
+       substantial portion of it. It does not include separate works that are
+       merely stored, processed, or versioned by the Software, or merely
+       aggregated with it on a storage or distribution medium.
+   (e) "Source" means the preferred form for making modifications, including
+       build and configuration files and the full version-control history as
+       maintained in the ordinary course of development, but excluding
+       secrets, credentials, private keys, and end-user personal data.
+   (f) "Affiliate" means any entity that controls, is controlled by, or is
+       under common control with You, where "control" means ownership of more
+       than 50% of the voting interests.
+   (g) "Written Request" means a request sent by email, repository issue or
+       pull request, direct message on X, or to any other contact published
+       for You, Your Downstream Code, or the domain on which it is hosted. A
+       Written Request is deemed received 24 hours after it is sent.
+
+3. Grant of Rights
+   (a) Subject to Your ongoing compliance with Sections 4, 5, and 6, each of
+       which is a condition of this license, the Licensor grants You a
+       worldwide, royalty-free, non-exclusive license to use, copy, modify,
+       distribute, sell, and host (including as a commercial or SaaS service)
+       the Software, and to sublicense it only as Section 5 permits.
+   (b) The Licensor also grants You, on the same conditions, a royalty-free
+       license under any patent claims of the Licensor necessarily infringed
+       by the unmodified Software as distributed by the Licensor.
+   (c) No trademark rights are granted except as needed to comply with
+       Section 4. All rights not expressly granted are reserved.
+
+4. Attribution
+   (a) Keep the Licensor's copyright notice and this License in every source
+       copy of the Software or Downstream Code.
+   (b) When You distribute binaries or offer the Software or Downstream Code
+       over a network, include the copyright notice and this License in the
+       accompanying documentation or an about/legal screen, and prominently
+       credit Cube1ber as the original creator.
+   (c) Mark Your modifications as changed, with dates. Do not state or imply
+       that the Licensor endorses Your Downstream Code.
+
+5. Licensing of Downstream Code
+   Whenever You create, maintain, deploy, host, or distribute Downstream Code,
+   that Downstream Code must be governed as a whole by exactly one of:
+
+   (a) This License (Glassbox). You may keep Downstream Code private,
+       provided that:
+       (i)   You grant the Licensor a perpetual, irrevocable, worldwide,
+             royalty-free, non-exclusive, transferable, and sublicensable
+             copyright and patent license to use, copy, modify, merge,
+             distribute, and relicense any part of Your Downstream Code in
+             any project of the Licensor, under any license (open-source or
+             proprietary), and You waive, and agree not to assert, any moral
+             rights that would restrict this;
+       (ii)  if the complete Source of Your Downstream Code is not publicly
+             available, You give the Licensor, free of charge and within 14
+             days of receiving a Written Request, either read-only access to
+             the repository or a complete archive of the Source, without
+             squashing, rewriting, or removing version-control history to
+             avoid disclosure;
+       (iii) You have the right to grant the license in (i) for Your own
+             contributions;
+       (iv)  You clearly identify any third-party code You cannot sublicense
+             under (i), along with its license terms; and
+       (v)   whenever You host or distribute Downstream Code, You include a
+             working email address or repository URL alongside the notices
+             required by Section 4(b).
+
+   (b) GPL-3.0-only. You comply with the GNU General Public License,
+       version 3, and preserve the notices required by Section 4 as
+       permitted by GPLv3 Section 7(b) and 7(c).
+
+   You may not license Downstream Code under any other terms, or impose any
+   restriction that prevents others from exercising rights under the chosen
+   license.
+
+6. No Circumvention
+   You may not evade this License through Affiliates, contractors, shell
+   entities, wrappers, or obfuscation. Downstream Code developed for You or at
+   Your direction is treated as Your Downstream Code.
+
+7. Contributions
+   Each Contributor grants the Licensor, for each Contribution, the same
+   license and moral-rights covenant described in Section 5(a)(i), and
+   confirms they have the right to do so.
+
+8. Termination
+   (a) Your rights under Section 3 end automatically if You breach Section 4,
+       5, or 6, or if You bring a patent claim alleging that the Software
+       infringes a patent.
+   (b) If it is Your first breach and it was not willful, Your rights are
+       reinstated if You fully cure it within 30 days after notice from the
+       Licensor. Cure does not waive liability for the breach.
+   (c) Termination does not affect recipients who received the Software from
+       You and remain in compliance.
+   (d) You agree that a breach of Section 4, 5, or 6 causes the Licensor
+       irreparable harm, and that the Licensor may seek injunctive relief in
+       addition to any other remedy.
+   (e) Section 5(a)(i) and (ii) survive termination for all Downstream Code
+       created, modified, or deployed before termination. Sections 7 through
+       10 also survive.
+
+9. No Warranty; Limitation of Liability
+   (a) THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+       OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR
+       PURPOSE, TITLE, AND NON-INFRINGEMENT.
+   (b) TO THE FULLEST EXTENT PERMITTED BY LAW, THE LICENSOR AND CONTRIBUTORS
+       ARE NOT LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+       CONSEQUENTIAL, OR PUNITIVE DAMAGES ARISING FROM THIS LICENSE OR THE
+       SOFTWARE, UNDER ANY LEGAL THEORY, EVEN IF ADVISED OF THEIR POSSIBILITY.
+   (c) Any warranty or support You offer is on Your own behalf only. You will
+       indemnify the Licensor and Contributors against third-party claims
+       arising from (i) any warranty, support, or representation You offer to
+       others, or (ii) Your modifications, or Your commercial distribution or
+       operation of Downstream Code.
+
+10. General
+    (a) The Licensor may offer the Software under other terms by separate
+        signed agreement, which controls over this License where they
+        conflict.
+    (b) If any provision is unenforceable, it is to be enforced to the
+        maximum extent permitted, and the rest of this License remains in
+        effect.
+    (c) Failure or delay in enforcing any right is not a waiver.
+    (d) This License is the entire agreement between You and the Licensor
+        regarding the Software. The English-language version controls over
+        any translation. Headings do not affect interpretation.
