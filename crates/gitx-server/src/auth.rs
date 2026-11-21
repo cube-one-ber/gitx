@@ -1,3 +1,4 @@
+use crate::state::AppState;
 use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
@@ -6,6 +7,8 @@ use gitx_crypto::{AclPolicy, Principal};
 use gitx_store::ObjectStore;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
+use tonic::Status;
+use tonic::metadata::MetadataMap;
 
 pub const HEADER_USER: &str = "x-gitx-user";
 pub const HEADER_TEAMS: &str = "x-gitx-teams";
@@ -182,6 +185,76 @@ pub fn can_publish_embargo(policy: &AclPolicy, principal: &Principal, cs: &Chang
         return true;
     }
     policy.can_read_changeset(principal, cs)
+}
+
+/// Extract and authenticate a [`Principal`] from incoming gRPC [`MetadataMap`].
+///
+/// - If `authorization` metadata is present, it MUST use the `Bearer <token>` scheme and
+///   match a registered token in [`AppState`], otherwise `Status::unauthenticated` is returned.
+/// - If `authorization` is absent, falls back to `x-gitx-*` metadata headers if present,
+///   or [`Principal::anonymous()`] (which can ONLY read `public`).
+pub fn extract_principal_from_grpc_metadata(
+    state: &AppState,
+    metadata: &MetadataMap,
+) -> std::result::Result<Principal, Status> {
+    if let Some(auth_val) = metadata.get("authorization") {
+        let raw = auth_val
+            .to_str()
+            .map_err(|_| Status::unauthenticated("authorization metadata must be valid ASCII"))?
+            .trim();
+
+        let Some((scheme, token)) = raw.split_once(' ') else {
+            return Err(Status::unauthenticated(
+                "invalid authorization metadata; expected 'Bearer <token>'",
+            ));
+        };
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return Err(Status::unauthenticated(
+                "unsupported authorization scheme; expected 'Bearer <token>'",
+            ));
+        }
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(Status::unauthenticated("empty bearer token"));
+        }
+
+        return state
+            .resolve_token(token)
+            .ok_or_else(|| Status::unauthenticated("invalid or unrecognized bearer token"));
+    }
+
+    let Some(user) = metadata_str(metadata, HEADER_USER).filter(|s| !s.is_empty()) else {
+        return Ok(Principal::anonymous());
+    };
+
+    let mut principal = Principal::user(user);
+
+    if let Some(teams_raw) = metadata_str(metadata, HEADER_TEAMS) {
+        let teams = split_csv(teams_raw);
+        if !teams.is_empty() {
+            principal = principal.with_teams(teams);
+        }
+    }
+
+    if let Some(roles_raw) = metadata_str(metadata, HEADER_ROLES) {
+        let roles = split_csv(roles_raw);
+        if !roles.is_empty() {
+            principal = principal.with_roles(roles);
+        }
+    }
+
+    if let Some(fp) = metadata_str(metadata, HEADER_FINGERPRINT).filter(|s| !s.is_empty()) {
+        principal = principal.with_fingerprint(fp);
+    }
+
+    Ok(principal)
+}
+
+fn metadata_str<'a>(metadata: &'a MetadataMap, name: &str) -> Option<&'a str> {
+    metadata
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

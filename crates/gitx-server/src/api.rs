@@ -1723,6 +1723,106 @@ pub async fn derived_stats(
 // Internal Helpers
 // ---------------------------------------------------------------------------
 
+pub(crate) struct AuthorizedBlob {
+    pub path: String,
+    pub domain: String,
+    pub blob_hash: String,
+    pub size: u64,
+    pub content: Vec<u8>,
+}
+
+/// Strictly ACL-filtered single-blob lookup used by the gRPC `ReadBlob` RPC.
+///
+/// Only files reachable inside the caller's authorized visibility domains for the resolved
+/// visible ChangeSet can be read. Unauthorized paths and hashes return `NotFound` to prevent
+/// existence/ciphertext leaks.
+pub(crate) fn read_blob_authorized(
+    state: &AppState,
+    principal: &Principal,
+    owner: &str,
+    name: &str,
+    rev: Option<&str>,
+    path: &str,
+    blob_hash_filter: Option<&str>,
+) -> ApiResult<AuthorizedBlob> {
+    let trimmed_path = path.trim();
+    let trimmed_hash = blob_hash_filter.map(str::trim).filter(|s| !s.is_empty());
+
+    if trimmed_path.is_empty() && trimmed_hash.is_none() {
+        return Err(ApiError::bad_request(
+            "read_blob requires either 'path' or 'blob_hash'",
+        ));
+    }
+
+    let repo = get_existing_repo(state, owner, name)?;
+    let policy = repo.acl_snapshot()?;
+
+    let Some(cs) = resolve_visible_changeset(repo.store.as_ref(), &policy, principal, rev)? else {
+        return Err(ApiError::not_found(format!(
+            "revision not found in repository '{owner}/{name}'"
+        )));
+    };
+
+    let filtered = policy.filter_domain_trees(principal, &cs);
+    let ordered = ordered_domain_entries(&filtered, &cs.visibility.primary_domain);
+
+    if !trimmed_path.is_empty() {
+        let norm_path = normalize_repo_path(trimmed_path)?;
+        let expected_hash = trimmed_hash.map(ObjectHash::from_str).transpose()?;
+
+        for (dom, tree_hash) in ordered.into_iter().rev() {
+            let tree = repo.store.get_tree(tree_hash)?;
+            if let Some(EntryKind::File {
+                blob_hash, size, ..
+            }) = tree.entries.get(&norm_path)
+            {
+                if expected_hash.is_some_and(|exp| exp != *blob_hash) {
+                    continue;
+                }
+                let content = repo.store.read_blob_bytes(*blob_hash)?;
+                return Ok(AuthorizedBlob {
+                    path: norm_path,
+                    domain: dom.to_string(),
+                    blob_hash: blob_hash.to_hex(),
+                    size: *size,
+                    content,
+                });
+            }
+        }
+
+        return Err(ApiError::not_found(format!(
+            "path '{norm_path}' not found at revision {}",
+            cs.id
+        )));
+    }
+
+    let target_hash = ObjectHash::from_str(trimmed_hash.expect("checked non-empty"))?;
+    for (dom, tree_hash) in ordered.into_iter().rev() {
+        let tree = repo.store.get_tree(tree_hash)?;
+        for (entry_path, entry) in &tree.entries {
+            if let EntryKind::File {
+                blob_hash, size, ..
+            } = entry
+                && *blob_hash == target_hash
+            {
+                let content = repo.store.read_blob_bytes(*blob_hash)?;
+                return Ok(AuthorizedBlob {
+                    path: entry_path.clone(),
+                    domain: dom.to_string(),
+                    blob_hash: blob_hash.to_hex(),
+                    size: *size,
+                    content,
+                });
+            }
+        }
+    }
+
+    Err(ApiError::not_found(format!(
+        "blob '{target_hash}' not found at revision {}",
+        cs.id
+    )))
+}
+
 pub(crate) fn get_existing_repo(
     state: &AppState,
     owner: &str,

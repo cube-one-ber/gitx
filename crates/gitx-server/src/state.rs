@@ -2,7 +2,7 @@ use crate::derived::DerivedIndex;
 use crate::queue::{ConflictResolverFn, MergeQueue};
 use gitx_context::ContextStore;
 use gitx_core::{DomainId, EntryKind, GitxError, Result};
-use gitx_crypto::AclPolicy;
+use gitx_crypto::{AclPolicy, Principal};
 use gitx_store::{LocalStore, ObjectStore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,12 +11,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-/// Configuration for the GitX HTTP + Git Smart HTTP server.
+/// Configuration for the GitX HTTP + gRPC + Git Smart HTTP server.
 #[derive(Clone)]
 pub struct ServerConfig {
     pub data_dir: PathBuf,
     pub default_acl: Option<String>,
     pub conflict_resolver: Option<ConflictResolverFn>,
+    pub tokens: BTreeMap<String, Principal>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -25,6 +26,7 @@ impl fmt::Debug for ServerConfig {
             .field("data_dir", &self.data_dir)
             .field("default_acl", &self.default_acl)
             .field("conflict_resolver", &self.conflict_resolver.is_some())
+            .field("token_count", &self.tokens.len())
             .finish()
     }
 }
@@ -35,6 +37,7 @@ impl ServerConfig {
             data_dir: data_dir.into(),
             default_acl: None,
             conflict_resolver: None,
+            tokens: BTreeMap::new(),
         }
     }
 
@@ -45,6 +48,12 @@ impl ServerConfig {
 
     pub fn with_conflict_resolver(mut self, resolver: ConflictResolverFn) -> Self {
         self.conflict_resolver = Some(resolver);
+        self
+    }
+
+    /// Registers a bearer authentication token mapped to `principal` for gRPC/API calls.
+    pub fn with_token(mut self, token: impl Into<String>, principal: Principal) -> Self {
+        self.tokens.insert(token.into(), principal);
         self
     }
 }
@@ -162,18 +171,43 @@ impl RepoHandle {
     }
 }
 
-/// Shared multi-repository state for the GitX HTTP server.
+/// Shared multi-repository state for the GitX HTTP and gRPC servers.
 pub struct AppState {
     pub config: ServerConfig,
     repos: RwLock<BTreeMap<(String, String), Arc<RepoHandle>>>,
+    tokens: RwLock<BTreeMap<String, Principal>>,
 }
 
 impl AppState {
     pub fn new(config: ServerConfig) -> Self {
+        let initial_tokens = config.tokens.clone();
         Self {
             config,
             repos: RwLock::new(BTreeMap::new()),
+            tokens: RwLock::new(initial_tokens),
         }
+    }
+
+    /// Register or replace a bearer token mapping at runtime.
+    pub fn register_token(&self, token: impl Into<String>, principal: Principal) {
+        if let Ok(mut guard) = self.tokens.write() {
+            guard.insert(token.into(), principal);
+        }
+    }
+
+    /// Revoke a previously registered bearer token.
+    pub fn revoke_token(&self, token: &str) {
+        if let Ok(mut guard) = self.tokens.write() {
+            guard.remove(token);
+        }
+    }
+
+    /// Resolve a bearer token to its authenticated [`Principal`].
+    pub fn resolve_token(&self, token: &str) -> Option<Principal> {
+        self.tokens
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(token).cloned())
     }
 
     fn repos_base_dir(&self) -> PathBuf {

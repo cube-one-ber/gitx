@@ -5,6 +5,7 @@ pub mod auth;
 pub mod derived;
 pub mod error;
 pub mod git_http;
+pub mod grpc;
 pub mod queue;
 pub mod state;
 
@@ -16,13 +17,14 @@ pub use api::{
 };
 pub use auth::{
     AuthenticatedPrincipal, HEADER_FINGERPRINT, HEADER_ROLES, HEADER_TEAMS, HEADER_USER,
-    allowed_domains_for_repo, extract_principal,
+    allowed_domains_for_repo, extract_principal, extract_principal_from_grpc_metadata,
 };
 pub use derived::{
     CommitGraphIndex, CommitGraphNode, DerivedIndex, DerivedStats, PathHistoryIndex, TrigramIndex,
     TrigramSearchIndex,
 };
 pub use error::{ApiError, ApiResult};
+pub use grpc::{GitxGrpcService, serve_grpc, serve_grpc_addr};
 pub use queue::{
     ConflictResolverFn, DrainRequest, DrainResponse, EnqueueRequest, EnqueueResponse, MergeQueue,
     QueueEntry, QueueListQuery, QueueListResponse, QueueStatus,

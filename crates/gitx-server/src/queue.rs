@@ -301,7 +301,7 @@ pub async fn list_queue(
     }))
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DrainRequest {
     #[serde(default = "default_target")]
     pub target: String,
