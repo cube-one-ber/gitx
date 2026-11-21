@@ -6,7 +6,30 @@
 
 Source control shouldn't be 100% or 0% access, lock branches inside clunky worktrees, force every CI job to clone gigabytes of history, or lose the *why* behind every change. **GitX** rethinks version control from first principles while keeping an incremental, lossless interoperability bridge with Git.
 
-> **Status:** Architecture & Planning phase. See [PLAN.md](PLAN.md) for the full technical design, crate layout, and 6-phase implementation roadmap.
+> **Status:** Working Rust workspace (9 crates, 76 passing unit/integration/E2E tests, zero clippy warnings). See [PLAN.md](PLAN.md) for the full technical design and roadmap.
+
+## Quickstart
+
+```bash
+# Build & test the full workspace
+cargo test --workspace
+
+# Run the CLI
+cargo run --bin gitx -- --help
+
+# Initialize a repo (or --colocate inside an existing Git repo)
+gitx init
+gitx status
+gitx describe -m "Initial feature"
+gitx land --target master
+
+# Native encrypted .env secrets & ACL-filtered Git export
+gitx secret set .env --domain secret:dev
+gitx git-export /tmp/public-mirror --domains public
+
+# Start the always-online zero-clone + ACL-filtered Git Smart HTTP server
+gitx serve --addr 127.0.0.1:7878
+```
 
 ---
 

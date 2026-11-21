@@ -1,0 +1,18 @@
+[package]
+name = "gitx-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+gitx-core.workspace = true
+gitx-store.workspace = true
+globset.workspace = true
+reflink-copy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

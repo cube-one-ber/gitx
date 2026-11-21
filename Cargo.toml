@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gitx-core",
+    "crates/gitx-store",
+    "crates/gitx-crypto",
+    "crates/gitx-merge",
+    "crates/gitx-vfs",
+    "crates/gitx-context",
+    "crates/gitx-git-bridge",
+    "crates/gitx-server",
+    "crates/gitx-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+gitx-core = { path = "crates/gitx-core" }
+gitx-store = { path = "crates/gitx-store" }
+gitx-crypto = { path = "crates/gitx-crypto" }
+gitx-merge = { path = "crates/gitx-merge" }
+gitx-vfs = { path = "crates/gitx-vfs" }
+gitx-context = { path = "crates/gitx-context" }
+gitx-git-bridge = { path = "crates/gitx-git-bridge" }
+gitx-server = { path = "crates/gitx-server" }
+
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+bincode = "1.3"
+blake3 = "1.5"
+bytes = "1"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+fastcdc = "3.1"
+flate2 = "1"
+globset = "0.4"
+hex = "0.4"
+hkdf = "0.12"
+lz4_flex = "0.11"
+rand = "0.8"
+reflink-copy = "0.1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+similar = "2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = { version = "1", features = ["serde"] }
+walkdir = "2"
+x25519-dalek = { version = "2", features = ["static_secrets", "serde"] }
+zeroize = { version = "1", features = ["derive"] }
+proptest = "1"

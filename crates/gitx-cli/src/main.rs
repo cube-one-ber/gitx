@@ -1,0 +1,396 @@
+mod commands;
+mod repo;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    name = "gitx",
+    version,
+    about = "GitX — Visibility-domain VCS with native secrets, lock-free workspaces, stacked diffs, and durable AI context"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize a new gitx repository (optionally colocated with an existing .git repository)
+    Init {
+        /// Import history from an existing colocated .git repository
+        #[arg(long)]
+        colocate: bool,
+        /// Author name for commits
+        #[arg(long)]
+        name: Option<String>,
+        /// Author email for commits
+        #[arg(long)]
+        email: Option<String>,
+    },
+
+    /// Auto-snapshot working copy and show status grouped by visibility domain
+    Status,
+
+    /// Show unified diff vs parent, or revision-to-revision interdiff
+    Diff {
+        /// Compare previous revision vs current revision of the same ChangeId
+        #[arg(long)]
+        interdiff: bool,
+        /// Source revision hash, ChangeId, or bookmark
+        #[arg(long)]
+        from: Option<String>,
+        /// Target revision hash, ChangeId, or bookmark
+        #[arg(long)]
+        to: Option<String>,
+    },
+
+    /// Display ChangeSet history with visibility domains, agent metadata, and conflict badges
+    Log {
+        /// Maximum number of ChangeSets to display
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Show ChangeSets from all visibility domains
+        #[arg(long)]
+        all_domains: bool,
+    },
+
+    /// Snapshot current `@` and start a new child ChangeSet on top
+    New {
+        /// Description for the new ChangeSet
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Primary visibility domain (e.g., public, team:core, private:user:alice)
+        #[arg(long)]
+        visibility: Option<String>,
+        /// Automatically promote private change to public on land
+        #[arg(long)]
+        reveal_on_land: bool,
+        /// Record an AI agent committer (`<harness>:<model>`)
+        #[arg(long)]
+        agent: Option<String>,
+    },
+
+    /// Update the description of the current `@` ChangeSet as a new immutable revision
+    Describe {
+        /// New description text
+        #[arg(short = 'm', long = "message")]
+        message: String,
+    },
+
+    /// Manage native stacked diffs
+    Stack {
+        #[command(subcommand)]
+        action: StackAction,
+    },
+
+    /// Atomically land the current ChangeSet onto a target bookmark (default: master)
+    Land {
+        /// Target bookmark to land onto
+        #[arg(long, default_value = "master")]
+        target: String,
+    },
+
+    /// O(1) atomic revert of a previously landed sequence number
+    Revert {
+        /// Monotonic land_seq assigned by `gitx land`
+        land_seq: u64,
+    },
+
+    /// Inspect the immutable operation log
+    Op {
+        #[command(subcommand)]
+        action: OpAction,
+    },
+
+    /// Restore the previous OpLog snapshot (bookmarks, workspaces, and working tree)
+    Undo,
+
+    /// Manage lock-free concurrent workspaces
+    Ws {
+        #[command(subcommand)]
+        action: WsAction,
+    },
+
+    /// Manage native envelope-encrypted secrets inside `secret:*` domains
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+
+    /// Manage embargoed security ChangeSets and coordinated disclosure
+    Embargo {
+        #[command(subcommand)]
+        action: EmbargoAction,
+    },
+
+    /// Record durable "Why" context records anchored to code ranges
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
+
+    /// Query durable "Why" context for a file line (`<path>:<line>`)
+    Why {
+        /// Target file and 1-based line (`<path>:<line>`)
+        target: String,
+        /// Comma-separated authorized visibility domains
+        #[arg(long, default_value = "public")]
+        domains: String,
+    },
+
+    /// Manage sub-commit AI agent checkpoints with human-edit-preserving undo
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+
+    /// Export an ACL-filtered Git repository containing only authorized domains
+    GitExport {
+        /// Target directory for the exported Git repository
+        target_dir: PathBuf,
+        /// Comma-separated visibility domains to export
+        #[arg(long, default_value = "public")]
+        domains: String,
+    },
+
+    /// Cross-machine overlay sync for local files (`.env`, `.env.local`, configs)
+    Fleet {
+        #[command(subcommand)]
+        action: FleetAction,
+    },
+
+    /// Start the GitX HTTP/JSON and ACL-filtered Git Smart HTTP server
+    Serve {
+        /// Listen address (host:port)
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        addr: String,
+        /// Server data directory
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StackAction {
+    /// Create a named stack from open changes above master
+    Create { name: String },
+    /// List all stacks
+    List,
+    /// Restack open stack changes onto latest master (recording conflicts without failing)
+    Sync,
+}
+
+#[derive(Subcommand)]
+enum OpAction {
+    /// Show recent entries from the immutable operation log
+    Log {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum WsAction {
+    /// Add a new lock-free workspace off master
+    Add {
+        name: String,
+        /// Target directory for a Copy-on-Write disk workspace
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Create an in-memory workspace instead of a disk workspace
+        #[arg(long)]
+        mem: bool,
+    },
+    /// List registered workspaces
+    List,
+    /// Remove a registered workspace
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Encrypt and store a local file inside a `secret:*` domain tree
+    Set {
+        path: String,
+        #[arg(long, default_value = "secret:dev")]
+        domain: String,
+    },
+    /// Decrypt and print a secret file from a `secret:*` domain tree
+    Get {
+        path: String,
+        #[arg(long, default_value = "secret:dev")]
+        domain: String,
+    },
+    /// Generate a new X25519 + Ed25519 recipient keypair and print its PublicKeyBundle JSON
+    Keygen { name: String },
+    /// Grant a recipient's PublicKeyBundle JSON access to future secret encryptions
+    Grant { name: String, pubkey_json: String },
+    /// Rotate a secret's DEK to epoch+1, optionally dropping a revoked recipient fingerprint
+    Rotate {
+        path: String,
+        #[arg(long, default_value = "secret:dev")]
+        domain: String,
+        #[arg(long)]
+        drop: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EmbargoAction {
+    /// Create an embargoed security ChangeSet isolated from public projections
+    Create {
+        advisory: String,
+        /// Team or domain allowed to read the embargoed change (repeatable or comma-separated)
+        #[arg(long = "allow", required = true)]
+        allow: Vec<String>,
+        /// Description for the embargoed ChangeSet
+        #[arg(short = 'm', long = "message")]
+        message: String,
+    },
+    /// Publish an active embargoed advisory, promoting it to public
+    Publish { advisory: String },
+}
+
+#[derive(Subcommand)]
+enum ContextAction {
+    /// Attach a durable prompt/rationale record anchored to a code range
+    Add {
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        path: String,
+        /// 1-based line range (`start-end` or single line)
+        #[arg(long)]
+        lines: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        harness: Option<String>,
+        #[arg(long, default_value = "public")]
+        visibility: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckpointAction {
+    /// Save a sub-commit agent checkpoint of the current working tree
+    Save {
+        #[arg(short = 'm', long = "message")]
+        message: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// List checkpoints for the active workspace
+    List,
+    /// Undo an agent checkpoint while preserving subsequent human edits via 3-way inverse patch
+    Undo { checkpoint_id: String },
+}
+
+#[derive(Subcommand)]
+enum FleetAction {
+    /// Export local overlay files to a portable JSON bundle
+    Export {
+        bundle_path: PathBuf,
+        /// Comma-separated glob patterns to include
+        #[arg(long, default_value = ".env,.env.local")]
+        include: String,
+    },
+    /// Apply a fleet overlay bundle onto the current directory
+    Apply { bundle_path: PathBuf },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Init {
+            colocate,
+            name,
+            email,
+        } => commands::core::cmd_init(colocate, name, email),
+        Commands::Status => commands::core::cmd_status(),
+        Commands::Diff {
+            interdiff,
+            from,
+            to,
+        } => commands::core::cmd_diff(interdiff, from, to),
+        Commands::Log { limit, all_domains } => commands::core::cmd_log(limit, all_domains),
+        Commands::New {
+            message,
+            visibility,
+            reveal_on_land,
+            agent,
+        } => commands::core::cmd_new(message, visibility, reveal_on_land, agent),
+        Commands::Describe { message } => commands::core::cmd_describe(message),
+        Commands::Stack { action } => match action {
+            StackAction::Create { name } => commands::stack::cmd_stack_create(name),
+            StackAction::List => commands::stack::cmd_stack_list(),
+            StackAction::Sync => commands::stack::cmd_stack_sync(),
+        },
+        Commands::Land { target } => commands::stack::cmd_land(target),
+        Commands::Revert { land_seq } => commands::stack::cmd_revert(land_seq),
+        Commands::Op { action } => match action {
+            OpAction::Log { limit } => commands::stack::cmd_op_log(limit),
+        },
+        Commands::Undo => commands::stack::cmd_undo(),
+        Commands::Ws { action } => match action {
+            WsAction::Add { name, path, mem } => commands::workspace::cmd_ws_add(name, path, mem),
+            WsAction::List => commands::workspace::cmd_ws_list(),
+            WsAction::Rm { name } => commands::workspace::cmd_ws_rm(name),
+        },
+        Commands::Secret { action } => match action {
+            SecretAction::Set { path, domain } => commands::security::cmd_secret_set(path, domain),
+            SecretAction::Get { path, domain } => commands::security::cmd_secret_get(path, domain),
+            SecretAction::Keygen { name } => commands::security::cmd_secret_keygen(name),
+            SecretAction::Grant { name, pubkey_json } => {
+                commands::security::cmd_secret_grant(name, pubkey_json)
+            }
+            SecretAction::Rotate { path, domain, drop } => {
+                commands::security::cmd_secret_rotate(path, domain, drop)
+            }
+        },
+        Commands::Embargo { action } => match action {
+            EmbargoAction::Create {
+                advisory,
+                allow,
+                message,
+            } => commands::security::cmd_embargo_create(advisory, allow, message),
+            EmbargoAction::Publish { advisory } => commands::security::cmd_embargo_publish(advisory),
+        },
+        Commands::Context { action } => match action {
+            ContextAction::Add {
+                prompt,
+                path,
+                lines,
+                model,
+                harness,
+                visibility,
+            } => commands::context::cmd_context_add(prompt, path, lines, model, harness, visibility),
+        },
+        Commands::Why { target, domains } => commands::context::cmd_why(target, domains),
+        Commands::Checkpoint { action } => match action {
+            CheckpointAction::Save { message, session } => {
+                commands::context::cmd_checkpoint_save(message, session)
+            }
+            CheckpointAction::List => commands::context::cmd_checkpoint_list(),
+            CheckpointAction::Undo { checkpoint_id } => {
+                commands::context::cmd_checkpoint_undo(checkpoint_id)
+            }
+        },
+        Commands::GitExport {
+            target_dir,
+            domains,
+        } => commands::workspace::cmd_git_export(target_dir, domains),
+        Commands::Fleet { action } => match action {
+            FleetAction::Export {
+                bundle_path,
+                include,
+            } => commands::workspace::cmd_fleet_export(bundle_path, include),
+            FleetAction::Apply { bundle_path } => commands::workspace::cmd_fleet_apply(bundle_path),
+        },
+        Commands::Serve { addr, data_dir } => commands::serve::cmd_serve(addr, data_dir),
+    }
+}

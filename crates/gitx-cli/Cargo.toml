@@ -1,0 +1,31 @@
+[package]
+name = "gitx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gitx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+gitx-context.workspace = true
+gitx-core.workspace = true
+gitx-crypto.workspace = true
+gitx-git-bridge.workspace = true
+gitx-merge.workspace = true
+gitx-server.workspace = true
+gitx-store.workspace = true
+gitx-vfs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

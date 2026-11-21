@@ -1,0 +1,17 @@
+[package]
+name = "gitx-git-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+flate2.workspace = true
+gitx-core.workspace = true
+gitx-store.workspace = true
+hex.workspace = true
+serde.workspace = true
+sha1.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "gitx-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bincode.workspace = true
+chrono.workspace = true
+gitx-core.workspace = true
+lz4_flex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

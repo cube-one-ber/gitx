@@ -1,0 +1,18 @@
+[package]
+name = "gitx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bincode.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+fastcdc.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

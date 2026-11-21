@@ -1,0 +1,26 @@
+[package]
+name = "gitx-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+gitx-context.workspace = true
+gitx-core.workspace = true
+gitx-crypto.workspace = true
+gitx-git-bridge.workspace = true
+gitx-merge.workspace = true
+gitx-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
