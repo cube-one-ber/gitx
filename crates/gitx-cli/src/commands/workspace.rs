@@ -1,18 +1,53 @@
-use crate::repo::{Repo, WorkspacePointer, save_json_file};
-use anyhow::{Result, bail};
-use gitx_core::{ChangeSetBuilder, DomainId, OpKind, VisibilityPolicy};
+use crate::repo::{Repo, WorkspacePointer, load_json_file, save_json_file};
+use anyhow::{Result, anyhow, bail};
+use clap::ValueEnum;
+use gitx_core::{ChangeSetBuilder, DomainId, DomainTree, EntryKind, OpKind, VisibilityPolicy};
 use gitx_crypto::{PublicKeyBundle, UserKeyPair};
 use gitx_git_bridge::export_to_git_repo;
 use gitx_store::ObjectStore;
+#[cfg(target_os = "linux")]
+use gitx_vfs::FuseMountHandle;
 use gitx_vfs::{
-    EncryptedFleetBundle, FleetOverlayBundle, FleetWorkspaceMetadata, WorkspaceManager,
-    apply_encrypted_overlay, apply_overlay, export_encrypted_overlay,
-    export_overlay_with_metadata,
+    EncryptedFleetBundle, FleetOverlayBundle, FleetWorkspaceMetadata, LazyWorkspace,
+    LoopbackVfsServer, WorkspaceBackendKind, WorkspaceManager, apply_encrypted_overlay,
+    apply_overlay, export_encrypted_overlay, export_overlay_with_metadata,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountBackend {
+    Fuse,
+    Loopback,
+}
+
+impl MountBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            MountBackend::Fuse => "fuse",
+            MountBackend::Loopback => "loopback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MountRecord {
+    workspace: String,
+    mountpoint: String,
+    backend: String,
+    overlay_root: String,
+    pid: u32,
+    addr: Option<String>,
+    stop_file: String,
+}
 
 pub fn cmd_ws_add(name: String, path: Option<PathBuf>, mem: bool, lazy: bool) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
@@ -133,6 +168,223 @@ pub fn cmd_ws_rm(name: String) -> Result<()> {
     )?;
     println!("Removed workspace '{name}'");
     Ok(())
+}
+
+pub fn cmd_ws_mount(name: String, mountpoint: PathBuf, backend: MountBackend) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let ws_ref = repo
+        .store
+        .get_workspace(&name)?
+        .ok_or_else(|| anyhow!("workspace '{name}' not found"))?;
+
+    let cs = repo.store.get_changeset(ws_ref.head_changeset)?;
+    let mut tree = DomainTree::new(DomainId::public());
+    for tree_hash in cs.domain_trees.values() {
+        let domain_tree = repo.store.get_tree(*tree_hash)?;
+        for (path, kind) in domain_tree.entries {
+            if !matches!(kind, EntryKind::EncryptedSecret { .. }) {
+                tree.insert(path, kind);
+            }
+        }
+    }
+
+    let overlay_root = if ws_ref.backend == WorkspaceBackendKind::LazyMount {
+        ws_ref
+            .root_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo.gitx_dir.join("overlays").join(&name))
+    } else {
+        repo.gitx_dir.join("overlays").join(&name)
+    };
+
+    fs::create_dir_all(&mountpoint)?;
+    let mountpoint = fs::canonicalize(&mountpoint).unwrap_or(mountpoint);
+    let mount_key = mountpoint.to_string_lossy().into_owned();
+
+    let stop_file = mount_stop_file(&repo.gitx_dir, &mount_key);
+    if stop_file.exists() {
+        let _ = fs::remove_file(&stop_file);
+    }
+
+    let store_dyn: Arc<dyn ObjectStore> = repo.store.clone();
+    let lazy_ws = LazyWorkspace::mount(&overlay_root, Arc::clone(&store_dyn), tree)?;
+
+    match backend {
+        MountBackend::Fuse => {
+            #[cfg(target_os = "linux")]
+            {
+                let handle = FuseMountHandle::mount_background(&mountpoint, lazy_ws, store_dyn)?;
+                let stats = handle.stats();
+
+                let record = MountRecord {
+                    workspace: name.clone(),
+                    mountpoint: mount_key.clone(),
+                    backend: backend.as_str().to_string(),
+                    overlay_root: overlay_root.to_string_lossy().into_owned(),
+                    pid: std::process::id(),
+                    addr: None,
+                    stop_file: stop_file.to_string_lossy().into_owned(),
+                };
+                register_mount_record(&repo.gitx_dir, record)?;
+
+                println!(
+                    "Mounted workspace '{}' at {} (backend: fuse, virtual_files: {}, overlay_dirty: {}, pid: {})",
+                    name,
+                    mountpoint.display(),
+                    stats.total_virtual_files,
+                    stats.overlay_dirty_files,
+                    std::process::id()
+                );
+                io::stdout().flush()?;
+
+                while !stop_file.exists() && handle.is_alive() {
+                    thread::sleep(Duration::from_millis(50));
+                }
+
+                let _ = handle.unmount();
+                let _ = fs::remove_file(&stop_file);
+                let _ = unregister_mount_record(&repo.gitx_dir, &mount_key);
+                println!("Unmounted {}", mountpoint.display());
+                Ok(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (lazy_ws, store_dyn, stop_file, mount_key);
+                bail!(
+                    "FUSE3 mount backend is only supported on Linux; use `--backend loopback` on this platform"
+                );
+            }
+        }
+        MountBackend::Loopback => {
+            let server = LoopbackVfsServer::start("127.0.0.1:0", lazy_ws, store_dyn)?;
+            let addr = server.addr();
+            let stats = server.stats();
+
+            let record = MountRecord {
+                workspace: name.clone(),
+                mountpoint: mount_key.clone(),
+                backend: backend.as_str().to_string(),
+                overlay_root: overlay_root.to_string_lossy().into_owned(),
+                pid: std::process::id(),
+                addr: Some(addr.to_string()),
+                stop_file: stop_file.to_string_lossy().into_owned(),
+            };
+            register_mount_record(&repo.gitx_dir, record)?;
+
+            println!(
+                "Mounted workspace '{}' at {} (backend: loopback, addr: {}, virtual_files: {}, overlay_dirty: {}, pid: {})",
+                name,
+                mountpoint.display(),
+                addr,
+                stats.total_virtual_files,
+                stats.overlay_dirty_files,
+                std::process::id()
+            );
+            io::stdout().flush()?;
+
+            while !stop_file.exists() {
+                thread::sleep(Duration::from_millis(50));
+            }
+
+            server.shutdown();
+            let _ = fs::remove_file(&stop_file);
+            let _ = unregister_mount_record(&repo.gitx_dir, &mount_key);
+            println!("Unmounted {}", mountpoint.display());
+            Ok(())
+        }
+    }
+}
+
+pub fn cmd_ws_unmount(mountpoint: PathBuf) -> Result<()> {
+    let resolved = fs::canonicalize(&mountpoint).unwrap_or_else(|_| {
+        if mountpoint.is_absolute() {
+            mountpoint.clone()
+        } else {
+            env::current_dir()
+                .map(|cwd| cwd.join(&mountpoint))
+                .unwrap_or_else(|_| mountpoint.clone())
+        }
+    });
+    let mount_key = resolved.to_string_lossy().into_owned();
+
+    if let Ok(repo) = Repo::open(&env::current_dir()?)
+        && let Some(record) = unregister_mount_record(&repo.gitx_dir, &mount_key)?
+    {
+        if record.backend == "fuse" {
+            let _ = unmount_os_fuse(&resolved);
+        }
+        let stop_path = PathBuf::from(&record.stop_file);
+        if let Some(parent) = stop_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(&stop_path, b"stop\n")?;
+        println!(
+            "Unmounted workspace '{}' at {} (backend: {})",
+            record.workspace,
+            resolved.display(),
+            record.backend
+        );
+        return Ok(());
+    }
+
+    if unmount_os_fuse(&resolved).is_ok() {
+        println!("Unmounted {}", resolved.display());
+        return Ok(());
+    }
+
+    bail!("mountpoint '{}' is not an active gitx mount", resolved.display());
+}
+
+fn mounts_registry_path(gitx_dir: &Path) -> PathBuf {
+    gitx_dir.join("mounts.json")
+}
+
+fn mount_stop_file(gitx_dir: &Path, mount_key: &str) -> PathBuf {
+    let id = gitx_core::ObjectHash::of_bytes(mount_key.as_bytes()).short();
+    gitx_dir.join("mounts").join(format!("{id}.stop"))
+}
+
+fn load_mount_registry(gitx_dir: &Path) -> BTreeMap<String, MountRecord> {
+    let path = mounts_registry_path(gitx_dir);
+    if path.is_file() {
+        load_json_file(&path).unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    }
+}
+
+fn register_mount_record(gitx_dir: &Path, record: MountRecord) -> Result<()> {
+    let mut map = load_mount_registry(gitx_dir);
+    map.insert(record.mountpoint.clone(), record);
+    save_json_file(&mounts_registry_path(gitx_dir), &map)
+}
+
+fn unregister_mount_record(gitx_dir: &Path, mount_key: &str) -> Result<Option<MountRecord>> {
+    let mut map = load_mount_registry(gitx_dir);
+    let removed = map.remove(mount_key);
+    if removed.is_some() {
+        save_json_file(&mounts_registry_path(gitx_dir), &map)?;
+    }
+    Ok(removed)
+}
+
+fn unmount_os_fuse(mountpoint: &Path) -> Result<()> {
+    for (bin, args) in [
+        ("fusermount3", vec!["-u"]),
+        ("fusermount", vec!["-u"]),
+        ("umount", vec![]),
+    ] {
+        if let Ok(status) = Command::new(bin).args(&args).arg(mountpoint).status()
+            && status.success()
+        {
+            return Ok(());
+        }
+    }
+    bail!(
+        "failed to unmount FUSE mountpoint {}",
+        mountpoint.display()
+    )
 }
 
 pub fn cmd_git_export(target_dir: PathBuf, domains: String) -> Result<()> {

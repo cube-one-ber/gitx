@@ -535,3 +535,93 @@ pub fn base_fn() -> i32 {
     assert!(fn_names.contains(&"alpha_feature"), "got:\n{syms_json}");
     assert!(fn_names.contains(&"beta_feature"), "got:\n{syms_json}");
 }
+
+#[test]
+fn e2e_ws_mount_and_unmount_loopback() {
+    use std::io::{BufRead, BufReader};
+    use std::net::SocketAddr;
+
+    let repo_dir = TempDir::new().unwrap();
+    let root = repo_dir.path();
+    let overlay_parent = TempDir::new().unwrap();
+    let overlay_dir = overlay_parent.path().join("lazy-mount-overlay");
+    let mount_dir = overlay_parent.path().join("vfs-mnt");
+
+    gitx_ok(root, &["init", "--name", "MountDev", "--email", "mount@example.com"]);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/hello.rs"), "pub fn hi() -> &'static str { \"hi\" }\n").unwrap();
+    gitx_ok(root, &["describe", "-m", "Seed mount repo"]);
+    gitx_ok(root, &["land"]);
+
+    gitx_ok(
+        root,
+        &[
+            "ws",
+            "add",
+            "vfs-agent",
+            "--lazy",
+            "--path",
+            overlay_dir.to_str().unwrap(),
+        ],
+    );
+
+    // Spawn `gitx ws mount vfs-agent <mount_dir> --backend loopback`.
+    let mut child = Command::new(gitx_bin())
+        .current_dir(root)
+        .args([
+            "ws",
+            "mount",
+            "vfs-agent",
+            mount_dir.to_str().unwrap(),
+            "--backend",
+            "loopback",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn gitx ws mount");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut first_line = String::new();
+    reader
+        .read_line(&mut first_line)
+        .expect("read mount status line");
+    assert!(
+        first_line.contains("Mounted workspace 'vfs-agent'")
+            && first_line.contains("backend: loopback"),
+        "unexpected mount output: {first_line}"
+    );
+
+    // Parse `addr: 127.0.0.1:<port>` and verify live RPC reads/writes over TCP loopback!
+    let addr_str = first_line
+        .split("addr: ")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .expect("extract addr from mount line");
+    let addr: SocketAddr = addr_str.parse().expect("valid loopback SocketAddr");
+
+    let mut client = gitx_vfs::LoopbackVfsClient::connect(addr).expect("connect loopback vfs");
+    let src_dir = client
+        .lookup(gitx_vfs::ROOT_INO, "src")
+        .expect("lookup src");
+    let hello = client
+        .lookup(src_dir.ino, "hello.rs")
+        .expect("lookup hello.rs");
+    let bytes = client.read(hello.ino, 0, 1024).expect("read hello.rs");
+    assert_eq!(bytes, b"pub fn hi() -> &'static str { \"hi\" }\n");
+    drop(client);
+
+    // Unmount via `gitx ws unmount <mount_dir>` and confirm clean exit.
+    let unmount_out = gitx_ok(root, &["ws", "unmount", mount_dir.to_str().unwrap()]);
+    assert!(
+        unmount_out.contains("Unmounted workspace 'vfs-agent'"),
+        "unexpected unmount output:\n{unmount_out}"
+    );
+
+    let status = child.wait().expect("wait for mount process exit");
+    assert!(
+        status.success(),
+        "mount process should exit cleanly on unmount, got {status:?}"
+    );
+}
