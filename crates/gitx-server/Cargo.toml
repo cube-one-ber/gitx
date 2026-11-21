@@ -14,12 +14,15 @@ gitx-core.workspace = true
 gitx-crypto.workspace = true
 gitx-git-bridge.workspace = true
 gitx-merge.workspace = true
+gitx-proto.workspace = true
 gitx-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

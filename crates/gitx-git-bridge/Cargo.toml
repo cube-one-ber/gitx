@@ -12,6 +12,4 @@ gitx-store.workspace = true
 hex.workspace = true
 serde.workspace = true
 sha1.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

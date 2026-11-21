@@ -8,11 +8,14 @@
 //! - Colocated import from any existing Git repository into `gitx-store` ([`import`]).
 //! - Git Smart HTTP pkt-line and `git-upload-pack` helpers for serving ACL-filtered clones
 //!   ([`pktline`]).
+//! - ACL-filtered Git SSH transport dispatcher for `git-upload-pack` / `git-receive-pack`
+//!   ([`ssh`]).
 
 pub mod import;
 pub mod objects;
 pub mod pktline;
 pub mod project;
+pub mod ssh;
 
 pub use import::{ImportReport, import_from_git_repo};
 pub use objects::{
@@ -26,3 +29,7 @@ pub use pktline::{
     encode_pkt_line, handle_upload_pack, handle_upload_pack_with_protocol,
 };
 pub use project::{ProjectionReport, export_to_git_repo};
+pub use ssh::{
+    GitSshService, GitSshSession, ParsedSshCommand, SshSessionReport,
+    advertise_ssh_upload_pack_refs, handle_ssh_command, parse_advertised_refs, parse_ssh_command,
+};

@@ -1,0 +1,264 @@
+syntax = "proto3";
+
+package gitx.v1;
+
+// Always-online, ACL-enforcing zero-clone & agentic merge queue gRPC service.
+service GitxService {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc CreateRepo(CreateRepoRequest) returns (CreateRepoResponse);
+  rpc ListRepos(ListReposRequest) returns (ListReposResponse);
+  rpc GetTree(GetTreeRequest) returns (GetTreeResponse);
+  rpc ReadBlob(ReadBlobRequest) returns (ReadBlobResponse);
+  rpc Diff(DiffRequest) returns (DiffResponse);
+  rpc Grep(GrepRequest) returns (GrepResponse);
+  rpc Blame(BlameRequest) returns (BlameResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Land(LandRequest) returns (LandResponse);
+  rpc Revert(RevertRequest) returns (RevertResponse);
+  rpc EnqueueMerge(EnqueueMergeRequest) returns (EnqueueMergeResponse);
+  rpc DrainMergeQueue(DrainMergeQueueRequest) returns (DrainMergeQueueResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+}
+
+message RepoInfo {
+  string owner = 1;
+  string name = 2;
+  string full_name = 3;
+  string default_branch = 4;
+  map<string, string> bookmarks = 5;
+}
+
+message CreateRepoRequest {
+  string owner = 1;
+  string name = 2;
+  optional string acl = 3;
+}
+
+message CreateRepoResponse {
+  RepoInfo repo = 1;
+}
+
+message ListReposRequest {
+  optional string owner = 1;
+}
+
+message ListReposResponse {
+  repeated RepoInfo repos = 1;
+}
+
+message GetTreeRequest {
+  string owner = 1;
+  string name = 2;
+  optional string rev = 3;
+  optional string domain = 4;
+}
+
+message TreeFileEntry {
+  string path = 1;
+  string domain = 2;
+  uint64 size = 3;
+  string blob_hash = 4;
+  bytes content = 5;
+}
+
+message GetTreeResponse {
+  optional string rev = 1;
+  repeated string domains = 2;
+  repeated TreeFileEntry files = 3;
+}
+
+message ReadBlobRequest {
+  string owner = 1;
+  string name = 2;
+  optional string rev = 3;
+  string path = 4;
+  optional string blob_hash = 5;
+}
+
+message ReadBlobResponse {
+  string path = 1;
+  string domain = 2;
+  string blob_hash = 3;
+  uint64 size = 4;
+  bytes content = 5;
+}
+
+message DiffRequest {
+  string owner = 1;
+  string name = 2;
+  optional string from = 3;
+  optional string to = 4;
+}
+
+message DiffFileEntry {
+  string path = 1;
+  string domain = 2;
+  string status = 3;
+  string patch = 4;
+}
+
+message DiffResponse {
+  optional string from = 1;
+  optional string to = 2;
+  repeated DiffFileEntry files = 3;
+  string unified_diff = 4;
+}
+
+message GrepRequest {
+  string owner = 1;
+  string name = 2;
+  string query = 3;
+  optional string rev = 4;
+  bool case_insensitive = 5;
+}
+
+message GrepMatch {
+  string path = 1;
+  string domain = 2;
+  uint64 line_number = 3;
+  string line = 4;
+}
+
+message GrepResponse {
+  string query = 1;
+  optional string rev = 2;
+  repeated GrepMatch matches = 3;
+}
+
+message BlameRequest {
+  string owner = 1;
+  string name = 2;
+  string path = 3;
+  optional string rev = 4;
+}
+
+message BlameLine {
+  uint64 line_number = 1;
+  string content = 2;
+  string changeset_id = 3;
+  string change_id = 4;
+  string author_name = 5;
+  string author_email = 6;
+  string timestamp = 7;
+  string message = 8;
+}
+
+message BlameResponse {
+  string path = 1;
+  string rev = 2;
+  repeated BlameLine lines = 3;
+}
+
+message ActorAgent {
+  string harness = 1;
+  string model = 2;
+  string session_id = 3;
+}
+
+message FileWrite {
+  string path = 1;
+  bytes content = 2;
+}
+
+message CommitRequest {
+  string owner = 1;
+  string name = 2;
+  repeated FileWrite files = 3;
+  repeated string delete_files = 4;
+  string message = 5;
+  string author_name = 6;
+  string author_email = 7;
+  optional ActorAgent actor_agent = 8;
+  optional string target = 9;
+  optional string parent = 10;
+  optional bool update_target = 11;
+  optional string visibility_domain = 12;
+  optional string embargo_advisory = 13;
+  repeated string embargo_allowed_teams = 14;
+  optional string context_prompt = 15;
+}
+
+message CommitResponse {
+  string changeset_id = 1;
+  string change_id = 2;
+  string public_projection_hash = 3;
+  repeated string domains_written = 4;
+  optional string target = 5;
+}
+
+message LandRequest {
+  string owner = 1;
+  string name = 2;
+  string changeset_id = 3;
+  string target = 4;
+  optional string expected_head = 5;
+}
+
+message LandResponse {
+  uint64 land_seq = 1;
+  string target = 2;
+  optional string previous_head = 3;
+  string new_head = 4;
+  repeated string conflicts = 5;
+}
+
+message RevertRequest {
+  string owner = 1;
+  string name = 2;
+  uint64 land_seq = 3;
+}
+
+message RevertResponse {
+  uint64 reverted_land_seq = 1;
+  uint64 revert_land_seq = 2;
+  string target = 3;
+  string restored_head = 4;
+}
+
+message QueueEntry {
+  uint64 id = 1;
+  string changeset_id = 2;
+  string change_id = 3;
+  string target = 4;
+  string submitted_by = 5;
+  string enqueued_at = 6;
+  string status = 7;
+  optional uint64 land_seq = 8;
+  repeated string conflict_paths = 9;
+  optional string rejection_reason = 10;
+}
+
+message EnqueueMergeRequest {
+  string owner = 1;
+  string name = 2;
+  string changeset_id = 3;
+  string target = 4;
+}
+
+message EnqueueMergeResponse {
+  QueueEntry entry = 1;
+  uint64 queue_depth = 2;
+}
+
+message DrainMergeQueueRequest {
+  string owner = 1;
+  string name = 2;
+  string target = 3;
+  optional uint64 max_batch_size = 4;
+}
+
+message DrainMergeQueueResponse {
+  string target = 1;
+  optional uint64 land_seq = 2;
+  optional string previous_head = 3;
+  optional string new_head = 4;
+  repeated QueueEntry landed = 5;
+  repeated QueueEntry conflicted = 6;
+  repeated QueueEntry rejected = 7;
+  repeated string resolved_conflicts = 8;
+}

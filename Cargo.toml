@@ -8,6 +8,7 @@ members = [
     "crates/gitx-vfs",
     "crates/gitx-context",
     "crates/gitx-git-bridge",
+    "crates/gitx-proto",
     "crates/gitx-server",
     "crates/gitx-sdk",
     "crates/gitx-cli",
@@ -27,6 +28,7 @@ gitx-merge = { path = "crates/gitx-merge" }
 gitx-vfs = { path = "crates/gitx-vfs" }
 gitx-context = { path = "crates/gitx-context" }
 gitx-git-bridge = { path = "crates/gitx-git-bridge" }
+gitx-proto = { path = "crates/gitx-proto" }
 gitx-server = { path = "crates/gitx-server" }
 gitx-sdk = { path = "crates/gitx-sdk" }
 
@@ -46,6 +48,8 @@ globset = "0.4"
 hex = "0.4"
 hkdf = "0.12"
 lz4_flex = "0.11"
+object_store = { version = "0.12", features = ["fs", "aws", "gcp"] }
+prost = "0.14"
 rand = "0.8"
 reflink-copy = "0.1"
 regex = "1"
@@ -59,7 +63,11 @@ similar = "2"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 toml = "0.8"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.24"
