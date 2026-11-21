@@ -1,18 +1,32 @@
+use crate::derived::DerivedIndex;
+use crate::queue::{ConflictResolverFn, MergeQueue};
 use gitx_context::ContextStore;
 use gitx_core::{DomainId, EntryKind, GitxError, Result};
 use gitx_crypto::AclPolicy;
 use gitx_store::{LocalStore, ObjectStore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// Configuration for the GitX HTTP + Git Smart HTTP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     pub data_dir: PathBuf,
     pub default_acl: Option<String>,
+    pub conflict_resolver: Option<ConflictResolverFn>,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("data_dir", &self.data_dir)
+            .field("default_acl", &self.default_acl)
+            .field("conflict_resolver", &self.conflict_resolver.is_some())
+            .finish()
+    }
 }
 
 impl ServerConfig {
@@ -20,11 +34,17 @@ impl ServerConfig {
         Self {
             data_dir: data_dir.into(),
             default_acl: None,
+            conflict_resolver: None,
         }
     }
 
     pub fn with_default_acl(mut self, acl: impl Into<String>) -> Self {
         self.default_acl = Some(acl.into());
+        self
+    }
+
+    pub fn with_conflict_resolver(mut self, resolver: ConflictResolverFn) -> Self {
+        self.conflict_resolver = Some(resolver);
         self
     }
 }
@@ -47,6 +67,8 @@ pub struct RepoHandle {
     pub store: Arc<LocalStore>,
     pub context: Arc<ContextStore>,
     pub acl: RwLock<AclPolicy>,
+    pub derived: RwLock<DerivedIndex>,
+    pub queue: MergeQueue,
     default_acl: Option<String>,
 }
 
@@ -70,8 +92,15 @@ impl RepoHandle {
             store,
             context,
             acl: RwLock::new(policy),
+            derived: RwLock::new(DerivedIndex::new()),
+            queue: MergeQueue::new(None),
             default_acl,
         })
+    }
+
+    /// Install or clear an optional conflict-resolver hook for this repository's merge queue.
+    pub fn set_conflict_resolver(&self, resolver: Option<ConflictResolverFn>) {
+        self.queue.set_conflict_resolver(resolver);
     }
 
     /// Return a cloned snapshot of the current [`AclPolicy`].
@@ -187,6 +216,7 @@ impl AppState {
             dir,
             self.config.default_acl.clone(),
         )?);
+        handle.set_conflict_resolver(self.config.conflict_resolver.clone());
         guard.insert(key, Arc::clone(&handle));
         Ok(handle)
     }
@@ -226,6 +256,7 @@ impl AppState {
             dir,
             self.config.default_acl.clone(),
         )?);
+        handle.set_conflict_resolver(self.config.conflict_resolver.clone());
         guard.insert(key, Arc::clone(&handle));
         Ok(Some(handle))
     }

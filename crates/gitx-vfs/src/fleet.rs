@@ -2,7 +2,8 @@ use crate::backend::normalize_rel_path;
 use crate::cow::{apply_workspace_permissions, detect_file_mode, write_symlink};
 use chrono::{DateTime, Utc};
 use gitx_core::oplog::WorkspaceBackendKind;
-use gitx_core::{ChangeId, FileMode, GitxError, ObjectHash, Result, WorkspaceRef};
+use gitx_core::{ChangeId, DomainId, FileMode, GitxError, ObjectHash, Result, WorkspaceRef};
+use gitx_crypto::{PublicKeyBundle, SecretEnvelope, UserKeyPair, decrypt_secret, encrypt_secret};
 use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -227,6 +228,95 @@ pub fn apply_overlay(root: &Path, bundle: &FleetOverlayBundle) -> Result<Vec<Str
 
     restored.sort();
     Ok(restored)
+}
+
+/// End-to-end envelope-encrypted cross-machine Fleet Overlay bundle.
+///
+/// Wraps a serialized [`FleetOverlayBundle`] inside a [`SecretEnvelope`] encrypted via
+/// `gitx-crypto` (ChaCha20-Poly1305 payload encryption + per-recipient X25519 ECDH /
+/// HKDF-SHA256 DEK wrapping) so sensitive overlay files (`.env`, local tokens, editor configs)
+/// never appear in plaintext in transit or at rest on untrusted relay/storage nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedFleetBundle {
+    pub envelope: SecretEnvelope,
+    pub created_at: DateTime<Utc>,
+    pub machine_id: String,
+    pub file_count: usize,
+}
+
+impl EncryptedFleetBundle {
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).map_err(|e| GitxError::Serialization(e.to_string()))
+    }
+
+    pub fn from_json(json: &str) -> Result<Self> {
+        serde_json::from_str(json).map_err(|e| GitxError::Serialization(e.to_string()))
+    }
+}
+
+fn fleet_overlay_aad_path(machine_id: &str) -> String {
+    format!("gitx:fleet-overlay:v1/{machine_id}")
+}
+
+/// Export private/ignored overlay files matching `include_patterns` from `root` and seal the
+/// entire bundle inside an end-to-end encrypted [`EncryptedFleetBundle`] for `recipients`.
+///
+/// Strictly excludes OS/build/VCS directories (`node_modules/`, `target/`, `.git/`, `.gitx/`)
+/// and binds `(domain, machine_id, key_epoch)` into the AEAD associated data.
+pub fn export_encrypted_overlay(
+    root: &Path,
+    include_patterns: &[&str],
+    machine_id: &str,
+    domain: &DomainId,
+    key_epoch: u64,
+    recipients: &[PublicKeyBundle],
+) -> Result<EncryptedFleetBundle> {
+    let metadata = FleetWorkspaceMetadata {
+        source_machine: Some(machine_id.to_string()),
+        ..Default::default()
+    };
+    let bundle = export_overlay_with_metadata(root, include_patterns, metadata)?;
+    let file_count = bundle.files.len();
+    let created_at = bundle.created_at;
+
+    let plaintext =
+        serde_json::to_vec(&bundle).map_err(|e| GitxError::Serialization(e.to_string()))?;
+    let aad_path = fleet_overlay_aad_path(machine_id);
+    let envelope = encrypt_secret(domain, &aad_path, key_epoch, &plaintext, recipients)?;
+
+    Ok(EncryptedFleetBundle {
+        envelope,
+        created_at,
+        machine_id: machine_id.to_string(),
+        file_count,
+    })
+}
+
+/// Decrypt an [`EncryptedFleetBundle`] using an authorized machine/user `keypair` and restore
+/// its overlay files onto `root`, returning the sorted list of restored relative file paths.
+///
+/// Fails with [`GitxError::AccessDenied`] if `keypair` is not an authorized recipient, or
+/// [`GitxError::Crypto`] if the ciphertext or authenticated header metadata was tampered with.
+pub fn apply_encrypted_overlay(
+    root: &Path,
+    bundle: &EncryptedFleetBundle,
+    keypair: &UserKeyPair,
+) -> Result<Vec<String>> {
+    let aad_path = fleet_overlay_aad_path(&bundle.machine_id);
+    let plaintext = decrypt_secret(&bundle.envelope, &aad_path, keypair)?;
+
+    let decoded: FleetOverlayBundle =
+        serde_json::from_slice(&plaintext).map_err(|e| GitxError::Serialization(e.to_string()))?;
+
+    if decoded.files.len() != bundle.file_count {
+        return Err(GitxError::Crypto(format!(
+            "encrypted fleet bundle file_count mismatch: header={}, payload={}",
+            bundle.file_count,
+            decoded.files.len()
+        )));
+    }
+
+    apply_overlay(root, &decoded)
 }
 
 struct CompiledIncludePattern {

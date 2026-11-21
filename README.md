@@ -6,13 +6,16 @@
 
 Source control shouldn't be 100% or 0% access, lock branches inside clunky worktrees, force every CI job to clone gigabytes of history, or lose the *why* behind every change. **GitX** rethinks version control from first principles while keeping an incremental, lossless interoperability bridge with Git.
 
-> **Status:** Working Rust workspace (9 crates, 76 passing unit/integration/E2E tests, zero clippy warnings). See [PLAN.md](PLAN.md) for the full technical design and roadmap.
+> **Status:** Complete 11-crate Rust workspace (Phases 0–5 implemented, 0 clippy warnings). See [PLAN.md](PLAN.md) for the full technical architecture.
 
 ## Quickstart
 
 ```bash
-# Build & test the full workspace
+# Build & test all 11 crates (including hermetic simulation & ACL fuzzing)
 cargo test --workspace
+
+# Run GitX vs. Git benchmarks
+cargo run --release --bin gitx-bench
 
 # Run the CLI
 cargo run --bin gitx -- --help
@@ -23,13 +26,34 @@ gitx status
 gitx describe -m "Initial feature"
 gitx land --target master
 
-# Native encrypted .env secrets & ACL-filtered Git export
+# Native encrypted .env secrets, encrypted fleet sync & ACL-filtered Git export
 gitx secret set .env --domain secret:dev
+gitx fleet export /tmp/fleet.bundle.json --encrypted --machine workstation-1
 gitx git-export /tmp/public-mirror --domains public
 
-# Start the always-online zero-clone + ACL-filtered Git Smart HTTP server
+# Lock-free demand-paged workspaces & Tree-sitter AST symbol inspection
+gitx ws add agent-1 --lazy
+gitx symbols src/lib.rs --json
+
+# Start the zero-disk MCP server (JSON-RPC 2.0 stdio, 13 tools) for AI agents
+gitx mcp --in-memory
+
+# Start the always-online zero-clone + batched merge queue + ACL-filtered Git Smart HTTP server
 gitx serve --addr 127.0.0.1:7878
 ```
+
+---
+
+## Benchmarks (`cargo run --bin gitx-bench`)
+
+Measured on Linux (250-file repo, debug build):
+
+| Benchmark | Baseline Git | GitX | Improvement |
+| --- | --- | --- | --- |
+| **32x Parallel Workspaces** | `git worktree add`: 757 ms (8,000 files written) | `LazyWorkspace`: **2.91 ms** (0 files written) / `MemVfs`: **<0.01 ms** | **260x+ faster** |
+| **16 Agents Appending to `src/lib.rs`** | `git merge-file`: **15/15 conflicts (100%)** | Tree-sitter AST Merge: **0/15 conflicts (0%)**, 4.86 ms | **100% → 0% conflicts** |
+| **Zero-Clone Server `/grep`** | `git clone` + `git grep`: 465.4 ms | Warm `TrigramIndex`: **1.35 ms** (zero clone) | **344x faster** |
+| **Zero-Clone Server `/diff`** | `git clone` + `git diff`: 468.0 ms | Server `/diff`: **18.0 ms** (zero clone) | **25.9x faster** |
 
 ---
 
@@ -49,25 +73,22 @@ gitx serve --addr 127.0.0.1:7878
 
 ---
 
-## Planned Workspace Structure
+## Workspace Structure
 
 ```text
 gitx/
 ├── crates/
 │   ├── gitx-core/         # ChangeSet, ChangeId, BLAKE3, FastCDC, VisibilityDomain, ConflictSet, OpLog
-│   ├── gitx-crypto/       # Envelope encryption (age/X25519 + ChaCha20), key epochs, ACLs, secret scanner
-│   ├── gitx-store/        # CAS & metadata backends (SQLite/FS locally; Postgres/S3/R2 + RAM cache on server)
-│   ├── gitx-merge/        # 3-way merge, JSON/TOML/YAML key merge, Tree-sitter AST merge, algebraic conflicts
-│   ├── gitx-vfs/          # mem://, cow://, vfs:// (FUSE3/NFSv3), cross-machine fleet sync
-│   ├── gitx-context/      # Sub-commit checkpoints & durable "why" store with AST/hunk anchoring
-│   ├── gitx-git-bridge/   # gitoxide colocated bridge + ACL-filtered Git Smart HTTP/SSH adapter
-│   ├── gitx-proto/        # gRPC / HTTP / JSON-RPC schemas
-│   ├── gitx-server/       # Axum + Tonic server, IAM/embargo engine, derived indices, transactional landing queue
-│   ├── gitx-cli/          # Single static `gitx` binary
-│   └── gitx-sdk/          # MCP server, JSON-RPC daemon, TypeScript/N-API & WASM bindings
-└── tests/
-    ├── sim/               # Deterministic hermetic simulation & crash/concurrency fuzzing
-    └── bench/             # Workspace fan-out, large-repo status/diff, 16-agent concurrent landing benchmarks
+│   ├── gitx-crypto/       # Envelope encryption (X25519 + ChaCha20), key epochs, .gitxacl, secret scanner
+│   ├── gitx-store/        # SQLite WAL + LZ4 FastCDC CAS (`LocalStore`), `MemoryStore`, ACID landing ledger
+│   ├── gitx-merge/        # 3-way line merge, JSON/TOML key merge, Tree-sitter AST merge (RS/TS/TSX/JS), interdiffs
+│   ├── gitx-vfs/          # `MemVfs`, reflink `CowWorkspace`, demand-paged `LazyWorkspace`, encrypted fleet sync
+│   ├── gitx-context/      # Sub-commit agent checkpoints & durable `gitx why` store with fuzzy anchor relocation
+│   ├── gitx-git-bridge/   # Pure-Rust Git objects, ACL-filtered projection (`git fsck` verified), colocated import, Smart HTTP
+│   ├── gitx-server/       # Always-online Axum server, zero-clone RPCs, Derived Data Engine, batched merge queue, Git HTTP
+│   ├── gitx-sdk/          # Zero-disk `AgentRepo` SDK + 13-tool JSON-RPC 2.0 MCP server
+│   ├── gitx-cli/          # Single static `gitx` binary (22 commands) + E2E test suite
+│   └── gitx-sim/          # Hermetic crash/OpLog simulator, adversarial ACL fuzzer, 32-agent merge stress test & `gitx-bench`
 ```
 
 ---

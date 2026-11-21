@@ -2,8 +2,10 @@
 
 pub mod api;
 pub mod auth;
+pub mod derived;
 pub mod error;
 pub mod git_http;
+pub mod queue;
 pub mod state;
 
 pub use api::{
@@ -16,7 +18,15 @@ pub use auth::{
     AuthenticatedPrincipal, HEADER_FINGERPRINT, HEADER_ROLES, HEADER_TEAMS, HEADER_USER,
     allowed_domains_for_repo, extract_principal,
 };
+pub use derived::{
+    CommitGraphIndex, CommitGraphNode, DerivedIndex, DerivedStats, PathHistoryIndex, TrigramIndex,
+    TrigramSearchIndex,
+};
 pub use error::{ApiError, ApiResult};
+pub use queue::{
+    ConflictResolverFn, DrainRequest, DrainResponse, EnqueueRequest, EnqueueResponse, MergeQueue,
+    QueueEntry, QueueListQuery, QueueListResponse, QueueStatus,
+};
 pub use state::{AppState, RepoHandle, RepoInfo, ServerConfig};
 
 use axum::Router;
@@ -54,6 +64,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/v1/repos/{owner}/{name}/embargo/{advisory}/publish",
             post(api::publish_embargo),
+        )
+        // Derived data engine observability
+        .route("/v1/repos/{owner}/{name}/derived/stats", get(api::derived_stats))
+        // Batched lock-free agentic merge queue
+        .route(
+            "/v1/repos/{owner}/{name}/queue/enqueue",
+            post(queue::enqueue),
+        )
+        .route("/v1/repos/{owner}/{name}/queue", get(queue::list_queue))
+        .route(
+            "/v1/repos/{owner}/{name}/queue/drain",
+            post(queue::drain_queue),
         )
         // ACL-filtered Git Smart HTTP endpoints (supports `/{owner}/{name}.git/...`)
         .route("/{owner}/{repo}/info/refs", get(git_http::info_refs))

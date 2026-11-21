@@ -171,6 +171,22 @@ enum Commands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+
+    /// Start the JSON-RPC 2.0 Model Context Protocol (MCP) server over stdin/stdout
+    Mcp {
+        /// Run a pure zero-disk in-memory AgentRepo (no .gitx directory required)
+        #[arg(long)]
+        in_memory: bool,
+    },
+
+    /// Extract Tree-sitter AST symbols (Rust/TS/TSX/JS) with kind and line ranges
+    Symbols {
+        /// Path to source file to inspect
+        path: PathBuf,
+        /// Output extracted symbols as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,12 +213,15 @@ enum WsAction {
     /// Add a new lock-free workspace off master
     Add {
         name: String,
-        /// Target directory for a Copy-on-Write disk workspace
+        /// Target directory for a Copy-on-Write or lazy overlay workspace
         #[arg(long)]
         path: Option<PathBuf>,
         /// Create an in-memory workspace instead of a disk workspace
-        #[arg(long)]
+        #[arg(long, conflicts_with = "lazy")]
         mem: bool,
+        /// Create a demand-paged virtualized sparse workspace (O(1) mount, zero base files written)
+        #[arg(long, conflicts_with = "mem")]
+        lazy: bool,
     },
     /// List registered workspaces
     List,
@@ -291,15 +310,26 @@ enum CheckpointAction {
 
 #[derive(Subcommand)]
 enum FleetAction {
-    /// Export local overlay files to a portable JSON bundle
+    /// Export local overlay files to a portable JSON bundle (optionally end-to-end encrypted)
     Export {
         bundle_path: PathBuf,
         /// Comma-separated glob patterns to include
         #[arg(long, default_value = ".env,.env.local")]
         include: String,
+        /// Encrypt the exported overlay bundle end-to-end for authorized keyring recipients
+        #[arg(long)]
+        encrypted: bool,
+        /// Source machine identifier recorded in bundle metadata and AEAD AAD
+        #[arg(long)]
+        machine: Option<String>,
     },
     /// Apply a fleet overlay bundle onto the current directory
-    Apply { bundle_path: PathBuf },
+    Apply {
+        bundle_path: PathBuf,
+        /// Decrypt an end-to-end encrypted fleet overlay bundle using the repo's local keypair
+        #[arg(long)]
+        encrypted: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -337,7 +367,12 @@ fn main() -> Result<()> {
         },
         Commands::Undo => commands::stack::cmd_undo(),
         Commands::Ws { action } => match action {
-            WsAction::Add { name, path, mem } => commands::workspace::cmd_ws_add(name, path, mem),
+            WsAction::Add {
+                name,
+                path,
+                mem,
+                lazy,
+            } => commands::workspace::cmd_ws_add(name, path, mem, lazy),
             WsAction::List => commands::workspace::cmd_ws_list(),
             WsAction::Rm { name } => commands::workspace::cmd_ws_rm(name),
         },
@@ -388,9 +423,16 @@ fn main() -> Result<()> {
             FleetAction::Export {
                 bundle_path,
                 include,
-            } => commands::workspace::cmd_fleet_export(bundle_path, include),
-            FleetAction::Apply { bundle_path } => commands::workspace::cmd_fleet_apply(bundle_path),
+                encrypted,
+                machine,
+            } => commands::workspace::cmd_fleet_export(bundle_path, include, encrypted, machine),
+            FleetAction::Apply {
+                bundle_path,
+                encrypted,
+            } => commands::workspace::cmd_fleet_apply(bundle_path, encrypted),
         },
         Commands::Serve { addr, data_dir } => commands::serve::cmd_serve(addr, data_dir),
+        Commands::Mcp { in_memory } => commands::mcp::cmd_mcp(in_memory),
+        Commands::Symbols { path, json } => commands::symbols::cmd_symbols(path, json),
     }
 }

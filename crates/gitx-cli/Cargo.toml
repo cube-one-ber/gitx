@@ -17,6 +17,7 @@ gitx-core.workspace = true
 gitx-crypto.workspace = true
 gitx-git-bridge.workspace = true
 gitx-merge.workspace = true
+gitx-sdk.workspace = true
 gitx-server.workspace = true
 gitx-store.workspace = true
 gitx-vfs.workspace = true

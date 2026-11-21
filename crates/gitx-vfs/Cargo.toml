@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 chrono.workspace = true
 gitx-core.workspace = true
+gitx-crypto.workspace = true
 gitx-store.workspace = true
 globset.workspace = true
 reflink-copy.workspace = true

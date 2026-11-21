@@ -1,0 +1,23 @@
+[package]
+name = "gitx-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gitx-bench"
+path = "src/bench_main.rs"
+
+[dependencies]
+chrono.workspace = true
+gitx-core.workspace = true
+gitx-merge.workspace = true
+gitx-server.workspace = true
+gitx-store.workspace = true
+gitx-vfs.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

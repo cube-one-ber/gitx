@@ -536,7 +536,7 @@ fn is_unchanged_regular_file(dest: &Path, expected_blob: ObjectHash, expected_si
     Ok(blob.manifest_hash() == expected_blob)
 }
 
-fn remove_if_exists(path: &Path) -> Result<()> {
+pub(crate) fn remove_if_exists(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
             make_writable_if_needed(path);
@@ -548,7 +548,7 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn make_writable_if_needed(path: &Path) {
+pub(crate) fn make_writable_if_needed(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -80,8 +80,20 @@ pub fn merge_bytes(path: &str, base: &[u8], ours: &[u8], theirs: &[u8]) -> Merge
         return outcome;
     }
 
-    // Standard 3-way line merge
-    merge_lines(base_str, ours_str, theirs_str)
+    // Standard 3-way line merge first (guarantees zero formatting churn on clean line merges)
+    let line_outcome = merge_lines(base_str, ours_str, theirs_str);
+    let needs_ast_merge = match &line_outcome {
+        MergeOutcome::Conflict { .. } => true,
+        MergeOutcome::Clean(bytes) => std::str::from_utf8(bytes)
+            .is_ok_and(|merged| crate::ast_merge::has_duplicate_top_level_keys(path, merged)),
+    };
+    if needs_ast_merge
+        && let Some(ast_outcome) =
+            crate::ast_merge::try_ast_merge(path, base_str, ours_str, theirs_str)
+    {
+        return ast_outcome;
+    }
+    line_outcome
 }
 
 fn has_extension_ci(path: &str, expected: &str) -> bool {
@@ -413,7 +425,7 @@ fn edit_precedes(a: &Edit, b: &Edit) -> bool {
             || (a.base_start == b.base_start && a.base_end < b.base_end))
 }
 
-fn merge_lines(base: &str, ours: &str, theirs: &str) -> MergeOutcome {
+pub(crate) fn merge_lines(base: &str, ours: &str, theirs: &str) -> MergeOutcome {
     let diff_ours = TextDiff::from_lines(base, ours);
     let diff_theirs = TextDiff::from_lines(base, theirs);
 

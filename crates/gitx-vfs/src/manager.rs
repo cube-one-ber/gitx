@@ -1,5 +1,6 @@
 use crate::backend::WorkspaceBackend;
 use crate::cow::CowWorkspace;
+use crate::lazy::LazyWorkspace;
 use crate::memory::MemVfs;
 use gitx_core::oplog::WorkspaceBackendKind;
 use gitx_core::{
@@ -174,6 +175,44 @@ impl WorkspaceManager {
     ) -> Result<(WorkspaceRef, CowWorkspace)> {
         let base = self.resolve_bookmark(bookmark)?;
         self.create_cow_workspace(name, root, base)
+    }
+
+    /// Create a new demand-paged [`LazyWorkspace`] backed by `overlay_root` and mounted
+    /// instantaneously in O(1) with zero base files written to disk.
+    pub fn create_lazy_workspace(
+        &self,
+        name: impl Into<String>,
+        overlay_root: impl AsRef<Path>,
+        base_changeset: ObjectHash,
+    ) -> Result<(WorkspaceRef, LazyWorkspace)> {
+        let name = validate_workspace_name(name.into())?;
+        self.ensure_workspace_name_available(&name)?;
+
+        let cs = self.store.get_changeset(base_changeset)?;
+        let tree = collect_materializable_tree(self.store.as_ref(), &cs)?;
+        let ws = LazyWorkspace::mount(overlay_root.as_ref(), Arc::clone(&self.store), tree)?;
+
+        let ws_ref = WorkspaceRef {
+            name,
+            root_path: Some(overlay_root.as_ref().to_string_lossy().into_owned()),
+            backend: WorkspaceBackendKind::LazyMount,
+            head_changeset: cs.id,
+            head_change_id: cs.change_id,
+        };
+        self.store.put_workspace(&ws_ref)?;
+
+        Ok((ws_ref, ws))
+    }
+
+    /// Create a new demand-paged [`LazyWorkspace`] based on a named bookmark (e.g. `"master"`).
+    pub fn create_lazy_workspace_from_bookmark(
+        &self,
+        name: impl Into<String>,
+        overlay_root: impl AsRef<Path>,
+        bookmark: &str,
+    ) -> Result<(WorkspaceRef, LazyWorkspace)> {
+        let base = self.resolve_bookmark(bookmark)?;
+        self.create_lazy_workspace(name, overlay_root, base)
     }
 
     pub fn get_workspace(&self, name: &str) -> Result<Option<WorkspaceRef>> {

@@ -1,11 +1,13 @@
 //! 3-way text and semantic merging, Jujutsu-style algebraic tree merging,
 //! unified diffs, Graphite-style interdiffs, and inverse patches for agent checkpoint undo.
 
+pub mod ast_merge;
 pub mod diff;
 pub mod merge;
 pub mod tree_merge;
 pub mod undo_patch;
 
+pub use ast_merge::{AstSymbol, extract_ast_symbols, symbol_at_line, try_ast_merge};
 pub use diff::{DiffStatus, TreeDiffEntry, diff_trees, render_interdiff, unified_diff};
 pub use merge::{MergeOutcome, merge_bytes};
 pub use tree_merge::{

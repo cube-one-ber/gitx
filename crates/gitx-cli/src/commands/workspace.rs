@@ -1,10 +1,12 @@
-use crate::repo::Repo;
+use crate::repo::{Repo, WorkspacePointer, save_json_file};
 use anyhow::{Result, bail};
-use gitx_core::{DomainId, OpKind};
+use gitx_core::{ChangeSetBuilder, DomainId, OpKind, VisibilityPolicy};
+use gitx_crypto::{PublicKeyBundle, UserKeyPair};
 use gitx_git_bridge::export_to_git_repo;
 use gitx_store::ObjectStore;
 use gitx_vfs::{
-    FleetOverlayBundle, FleetWorkspaceMetadata, WorkspaceManager, apply_overlay,
+    EncryptedFleetBundle, FleetOverlayBundle, FleetWorkspaceMetadata, WorkspaceManager,
+    apply_encrypted_overlay, apply_overlay, export_encrypted_overlay,
     export_overlay_with_metadata,
 };
 use std::env;
@@ -12,7 +14,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub fn cmd_ws_add(name: String, path: Option<PathBuf>, mem: bool) -> Result<()> {
+pub fn cmd_ws_add(name: String, path: Option<PathBuf>, mem: bool, lazy: bool) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
     let snap = repo.snapshot_working_copy()?;
 
@@ -23,12 +25,40 @@ pub fn cmd_ws_add(name: String, path: Option<PathBuf>, mem: bool) -> Result<()> 
 
     let store_dyn: Arc<dyn ObjectStore> = repo.store.clone();
     let mgr = WorkspaceManager::with_pool_dir(store_dyn, repo.pool_dir());
+    let mut lazy_virtual_count = None;
+
     let ws_ref = if mem {
         let (ws_ref, _vfs) = mgr.create_mem_workspace(&name, base_hash)?;
         ws_ref
+    } else if lazy {
+        let ws_dir = path.unwrap_or_else(|| repo.gitx_dir.join("workspaces").join(&name));
+        let (ws_ref, lazy_ws) = mgr.create_lazy_workspace(&name, &ws_dir, base_hash)?;
+        lazy_virtual_count = Some(lazy_ws.stats().total_virtual_files);
+        ws_ref
     } else {
         let ws_dir = path.unwrap_or_else(|| repo.gitx_dir.join("workspaces").join(&name));
-        let (ws_ref, _cow) = mgr.create_cow_workspace(&name, &ws_dir, base_hash)?;
+        let (mut ws_ref, _cow) = mgr.create_cow_workspace(&name, &ws_dir, base_hash)?;
+
+        // Give each CoW workspace its own child working-copy ChangeSet (`@`) on top of `base_hash`
+        // so parallel edits diverge cleanly from the shared base and auto-merge on `gitx land`.
+        let base_cs = repo.store.get_changeset(base_hash)?;
+        let working_cs = ChangeSetBuilder::new(repo.config.author.clone())
+            .parents(vec![base_cs.id])
+            .public_parents(vec![base_cs.public_projection_hash])
+            .domain_trees(base_cs.domain_trees.clone())
+            .visibility(VisibilityPolicy::public())
+            .description("")
+            .build();
+        repo.store.put_changeset(&working_cs)?;
+        ws_ref.head_changeset = working_cs.id;
+        ws_ref.head_change_id = working_cs.change_id;
+        repo.store.put_workspace(&ws_ref)?;
+
+        let pointer = WorkspacePointer {
+            gitx_dir: repo.gitx_dir.clone(),
+            workspace: ws_ref.name.clone(),
+        };
+        save_json_file(&ws_dir.join(".gitx").join("workspace.json"), &pointer)?;
         ws_ref
     };
 
@@ -42,13 +72,24 @@ pub fn cmd_ws_add(name: String, path: Option<PathBuf>, mem: bool) -> Result<()> 
         ),
     )?;
 
-    println!(
-        "Created workspace '{}' (backend: {:?}, head: {}, path: {})",
-        ws_ref.name,
-        ws_ref.backend,
-        ws_ref.head_changeset.short(),
-        ws_ref.root_path.as_deref().unwrap_or("<memory>")
-    );
+    if let Some(virtual_files) = lazy_virtual_count {
+        println!(
+            "Created workspace '{}' (backend: {:?}, head: {}, path: {}, virtual_files: {}, overlay_dirty: 0)",
+            ws_ref.name,
+            ws_ref.backend,
+            ws_ref.head_changeset.short(),
+            ws_ref.root_path.as_deref().unwrap_or("<memory>"),
+            virtual_files
+        );
+    } else {
+        println!(
+            "Created workspace '{}' (backend: {:?}, head: {}, path: {})",
+            ws_ref.name,
+            ws_ref.backend,
+            ws_ref.head_changeset.short(),
+            ws_ref.root_path.as_deref().unwrap_or("<memory>")
+        );
+    }
     Ok(())
 }
 
@@ -128,7 +169,12 @@ pub fn cmd_git_export(target_dir: PathBuf, domains: String) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_fleet_export(bundle_path: PathBuf, include: String) -> Result<()> {
+pub fn cmd_fleet_export(
+    bundle_path: PathBuf,
+    include: String,
+    encrypted: bool,
+    machine: Option<String>,
+) -> Result<()> {
     let cwd = env::current_dir()?;
     let patterns: Vec<&str> = include
         .split(',')
@@ -136,7 +182,38 @@ pub fn cmd_fleet_export(bundle_path: PathBuf, include: String) -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let metadata = if cwd.join(".gitx").is_dir() {
+    if encrypted {
+        let repo = Repo::open(&cwd)?;
+        let keyring = repo.load_keyring()?;
+        let mut recipients: Vec<PublicKeyBundle> = keyring.recipients.values().cloned().collect();
+        if recipients.is_empty() {
+            let local_kp = UserKeyPair::from_secret_bundle(&keyring.local)?;
+            recipients.push(local_kp.public_bundle());
+        }
+
+        let machine_id = resolve_machine_id(machine);
+        let domain = DomainId::secret("fleet")?;
+        let bundle = export_encrypted_overlay(&cwd, &patterns, &machine_id, &domain, 1, &recipients)?;
+        let json = bundle.to_json()?;
+
+        if let Some(parent) = bundle_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&bundle_path, json)?;
+
+        println!(
+            "Exported encrypted fleet overlay bundle to {} ({} file(s), machine: {}, recipients: {})",
+            bundle_path.display(),
+            bundle.file_count,
+            bundle.machine_id,
+            recipients.len()
+        );
+        return Ok(());
+    }
+
+    let mut metadata = if cwd.join(".gitx").is_dir() {
         if let Ok(repo) = Repo::open(&cwd) {
             if let Ok(ws) = repo.active_workspace_ref() {
                 FleetWorkspaceMetadata::from_workspace_ref(&ws)
@@ -149,6 +226,10 @@ pub fn cmd_fleet_export(bundle_path: PathBuf, include: String) -> Result<()> {
     } else {
         FleetWorkspaceMetadata::default()
     };
+
+    if let Some(m) = machine {
+        metadata.source_machine = Some(m);
+    }
 
     let bundle = export_overlay_with_metadata(&cwd, &patterns, metadata)?;
     let json = bundle.to_json()?;
@@ -171,10 +252,40 @@ pub fn cmd_fleet_export(bundle_path: PathBuf, include: String) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_fleet_apply(bundle_path: PathBuf) -> Result<()> {
+pub fn cmd_fleet_apply(bundle_path: PathBuf, encrypted: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let json = fs::read_to_string(&bundle_path)?;
-    let bundle = FleetOverlayBundle::from_json(&json)?;
+
+    if encrypted {
+        let repo = Repo::open(&cwd)?;
+        let keypair = repo.load_local_keypair()?;
+        let bundle = EncryptedFleetBundle::from_json(&json)?;
+        let restored = apply_encrypted_overlay(&cwd, &bundle, &keypair)?;
+
+        println!(
+            "Applied encrypted fleet overlay bundle from {} ({} file(s) restored, machine: {})",
+            bundle_path.display(),
+            restored.len(),
+            bundle.machine_id
+        );
+        for path in &restored {
+            println!("  -> {path}");
+        }
+        return Ok(());
+    }
+
+    let bundle = match FleetOverlayBundle::from_json(&json) {
+        Ok(b) => b,
+        Err(err) => {
+            if EncryptedFleetBundle::from_json(&json).is_ok() {
+                bail!(
+                    "fleet overlay bundle '{}' is end-to-end encrypted; re-run with --encrypted",
+                    bundle_path.display()
+                );
+            }
+            return Err(err.into());
+        }
+    };
     let restored = apply_overlay(&cwd, &bundle)?;
 
     println!(
@@ -186,4 +297,12 @@ pub fn cmd_fleet_apply(bundle_path: PathBuf) -> Result<()> {
         println!("  -> {path}");
     }
     Ok(())
+}
+
+fn resolve_machine_id(machine: Option<String>) -> String {
+    machine
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env::var("HOSTNAME").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| env::var("USER").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "local".to_string())
 }

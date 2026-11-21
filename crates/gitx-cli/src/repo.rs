@@ -38,6 +38,12 @@ pub struct RepoConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspacePointer {
+    pub gitx_dir: PathBuf,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyringFile {
     pub local: SecretKeyBundle,
     pub recipients: BTreeMap<String, PublicKeyBundle>,
@@ -235,11 +241,58 @@ impl Repo {
                     config,
                 });
             }
+            if candidate.is_dir() && candidate.join("workspace.json").is_file() {
+                let pointer: WorkspacePointer = load_json_file(&candidate.join("workspace.json"))?;
+                let mut config: RepoConfig = load_json_file(&pointer.gitx_dir.join("config.json"))?;
+                config.active_workspace = pointer.workspace;
+                let store = Arc::new(LocalStore::open(pointer.gitx_dir.join("store"))?);
+                let context = ContextStore::open(pointer.gitx_dir.join("context.db"))?;
+                return Ok(Self {
+                    root: cur,
+                    gitx_dir: pointer.gitx_dir,
+                    store,
+                    context,
+                    config,
+                });
+            }
             if !cur.pop() {
                 bail!(
                     "not inside a gitx repository (no .gitx directory found from {})",
                     start_dir.display()
                 );
+            }
+        }
+    }
+
+    /// Locate a repository root and its [`RepoConfig`] without opening `LocalStore` or
+    /// `ContextStore` (avoiding exclusive database locks when handing off to `AgentRepo`).
+    pub fn discover_config(start_dir: &Path) -> Option<(PathBuf, RepoConfig)> {
+        let mut cur = fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
+        loop {
+            let candidate = cur.join(".gitx");
+            if candidate.is_dir()
+                && candidate.join("config.json").is_file()
+                && let Ok(config) = load_json_file::<RepoConfig>(&candidate.join("config.json"))
+            {
+                return Some((cur, config));
+            }
+            if candidate.is_dir()
+                && candidate.join("workspace.json").is_file()
+                && let Ok(pointer) =
+                    load_json_file::<WorkspacePointer>(&candidate.join("workspace.json"))
+                && let Ok(mut config) =
+                    load_json_file::<RepoConfig>(&pointer.gitx_dir.join("config.json"))
+            {
+                config.active_workspace = pointer.workspace;
+                let primary_root = pointer
+                    .gitx_dir
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or(cur);
+                return Some((primary_root, config));
+            }
+            if !cur.pop() {
+                return None;
             }
         }
     }
@@ -260,10 +313,16 @@ impl Repo {
         let acl_path = self.root.join(".gitxacl");
         if acl_path.is_file() {
             let text = fs::read_to_string(&acl_path)?;
-            Ok(AclPolicy::parse(&text)?)
-        } else {
-            Ok(AclPolicy::default_secure())
+            return Ok(AclPolicy::parse(&text)?);
         }
+        if let Some(primary_root) = self.gitx_dir.parent() {
+            let primary_acl = primary_root.join(".gitxacl");
+            if primary_acl.is_file() {
+                let text = fs::read_to_string(&primary_acl)?;
+                return Ok(AclPolicy::parse(&text)?);
+            }
+        }
+        Ok(AclPolicy::default_secure())
     }
 
     pub fn load_keyring(&self) -> Result<KeyringFile> {

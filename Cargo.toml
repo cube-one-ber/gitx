@@ -9,7 +9,9 @@ members = [
     "crates/gitx-context",
     "crates/gitx-git-bridge",
     "crates/gitx-server",
+    "crates/gitx-sdk",
     "crates/gitx-cli",
+    "crates/gitx-sim",
 ]
 
 [workspace.package]
@@ -26,6 +28,7 @@ gitx-vfs = { path = "crates/gitx-vfs" }
 gitx-context = { path = "crates/gitx-context" }
 gitx-git-bridge = { path = "crates/gitx-git-bridge" }
 gitx-server = { path = "crates/gitx-server" }
+gitx-sdk = { path = "crates/gitx-sdk" }
 
 anyhow = "1"
 axum = "0.8"
@@ -59,6 +62,10 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.24"
+tree-sitter-javascript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
 ulid = { version = "1", features = ["serde"] }
 walkdir = "2"
 x25519-dalek = { version = "2", features = ["static_secrets", "serde"] }

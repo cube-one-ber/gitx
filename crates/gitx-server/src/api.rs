@@ -2,6 +2,7 @@ use crate::auth::{
     AuthenticatedPrincipal, can_publish_embargo, can_write_domain_effective,
     effective_allowed_domains,
 };
+use crate::derived::DerivedStats;
 use crate::error::{ApiError, ApiResult};
 use crate::state::{AppState, RepoHandle, RepoInfo};
 use axum::Json;
@@ -20,7 +21,7 @@ use gitx_merge::{merge_domain_trees, unified_diff};
 use gitx_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use similar::{DiffOp, TextDiff};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -582,8 +583,16 @@ pub async fn land(
         Some(target_head) => {
             // Target has moved since incoming's base: perform 3-way semantic auto-merge across every domain.
             let target_cs = repo.store.get_changeset(target_head)?;
-            let lca_hash = find_lca(repo.store.as_ref(), target_head, incoming_cs.id)
-                .or_else(|| incoming_cs.parents.first().copied());
+            let lca_hash = {
+                let mut derived = repo
+                    .derived
+                    .write()
+                    .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+                derived
+                    .commit_graph
+                    .merge_base(repo.store.as_ref(), target_head, incoming_cs.id)?
+            }
+            .or_else(|| incoming_cs.parents.first().copied());
             let base_cs = lca_hash
                 .map(|h| repo.store.get_changeset(h))
                 .transpose()?;
@@ -1009,13 +1018,81 @@ pub async fn grep(
         }));
     };
 
-    let files = materialize_authorized_files(repo.store.as_ref(), &policy, &principal, &cs)?;
+    let filtered = policy.filter_domain_trees(&principal, &cs);
+    let ordered: Vec<(DomainId, ObjectHash)> =
+        ordered_domain_entries(&filtered, &cs.visibility.primary_domain)
+            .into_iter()
+            .map(|(dom, hash)| (dom.clone(), hash))
+            .collect();
+
+    // Query domain-partitioned TrigramIndex (strictly scoped to caller's authorized domains).
+    let mut candidate_files: BTreeMap<String, (DomainId, ObjectHash)> = BTreeMap::new();
+    let fast_hit = {
+        let derived = repo
+            .derived
+            .read()
+            .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+        if ordered
+            .iter()
+            .all(|(dom, hash)| derived.trigram.contains(*hash, dom))
+        {
+            for (idx, (dom, hash)) in ordered.iter().enumerate() {
+                if let Some(cands) = derived.trigram.try_query_cached(*hash, dom, &query.q) {
+                    for (path, blob_hash) in cands {
+                        let shadowed = ordered[idx + 1..].iter().any(|(later_dom, later_hash)| {
+                            derived
+                                .trigram
+                                .cached_tree_contains_path(*later_hash, later_dom, &path)
+                                .unwrap_or(false)
+                        });
+                        if !shadowed {
+                            candidate_files.insert(path, (dom.clone(), blob_hash));
+                        }
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    };
+
+    if !fast_hit {
+        let mut derived = repo
+            .derived
+            .write()
+            .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+        let mut per_domain_candidates: Vec<(DomainId, Vec<(String, ObjectHash)>)> =
+            Vec::with_capacity(ordered.len());
+        for (dom, hash) in &ordered {
+            let cands =
+                derived
+                    .trigram
+                    .query_or_build(repo.store.as_ref(), *hash, dom, &query.q)?;
+            per_domain_candidates.push((dom.clone(), cands));
+        }
+        for (idx, (dom, cands)) in per_domain_candidates.into_iter().enumerate() {
+            for (path, blob_hash) in cands {
+                let shadowed = ordered[idx + 1..].iter().any(|(later_dom, later_hash)| {
+                    derived
+                        .trigram
+                        .cached_tree_contains_path(*later_hash, later_dom, &path)
+                        .unwrap_or(false)
+                });
+                if !shadowed {
+                    candidate_files.insert(path, (dom.clone(), blob_hash));
+                }
+            }
+        }
+    }
+
     let case_insensitive = query.case_insensitive.unwrap_or(false);
     let needle_lower = query.q.to_lowercase();
 
     let mut matches = Vec::new();
-    for (path, (dom, bytes)) in &files {
-        let Ok(text) = std::str::from_utf8(bytes) else {
+    for (path, (dom, blob_hash)) in &candidate_files {
+        let bytes = repo.store.read_blob_bytes(*blob_hash)?;
+        let Ok(text) = std::str::from_utf8(&bytes) else {
             continue;
         };
         for (idx, line) in text.lines().enumerate() {
@@ -1090,29 +1167,57 @@ pub async fn blame(
         )));
     };
 
-    let head_files =
-        materialize_authorized_files(repo.store.as_ref(), &policy, &principal, &head_cs)?;
-    if !head_files.contains_key(&norm_path) {
+    // Resolve the highest-priority authorized domain owning `norm_path` at `head_cs`.
+    let filtered = policy.filter_domain_trees(&principal, &head_cs);
+    let ordered = ordered_domain_entries(&filtered, &head_cs.visibility.primary_domain);
+    let mut target_domain: Option<DomainId> = None;
+    for (dom, tree_hash) in ordered.into_iter().rev() {
+        let tree = repo.store.get_tree(tree_hash)?;
+        if matches!(tree.entries.get(&norm_path), Some(EntryKind::File { .. })) {
+            target_domain = Some(dom.clone());
+            break;
+        }
+    }
+
+    let Some(target_domain) = target_domain else {
         return Err(ApiError::not_found(format!(
             "path '{norm_path}' not found at revision {}",
             head_cs.id
         )));
-    }
+    };
 
-    // Collect first-parent visible history chain from oldest to newest.
-    let mut chain: Vec<ChangeSet> = Vec::new();
-    let mut cursor = Some(head_cs.clone());
-    let mut visited: HashSet<ObjectHash> = HashSet::new();
-
-    while let Some(cs) = cursor {
-        if !visited.insert(cs.id) {
-            break;
+    // Query domain-partitioned PathHistoryIndex (accelerates blame by skipping untouched commits).
+    let touching_commits: Vec<ObjectHash> = {
+        let cached = {
+            let derived = repo
+                .derived
+                .read()
+                .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+            derived
+                .path_history
+                .get_cached(head_cs.id, &norm_path, &target_domain)
+        };
+        if let Some(commits) = cached {
+            commits
+        } else {
+            let mut derived = repo
+                .derived
+                .write()
+                .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+            let crate::derived::DerivedIndex {
+                commit_graph,
+                path_history,
+                ..
+            } = &mut *derived;
+            path_history.history_for_path(
+                repo.store.as_ref(),
+                commit_graph,
+                head_cs.id,
+                &norm_path,
+                &target_domain,
+            )?
         }
-        let next = first_visible_parent(repo.store.as_ref(), &policy, &principal, &cs)?;
-        chain.push(cs);
-        cursor = next;
-    }
-    chain.reverse();
+    };
 
     #[derive(Clone)]
     struct LineAttr {
@@ -1127,14 +1232,29 @@ pub async fn blame(
     let mut prev_text = String::new();
     let mut prev_attrs: Vec<LineAttr> = Vec::new();
 
-    for cs in &chain {
-        let files = materialize_authorized_files(repo.store.as_ref(), &policy, &principal, cs)?;
-        let Some((_, bytes)) = files.get(&norm_path) else {
+    for cs_id in touching_commits {
+        let cs = repo.store.get_changeset(cs_id)?;
+        if !policy.can_read_changeset(&principal, &cs) {
+            continue;
+        }
+        let blob_opt = if let Some(&tree_hash) = cs.domain_trees.get(&target_domain) {
+            let tree = repo.store.get_tree(tree_hash)?;
+            match tree.entries.get(&norm_path) {
+                Some(EntryKind::File { blob_hash, .. }) => {
+                    Some(repo.store.read_blob_bytes(*blob_hash)?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let Some(bytes) = blob_opt else {
             prev_text.clear();
             prev_attrs.clear();
             continue;
         };
-        let curr_text = String::from_utf8_lossy(bytes).into_owned();
+        let curr_text = String::from_utf8_lossy(&bytes).into_owned();
         let curr_lines: Vec<&str> = curr_text.lines().collect();
 
         let cs_attr = LineAttr {
@@ -1577,10 +1697,37 @@ pub async fn publish_embargo(
 }
 
 // ---------------------------------------------------------------------------
+// Derived Data Engine Stats (ACL-Filtered)
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/repos/{owner}/{name}/derived/stats`
+pub async fn derived_stats(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path((owner, name)): Path<(String, String)>,
+) -> ApiResult<Json<DerivedStats>> {
+    let repo = get_existing_repo(&state, &owner, &name)?;
+    let policy = repo.acl_snapshot()?;
+    let allowed: BTreeSet<DomainId> =
+        effective_allowed_domains(repo.store.as_ref(), &policy, &principal)
+            .into_iter()
+            .collect();
+    let derived = repo
+        .derived
+        .read()
+        .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+    Ok(Json(derived.stats_for_domains(&allowed)))
+}
+
+// ---------------------------------------------------------------------------
 // Internal Helpers
 // ---------------------------------------------------------------------------
 
-fn get_existing_repo(state: &AppState, owner: &str, name: &str) -> ApiResult<Arc<RepoHandle>> {
+pub(crate) fn get_existing_repo(
+    state: &AppState,
+    owner: &str,
+    name: &str,
+) -> ApiResult<Arc<RepoHandle>> {
     state
         .get_repo(owner, name)?
         .ok_or_else(|| ApiError::not_found(format!("repository '{owner}/{name}' not found")))
@@ -1791,7 +1938,10 @@ fn materialize_authorized_files(
     Ok(out)
 }
 
-fn compute_public_parents(store: &dyn ObjectStore, parents: &[ObjectHash]) -> Vec<ObjectHash> {
+pub(crate) fn compute_public_parents(
+    store: &dyn ObjectStore,
+    parents: &[ObjectHash],
+) -> Vec<ObjectHash> {
     let mut out = Vec::new();
     for &p in parents {
         if let Ok(cs) = store.get_changeset(p) {
@@ -1811,7 +1961,7 @@ fn compute_public_parents(store: &dyn ObjectStore, parents: &[ObjectHash]) -> Ve
     out
 }
 
-fn load_domain_tree_or_empty(
+pub(crate) fn load_domain_tree_or_empty(
     store: &dyn ObjectStore,
     cs: Option<&ChangeSet>,
     domain: &DomainId,
@@ -1822,51 +1972,4 @@ fn load_domain_tree_or_empty(
         return Ok(store.get_tree(tree_hash)?);
     }
     Ok(DomainTree::new(domain.clone()))
-}
-
-/// Find the closest common ancestor (LCA) of two ChangeSets in the DAG.
-fn find_lca(store: &dyn ObjectStore, a: ObjectHash, b: ObjectHash) -> Option<ObjectHash> {
-    let mut dist_a: HashMap<ObjectHash, usize> = HashMap::new();
-    let mut queue: VecDeque<(ObjectHash, usize)> = VecDeque::new();
-    queue.push_back((a, 0));
-
-    while let Some((hash, d)) = queue.pop_front() {
-        if dist_a.contains_key(&hash) {
-            continue;
-        }
-        dist_a.insert(hash, d);
-        if let Ok(cs) = store.get_changeset(hash) {
-            for &parent in &cs.parents {
-                if !dist_a.contains_key(&parent) {
-                    queue.push_back((parent, d + 1));
-                }
-            }
-        }
-    }
-
-    let mut visited_b: HashSet<ObjectHash> = HashSet::new();
-    let mut queue_b: VecDeque<(ObjectHash, usize)> = VecDeque::new();
-    queue_b.push_back((b, 0));
-    let mut best: Option<(usize, ObjectHash)> = None;
-
-    while let Some((hash, d_b)) = queue_b.pop_front() {
-        if !visited_b.insert(hash) {
-            continue;
-        }
-        if let Some(&d_a) = dist_a.get(&hash) {
-            let score = d_a + d_b;
-            if best.is_none_or(|(best_score, _)| score < best_score) {
-                best = Some((score, hash));
-            }
-        }
-        if let Ok(cs) = store.get_changeset(hash) {
-            for &parent in &cs.parents {
-                if !visited_b.contains(&parent) {
-                    queue_b.push_back((parent, d_b + 1));
-                }
-            }
-        }
-    }
-
-    best.map(|(_, h)| h)
 }

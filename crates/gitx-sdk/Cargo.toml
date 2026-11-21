@@ -1,0 +1,20 @@
+[package]
+name = "gitx-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+gitx-context.workspace = true
+gitx-core.workspace = true
+gitx-crypto.workspace = true
+gitx-merge.workspace = true
+gitx-store.workspace = true
+gitx-vfs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
