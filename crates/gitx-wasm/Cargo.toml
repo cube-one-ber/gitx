@@ -1,0 +1,23 @@
+[package]
+name = "gitx-wasm"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+description = "Pure-Rust WebAssembly (wasm32-wasip1) bindings for GitX in-memory AgentRepo and MCP server"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+gitx-context = { workspace = true, default-features = false }
+gitx-core.workspace = true
+gitx-crypto.workspace = true
+gitx-merge = { workspace = true, default-features = false }
+gitx-sdk = { workspace = true, default-features = false }
+gitx-store = { workspace = true, default-features = false }
+gitx-vfs = { workspace = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true

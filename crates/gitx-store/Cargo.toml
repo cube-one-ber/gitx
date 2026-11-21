@@ -4,16 +4,21 @@ version.workspace = true
 edition.workspace = true
 license-file.workspace = true
 
+[features]
+default = ["local", "distributed"]
+local = ["dep:rusqlite"]
+distributed = ["local", "dep:bytes", "dep:object_store", "dep:tokio"]
+
 [dependencies]
 bincode.workspace = true
-bytes.workspace = true
+bytes = { workspace = true, optional = true }
 chrono.workspace = true
 gitx-core.workspace = true
 lz4_flex.workspace = true
-object_store.workspace = true
-rusqlite.workspace = true
+object_store = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
 serde.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

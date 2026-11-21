@@ -1,10 +1,15 @@
 use crate::anchor::relocate_anchor;
 use crate::checkpoint::Checkpoint;
 use crate::record::{CodeAnchor, ContextRecord};
+#[cfg(feature = "sqlite")]
 use chrono::SecondsFormat;
 use gitx_core::{ChangeId, DomainId, GitxError, Result};
+#[cfg(feature = "sqlite")]
 use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use serde::{Deserialize, Serialize};
+#[cfg(not(feature = "sqlite"))]
+use std::collections::BTreeMap;
+#[cfg(feature = "sqlite")]
 use std::path::Path;
 use std::sync::Mutex;
 use ulid::Ulid;
@@ -18,11 +23,13 @@ pub struct WhyMatch {
     pub relocated_lines: (u32, u32),
 }
 
+#[cfg(feature = "sqlite")]
 /// SQLite-backed store for durable "Why" context records and sub-commit agent checkpoints.
 pub struct ContextStore {
     conn: Mutex<Connection>,
 }
 
+#[cfg(feature = "sqlite")]
 impl ContextStore {
     /// Open or create a persistent SQLite context store at `path` in WAL mode.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -359,6 +366,142 @@ impl ContextStore {
     }
 }
 
+#[cfg(not(feature = "sqlite"))]
+#[derive(Default)]
+struct InMemoryState {
+    records: BTreeMap<crate::record::ContextId, ContextRecord>,
+    checkpoints: BTreeMap<Ulid, Checkpoint>,
+}
+
+#[cfg(not(feature = "sqlite"))]
+/// Pure-Rust in-memory store for durable "Why" context records and sub-commit agent checkpoints.
+pub struct ContextStore {
+    state: Mutex<InMemoryState>,
+}
+
+#[cfg(not(feature = "sqlite"))]
+impl ContextStore {
+    /// Create a pure-Rust ephemeral in-memory context store (WASM / zero-C compatible).
+    pub fn in_memory() -> Result<Self> {
+        Ok(Self {
+            state: Mutex::new(InMemoryState::default()),
+        })
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, InMemoryState>> {
+        self.state
+            .lock()
+            .map_err(|_| GitxError::Storage("context store mutex poisoned".to_string()))
+    }
+
+    /// Persist a durable context record and index its code anchors.
+    pub fn add_record(&self, rec: &ContextRecord) -> Result<()> {
+        let mut state = self.lock_state()?;
+        state.records.insert(rec.id, rec.clone());
+        Ok(())
+    }
+
+    /// Fetch all context records for `change_id` whose visibility domain is in `allowed_domains`.
+    pub fn records_for_change(
+        &self,
+        change_id: ChangeId,
+        allowed_domains: &[DomainId],
+    ) -> Result<Vec<ContextRecord>> {
+        if allowed_domains.is_empty() {
+            return Ok(Vec::new());
+        }
+        let state = self.lock_state()?;
+        let mut records: Vec<ContextRecord> = state
+            .records
+            .values()
+            .filter(|rec| rec.change_id == change_id && rec.is_visible_to(allowed_domains))
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        Ok(records)
+    }
+
+    /// Answer "why does this line exist?" by loading authorized records anchored to `path`,
+    /// relocating each anchor against `current_file_content`, and returning those covering
+    /// `line_1based`.
+    pub fn why(
+        &self,
+        path: &str,
+        line_1based: u32,
+        current_file_content: &str,
+        allowed_domains: &[DomainId],
+    ) -> Result<Vec<WhyMatch>> {
+        if allowed_domains.is_empty() || line_1based == 0 {
+            return Ok(Vec::new());
+        }
+        let candidates: Vec<ContextRecord> = {
+            let state = self.lock_state()?;
+            let mut list: Vec<ContextRecord> = state
+                .records
+                .values()
+                .filter(|rec| {
+                    rec.is_visible_to(allowed_domains)
+                        && rec.anchors.iter().any(|a| a.path == path)
+                })
+                .cloned()
+                .collect();
+            list.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+            list
+        };
+
+        let mut matches = Vec::new();
+        for rec in candidates {
+            for anchor in &rec.anchors {
+                if anchor.path != path {
+                    continue;
+                }
+                if let Some((start, end)) = relocate_anchor(anchor, current_file_content)
+                    && line_1based >= start
+                    && line_1based <= end
+                {
+                    matches.push(WhyMatch {
+                        record: rec.clone(),
+                        matched_anchor: anchor.clone(),
+                        relocated_lines: (start, end),
+                    });
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    /// Persist a sub-commit agent checkpoint.
+    pub fn save_checkpoint(&self, cp: &Checkpoint) -> Result<()> {
+        let mut state = self.lock_state()?;
+        state.checkpoints.insert(cp.id, cp.clone());
+        Ok(())
+    }
+
+    /// List checkpoints for a workspace, newest first, up to `limit`.
+    pub fn list_checkpoints(&self, workspace: &str, limit: usize) -> Result<Vec<Checkpoint>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.lock_state()?;
+        let mut checkpoints: Vec<Checkpoint> = state
+            .checkpoints
+            .values()
+            .filter(|cp| cp.workspace == workspace)
+            .cloned()
+            .collect();
+        checkpoints.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        checkpoints.truncate(limit);
+        Ok(checkpoints)
+    }
+
+    /// Fetch a single checkpoint by its ULID.
+    pub fn get_checkpoint(&self, id: Ulid) -> Result<Option<Checkpoint>> {
+        let state = self.lock_state()?;
+        Ok(state.checkpoints.get(&id).cloned())
+    }
+}
+
+#[cfg(feature = "sqlite")]
 fn make_placeholders(start_index: usize, count: usize) -> String {
     (start_index..start_index + count)
         .map(|i| format!("?{i}"))
@@ -366,10 +509,12 @@ fn make_placeholders(start_index: usize, count: usize) -> String {
         .join(", ")
 }
 
+#[cfg(feature = "sqlite")]
 fn map_db_err(err: rusqlite::Error) -> GitxError {
     GitxError::Storage(err.to_string())
 }
 
+#[cfg(feature = "sqlite")]
 fn map_json_err(err: serde_json::Error) -> GitxError {
     GitxError::Serialization(err.to_string())
 }

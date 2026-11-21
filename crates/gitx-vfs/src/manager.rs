@@ -1,5 +1,8 @@
+#[cfg(feature = "cow")]
 use crate::backend::WorkspaceBackend;
+#[cfg(feature = "cow")]
 use crate::cow::CowWorkspace;
+#[cfg(feature = "cow")]
 use crate::lazy::LazyWorkspace;
 use crate::memory::MemVfs;
 use gitx_core::oplog::WorkspaceBackendKind;
@@ -10,6 +13,7 @@ use gitx_core::{
 use gitx_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(feature = "cow")]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -58,6 +62,7 @@ pub fn detect_changes(ws_tree: &DomainTree, base_tree: &DomainTree) -> Workspace
 /// bookmark or `ChangeSet` simultaneously without locking branches or blocking sibling agents.
 pub struct WorkspaceManager {
     store: Arc<dyn ObjectStore>,
+    #[cfg(feature = "cow")]
     pool_dir: Option<PathBuf>,
 }
 
@@ -65,10 +70,12 @@ impl WorkspaceManager {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self {
             store,
+            #[cfg(feature = "cow")]
             pool_dir: None,
         }
     }
 
+    #[cfg(feature = "cow")]
     /// Create a manager configured with a shared read-only CAS materialization pool for
     /// Copy-on-Write disk workspaces.
     pub fn with_pool_dir(store: Arc<dyn ObjectStore>, pool_dir: impl Into<PathBuf>) -> Self {
@@ -82,6 +89,7 @@ impl WorkspaceManager {
         &self.store
     }
 
+    #[cfg(feature = "cow")]
     pub fn pool_dir(&self) -> Option<&Path> {
         self.pool_dir.as_deref()
     }
@@ -123,6 +131,7 @@ impl WorkspaceManager {
         self.create_mem_workspace(name, base)
     }
 
+    #[cfg(feature = "cow")]
     /// Create a new Copy-on-Write disk workspace at `root`, materialized from `base_changeset`
     /// via the configured shared CAS pool (or `<root>/.gitx/pool` if no pool dir was set).
     pub fn create_cow_workspace(
@@ -138,6 +147,7 @@ impl WorkspaceManager {
         self.create_cow_workspace_with_pool(name, root, pool_dir, base_changeset)
     }
 
+    #[cfg(feature = "cow")]
     /// Create a new Copy-on-Write disk workspace at `root` with an explicit `pool_dir`.
     pub fn create_cow_workspace_with_pool(
         &self,
@@ -166,6 +176,7 @@ impl WorkspaceManager {
         Ok((ws_ref, ws))
     }
 
+    #[cfg(feature = "cow")]
     /// Create a new Copy-on-Write disk workspace based on a named bookmark (e.g. `"master"`).
     pub fn create_cow_workspace_from_bookmark(
         &self,
@@ -177,6 +188,7 @@ impl WorkspaceManager {
         self.create_cow_workspace(name, root, base)
     }
 
+    #[cfg(feature = "cow")]
     /// Create a new demand-paged [`LazyWorkspace`] backed by `overlay_root` and mounted
     /// instantaneously in O(1) with zero base files written to disk.
     pub fn create_lazy_workspace(
@@ -204,6 +216,7 @@ impl WorkspaceManager {
         Ok((ws_ref, ws))
     }
 
+    #[cfg(feature = "cow")]
     /// Create a new demand-paged [`LazyWorkspace`] based on a named bookmark (e.g. `"master"`).
     pub fn create_lazy_workspace_from_bookmark(
         &self,

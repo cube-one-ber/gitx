@@ -11,6 +11,7 @@ members = [
     "crates/gitx-proto",
     "crates/gitx-server",
     "crates/gitx-sdk",
+    "crates/gitx-wasm",
     "crates/gitx-cli",
     "crates/gitx-sim",
 ]

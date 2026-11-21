@@ -82,16 +82,19 @@ pub fn merge_bytes(path: &str, base: &[u8], ours: &[u8], theirs: &[u8]) -> Merge
 
     // Standard 3-way line merge first (guarantees zero formatting churn on clean line merges)
     let line_outcome = merge_lines(base_str, ours_str, theirs_str);
-    let needs_ast_merge = match &line_outcome {
-        MergeOutcome::Conflict { .. } => true,
-        MergeOutcome::Clean(bytes) => std::str::from_utf8(bytes)
-            .is_ok_and(|merged| crate::ast_merge::has_duplicate_top_level_keys(path, merged)),
-    };
-    if needs_ast_merge
-        && let Some(ast_outcome) =
-            crate::ast_merge::try_ast_merge(path, base_str, ours_str, theirs_str)
+    #[cfg(feature = "ast")]
     {
-        return ast_outcome;
+        let needs_ast_merge = match &line_outcome {
+            MergeOutcome::Conflict { .. } => true,
+            MergeOutcome::Clean(bytes) => std::str::from_utf8(bytes)
+                .is_ok_and(|merged| crate::ast_merge::has_duplicate_top_level_keys(path, merged)),
+        };
+        if needs_ast_merge
+            && let Some(ast_outcome) =
+                crate::ast_merge::try_ast_merge(path, base_str, ours_str, theirs_str)
+        {
+            return ast_outcome;
+        }
     }
     line_outcome
 }

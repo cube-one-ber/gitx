@@ -1,0 +1,22 @@
+{
+  "name": "@gitx/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for GitX — zero-disk WASM AgentRepo, HTTP Server Client, and MCP JSON-RPC Client",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./wasm": "./src/wasm.ts",
+    "./client": "./src/client.ts",
+    "./mcp": "./src/mcp.ts",
+    "./types": "./src/types.ts"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  }
+}

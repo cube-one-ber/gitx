@@ -11,10 +11,13 @@ use gitx_crypto::{AclPolicy, Principal, SecretFinding, scan_content};
 use gitx_merge::{
     DiffStatus, TreeDiffEntry, diff_trees, merge_domain_trees, revert_agent_tree_step, unified_diff,
 };
-use gitx_store::{LandRecord, LocalStore, MemoryStore, ObjectStore};
+#[cfg(feature = "local")]
+use gitx_store::LocalStore;
+use gitx_store::{LandRecord, MemoryStore, ObjectStore};
 use gitx_vfs::{MemVfs, WorkspaceBackend, WorkspaceBackendKind, normalize_rel_path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+#[cfg(feature = "local")]
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
@@ -149,6 +152,7 @@ impl AgentRepo {
         Self::from_parts(store, context, AclPolicy::default_secure(), author, principal)
     }
 
+    #[cfg(feature = "local")]
     /// Open (or initialize) a durable local repository at `root` (`.gitx/store` + `.gitx/context.db`),
     /// while executing agent workspace edits in isolated in-memory [`MemVfs`] instances.
     pub fn open_local(

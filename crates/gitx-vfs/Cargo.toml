@@ -5,23 +5,25 @@ edition.workspace = true
 license-file.workspace = true
 
 [features]
-default = ["fuse"]
-fuse = []
+default = ["cow", "fuse"]
+cow = ["dep:gitx-crypto", "dep:globset", "dep:libc", "dep:reflink-copy", "dep:walkdir"]
+fuse = ["cow"]
 
 [dependencies]
 chrono.workspace = true
 gitx-core.workspace = true
-gitx-crypto.workspace = true
-gitx-store.workspace = true
-globset.workspace = true
-libc.workspace = true
-reflink-copy.workspace = true
+gitx-crypto = { workspace = true, optional = true }
+gitx-store = { workspace = true, default-features = false }
+globset = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+reflink-copy = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-walkdir.workspace = true
+walkdir = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser.workspace = true
 
 [dev-dependencies]
+gitx-store.workspace = true
 tempfile.workspace = true
