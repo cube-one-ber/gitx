@@ -734,6 +734,7 @@ name = "gitx-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "gitx-context",
@@ -745,10 +746,12 @@ dependencies = [
  "gitx-server",
  "gitx-store",
  "gitx-vfs",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "ulid",
