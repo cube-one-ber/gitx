@@ -4,16 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["cow"]
+cow = ["dep:gitx-crypto", "dep:globset", "dep:reflink-copy", "dep:walkdir"]
+
 [dependencies]
 chrono.workspace = true
 gitx-core.workspace = true
-gitx-crypto.workspace = true
-gitx-store.workspace = true
-globset.workspace = true
-reflink-copy.workspace = true
+gitx-crypto = { workspace = true, optional = true }
+gitx-store = { workspace = true, default-features = false }
+globset = { workspace = true, optional = true }
+reflink-copy = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-walkdir.workspace = true
+walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

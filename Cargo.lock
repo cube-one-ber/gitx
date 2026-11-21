@@ -924,6 +924,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitx-wasm"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "gitx-context",
+ "gitx-core",
+ "gitx-crypto",
+ "gitx-merge",
+ "gitx-sdk",
+ "gitx-store",
+ "gitx-vfs",
+ "serde",
+ "serde_json",
+ "ulid",
+]
+
+[[package]]
 name = "globset"
 version = "0.4.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"

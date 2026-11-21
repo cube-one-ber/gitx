@@ -4,14 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["local", "ast"]
+local = ["gitx-store/local", "gitx-context/sqlite", "gitx-vfs/cow"]
+ast = ["gitx-merge/ast"]
+
 [dependencies]
 chrono.workspace = true
-gitx-context.workspace = true
+gitx-context = { workspace = true, default-features = false }
 gitx-core.workspace = true
 gitx-crypto.workspace = true
-gitx-merge.workspace = true
-gitx-store.workspace = true
-gitx-vfs.workspace = true
+gitx-merge = { workspace = true, default-features = false }
+gitx-store = { workspace = true, default-features = false }
+gitx-vfs = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
