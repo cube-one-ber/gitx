@@ -227,6 +227,21 @@ enum WsAction {
     List,
     /// Remove a registered workspace
     Rm { name: String },
+    /// Mount a workspace onto an OS-level virtualized mountpoint (`vfs://`)
+    Mount {
+        /// Name of the registered workspace to mount
+        name: String,
+        /// Target mountpoint directory
+        mountpoint: PathBuf,
+        /// Virtual mount backend (`fuse` on Linux FUSE3 or `loopback` TCP NFSv3-style server)
+        #[arg(long, value_enum, default_value_t = commands::workspace::MountBackend::Fuse)]
+        backend: commands::workspace::MountBackend,
+    },
+    /// Unmount an active OS-level virtualized workspace mountpoint
+    Unmount {
+        /// Mounted directory path to unmount
+        mountpoint: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -375,6 +390,12 @@ fn main() -> Result<()> {
             } => commands::workspace::cmd_ws_add(name, path, mem, lazy),
             WsAction::List => commands::workspace::cmd_ws_list(),
             WsAction::Rm { name } => commands::workspace::cmd_ws_rm(name),
+            WsAction::Mount {
+                name,
+                mountpoint,
+                backend,
+            } => commands::workspace::cmd_ws_mount(name, mountpoint, backend),
+            WsAction::Unmount { mountpoint } => commands::workspace::cmd_ws_unmount(mountpoint),
         },
         Commands::Secret { action } => match action {
             SecretAction::Set { path, domain } => commands::security::cmd_secret_set(path, domain),
