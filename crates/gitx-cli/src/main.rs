@@ -187,6 +187,45 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Manage remote gitx-server configurations and run zero-clone remote RPC queries
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+
+    /// Push local ChangeSet and working copy changes to a remote gitx-server (supports push-to-create)
+    Push {
+        /// Configured remote name (defaults to 'origin')
+        remote: Option<String>,
+        /// Target bookmark on the remote (defaults to repository default branch)
+        #[arg(long)]
+        target: Option<String>,
+        /// Commit message override for the pushed ChangeSet
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Authentication token override (e.g. 'alice' or 'user=alice;teams=core,security')
+        #[arg(long)]
+        token: Option<String>,
+    },
+
+    /// Pull ACL-filtered ChangeSets and files from a remote gitx-server into the local repo
+    Pull {
+        /// Configured remote name (defaults to 'origin')
+        remote: Option<String>,
+        /// Target bookmark to pull from the remote (defaults to repository default branch)
+        #[arg(long)]
+        target: Option<String>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+
+    /// Interact with a remote gitx-server batched agentic merge queue
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -332,6 +371,179 @@ enum FleetAction {
     },
 }
 
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Register a new remote gitx-server repository in .gitx/remotes.toml
+    Add {
+        /// Local alias for the remote (e.g. origin)
+        name: String,
+        /// Remote URL (e.g. http://127.0.0.1:7878/owner/repo or http://127.0.0.1:7878)
+        url: String,
+        /// Repository owner (optional when embedded in <url>)
+        #[arg(long)]
+        owner: Option<String>,
+        /// Repository name (optional when embedded in <url>)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Default authentication token for this remote
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// List configured remotes
+    List,
+    /// Show details and tracked heads for a configured remote
+    Show {
+        /// Remote name
+        name: String,
+    },
+    /// Remove a configured remote
+    Rm {
+        /// Remote name
+        name: String,
+    },
+    /// Zero-clone server-side grep (works with --url even without a local .gitx repo)
+    Grep {
+        /// Search query pattern
+        pattern: String,
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Revision hash, ChangeId, or bookmark to search
+        #[arg(long)]
+        rev: Option<String>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+        /// Case-insensitive matching
+        #[arg(short = 'i', long)]
+        case_insensitive: bool,
+    },
+    /// Zero-clone server-side unified diff between two revisions
+    Diff {
+        /// Source revision hash, ChangeId, or bookmark
+        from: String,
+        /// Target revision hash, ChangeId, or bookmark
+        to: String,
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Zero-clone server-side line-by-line blame for a file path
+    Blame {
+        /// Repository-relative file path
+        path: String,
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Revision hash, ChangeId, or bookmark
+        #[arg(long)]
+        rev: Option<String>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Zero-clone server-side ACL-filtered commit history log
+    Log {
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Revision hash, ChangeId, or bookmark to start from
+        #[arg(long)]
+        rev: Option<String>,
+        /// Maximum number of commits to show
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Query server-side derived data engine cache statistics (/derived/stats)
+    Stats {
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueAction {
+    /// Upload current ChangeSet lock-free and enqueue it onto the remote merge queue
+    Enqueue {
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Target bookmark on the remote (defaults to repository default branch)
+        #[arg(long)]
+        target: Option<String>,
+        /// Commit message override
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// List entries in the remote merge queue
+    List {
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Target bookmark on the remote (defaults to 'master')
+        #[arg(long)]
+        target: Option<String>,
+        /// Show only pending entries
+        #[arg(long)]
+        pending_only: bool,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Atomically drain pending entries from the remote merge queue
+    Drain {
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Target bookmark on the remote (defaults to repository default branch or 'master')
+        #[arg(long)]
+        target: Option<String>,
+        /// Maximum number of pending entries to drain in one batch
+        #[arg(long)]
+        max_batch_size: Option<usize>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -434,5 +646,90 @@ fn main() -> Result<()> {
         Commands::Serve { addr, data_dir } => commands::serve::cmd_serve(addr, data_dir),
         Commands::Mcp { in_memory } => commands::mcp::cmd_mcp(in_memory),
         Commands::Symbols { path, json } => commands::symbols::cmd_symbols(path, json),
+        Commands::Remote { action } => match action {
+            RemoteAction::Add {
+                name,
+                url,
+                owner,
+                repo,
+                token,
+            } => commands::remote::cmd_remote_add(name, url, owner, repo, token),
+            RemoteAction::List => commands::remote::cmd_remote_list(),
+            RemoteAction::Show { name } => commands::remote::cmd_remote_show(name),
+            RemoteAction::Rm { name } => commands::remote::cmd_remote_rm(name),
+            RemoteAction::Grep {
+                pattern,
+                remote,
+                url,
+                rev,
+                token,
+                case_insensitive,
+            } => commands::remote::cmd_remote_grep(
+                pattern,
+                remote,
+                url,
+                rev,
+                token,
+                case_insensitive,
+            ),
+            RemoteAction::Diff {
+                from,
+                to,
+                remote,
+                url,
+                token,
+            } => commands::remote::cmd_remote_diff(from, to, remote, url, token),
+            RemoteAction::Blame {
+                path,
+                remote,
+                url,
+                rev,
+                token,
+            } => commands::remote::cmd_remote_blame(path, remote, url, rev, token),
+            RemoteAction::Log {
+                remote,
+                url,
+                rev,
+                limit,
+                token,
+            } => commands::remote::cmd_remote_log(remote, url, rev, limit, token),
+            RemoteAction::Stats { remote, url, token } => {
+                commands::remote::cmd_remote_stats(remote, url, token)
+            }
+        },
+        Commands::Push {
+            remote,
+            target,
+            message,
+            token,
+        } => commands::remote::cmd_push(remote, target, message, token),
+        Commands::Pull {
+            remote,
+            target,
+            token,
+        } => commands::remote::cmd_pull(remote, target, token),
+        Commands::Queue { action } => match action {
+            QueueAction::Enqueue {
+                remote,
+                url,
+                target,
+                message,
+                token,
+            } => commands::queue::cmd_queue_enqueue(remote, url, target, message, token),
+            QueueAction::List {
+                remote,
+                url,
+                target,
+                pending_only,
+                token,
+            } => commands::queue::cmd_queue_list(remote, url, target, pending_only, token),
+            QueueAction::Drain {
+                remote,
+                url,
+                target,
+                max_batch_size,
+                token,
+            } => commands::queue::cmd_queue_drain(remote, url, target, max_batch_size, token),
+        },
     }
 }
