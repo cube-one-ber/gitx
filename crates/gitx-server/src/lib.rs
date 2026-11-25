@@ -4,30 +4,36 @@ pub mod api;
 pub mod auth;
 pub mod derived;
 pub mod error;
+pub mod fleet_api;
 pub mod git_http;
 pub mod grpc;
+pub mod outbox;
 pub mod queue;
 pub mod state;
 
 pub use api::{
     ActorAgentInput, BlameLine, BlameResponse, CommitRequest, CommitResponse, CreateRepoRequest,
     CreateRepoResponse, DiffFileEntry, DiffResponse, GrepMatch, GrepResponse, HealthResponse,
-    LandRequest, LandResponse, ListReposResponse, LogEntry, LogResponse, PublishEmbargoRequest,
-    PublishEmbargoResponse, RevertResponse, TreeFileEntry, TreeResponse, WhyResponse,
+    LandRequest, LandResponse, ListReposResponse, LogEntry, LogResponse, OutboxResponse,
+    PublishEmbargoRequest, PublishEmbargoResponse, RevertResponse, TreeFileEntry, TreeResponse,
+    TreeSecretEntry, WhyResponse,
 };
 pub use auth::{
     AuthenticatedPrincipal, HEADER_FINGERPRINT, HEADER_ROLES, HEADER_TEAMS, HEADER_USER,
-    allowed_domains_for_repo, extract_principal, extract_principal_from_grpc_metadata,
+    allowed_domains_for_repo, can_administer_acl, extract_principal,
+    extract_principal_from_grpc_metadata, extract_principal_from_http,
 };
 pub use derived::{
     CommitGraphIndex, CommitGraphNode, DerivedIndex, DerivedStats, PathHistoryIndex, TrigramIndex,
     TrigramSearchIndex,
 };
 pub use error::{ApiError, ApiResult};
+pub use fleet_api::{FleetSyncRecord, FleetUploadRequest};
 pub use grpc::{GitxGrpcService, serve_grpc, serve_grpc_addr};
+pub use outbox::{OutboxEvent, WebhookOutbox};
 pub use queue::{
     ConflictResolverFn, DrainRequest, DrainResponse, EnqueueRequest, EnqueueResponse, MergeQueue,
-    QueueEntry, QueueListQuery, QueueListResponse, QueueStatus,
+    QueueEntry, QueueListQuery, QueueListResponse, QueueStatus, command_conflict_resolver,
 };
 pub use state::{AppState, RepoHandle, RepoInfo, ServerConfig};
 
@@ -69,6 +75,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // Derived data engine observability
         .route("/v1/repos/{owner}/{name}/derived/stats", get(api::derived_stats))
+        // Durable webhook outbox inspection
+        .route("/v1/repos/{owner}/{name}/outbox", get(api::list_outbox))
+        // Live cross-machine encrypted Fleet Sync ("Dropbox for Devs")
+        .route(
+            "/v1/repos/{owner}/{name}/fleet",
+            post(fleet_api::upload_fleet_bundle).get(fleet_api::download_fleet_bundle),
+        )
         // Batched lock-free agentic merge queue
         .route(
             "/v1/repos/{owner}/{name}/queue/enqueue",
@@ -85,17 +98,28 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/{owner}/{repo}/git-upload-pack",
             post(git_http::upload_pack),
         )
+        .route(
+            "/{owner}/{repo}/git-receive-pack",
+            post(git_http::receive_pack),
+        )
         .with_state(state)
 }
 
-/// Serve the GitX HTTP/JSON and Git Smart HTTP server on a pre-bound `TcpListener`.
-pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
-    let state = Arc::new(AppState::new(config));
+/// Serve the GitX HTTP/JSON and Git Smart HTTP server using a shared `AppState`
+/// (useful when sharing state with a concurrent Tonic gRPC server).
+pub async fn serve_with_state(listener: TcpListener, state: Arc<AppState>) -> Result<()> {
+    state.replay_all_pending_outboxes();
     let router = build_router(state);
     if let Ok(local_addr) = listener.local_addr() {
         tracing::info!("gitx-server listening on http://{local_addr}");
     }
     axum::serve(listener, router).await.map_err(GitxError::Io)
+}
+
+/// Serve the GitX HTTP/JSON and Git Smart HTTP server on a pre-bound `TcpListener`.
+pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
+    let state = Arc::new(AppState::new(config));
+    serve_with_state(listener, state).await
 }
 
 /// Bind `addr` and serve the GitX HTTP/JSON and Git Smart HTTP server.

@@ -140,16 +140,26 @@ where
 
                 if term.is_resolved() {
                     match term.adds.first().copied().flatten() {
-                        Some(blob_hash) => {
-                            let bytes = read_blob(blob_hash)?;
-                            tree.insert(
-                                path,
-                                EntryKind::File {
-                                    blob_hash,
-                                    mode,
-                                    size: bytes.len() as u64,
-                                },
-                            );
+                        Some(resolved_hash) => {
+                            if let Some(secret_entry) = [o, t, b].into_iter().flatten().find(|e| {
+                                matches!(
+                                    e,
+                                    EntryKind::EncryptedSecret { envelope_hash, .. }
+                                        if *envelope_hash == resolved_hash
+                                )
+                            }) {
+                                tree.insert(path, secret_entry.clone());
+                            } else {
+                                let bytes = read_blob(resolved_hash)?;
+                                tree.insert(
+                                    path,
+                                    EntryKind::File {
+                                        blob_hash: resolved_hash,
+                                        mode,
+                                        size: bytes.len() as u64,
+                                    },
+                                );
+                            }
                         }
                         None => {
                             // Resolved to deletion

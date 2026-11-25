@@ -12,6 +12,13 @@ pub const UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE: &str =
 /// Content-Type header for `POST /git-upload-pack`.
 pub const UPLOAD_PACK_RESULT_CONTENT_TYPE: &str = "application/x-git-upload-pack-result";
 
+/// Content-Type header for `GET /info/refs?service=git-receive-pack`.
+pub const RECEIVE_PACK_ADVERTISEMENT_CONTENT_TYPE: &str =
+    "application/x-git-receive-pack-advertisement";
+
+/// Content-Type header for `POST /git-receive-pack`.
+pub const RECEIVE_PACK_RESULT_CONTENT_TYPE: &str = "application/x-git-receive-pack-result";
+
 /// Git pkt-line flush packet (`0000`).
 pub const FLUSH_PKT: &[u8] = b"0000";
 
@@ -166,15 +173,23 @@ pub fn handle_upload_pack_with_protocol(
     if let Some(mut stdin) = child.stdin.take() {
         let body = request_body.to_vec();
         let writer = std::thread::spawn(move || -> std::io::Result<()> {
-            stdin.write_all(&body)?;
-            stdin.flush()?;
+            match stdin.write_all(&body) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(err) => return Err(err),
+            }
+            match stdin.flush() {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(err) => return Err(err),
+            }
             drop(stdin);
             Ok(())
         });
         let output = child.wait_with_output()?;
-        writer.join().map_err(|_| {
+        let write_res = writer.join().map_err(|_| {
             GitxError::GitBridge("git upload-pack stdin writer thread panicked".into())
-        })??;
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -183,11 +198,100 @@ pub fn handle_upload_pack_with_protocol(
                 stderr.trim()
             )));
         }
+        write_res?;
         return Ok(output.stdout);
     }
 
     Err(GitxError::GitBridge(
         "failed to open stdin for git upload-pack".to_string(),
+    ))
+}
+
+/// Builds the full Git Smart HTTP response body for `GET /info/refs?service=git-receive-pack`
+/// against a projected bare Git repository.
+pub fn advertise_receive_pack_refs_with_protocol(
+    bare_git_dir: &Path,
+    git_protocol: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    cmd.args(["receive-pack", "--stateless-rpc", "--advertise-refs"])
+        .arg(bare_git_dir);
+    if let Some(proto) = git_protocol
+        && !proto.is_empty()
+    {
+        cmd.env("GIT_PROTOCOL", proto);
+    }
+
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GitxError::GitBridge(format!(
+            "git receive-pack --advertise-refs failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    let mut body = encode_pkt_line(b"# service=git-receive-pack\n");
+    body.extend_from_slice(&encode_flush_pkt());
+    body.extend_from_slice(&output.stdout);
+    Ok(body)
+}
+
+/// Handles a Git Smart HTTP `POST /git-receive-pack` request body by invoking
+/// `git receive-pack --stateless-rpc <bare_git_dir>` and returning the status report.
+pub fn handle_receive_pack_with_protocol(
+    bare_git_dir: &Path,
+    request_body: &[u8],
+    git_protocol: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    cmd.args(["receive-pack", "--stateless-rpc"])
+        .arg(bare_git_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(proto) = git_protocol
+        && !proto.is_empty()
+    {
+        cmd.env("GIT_PROTOCOL", proto);
+    }
+
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let body = request_body.to_vec();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            match stdin.write_all(&body) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(err) => return Err(err),
+            }
+            match stdin.flush() {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(err) => return Err(err),
+            }
+            drop(stdin);
+            Ok(())
+        });
+        let output = child.wait_with_output()?;
+        let write_res = writer.join().map_err(|_| {
+            GitxError::GitBridge("git receive-pack stdin writer thread panicked".into())
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GitxError::GitBridge(format!(
+                "git receive-pack --stateless-rpc failed: {}",
+                stderr.trim()
+            )));
+        }
+        write_res?;
+        return Ok(output.stdout);
+    }
+
+    Err(GitxError::GitBridge(
+        "failed to open stdin for git receive-pack".to_string(),
     ))
 }
 

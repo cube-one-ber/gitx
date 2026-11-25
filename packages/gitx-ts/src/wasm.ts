@@ -335,6 +335,9 @@ export class WasmGitxModule {
     try {
       if (cfgBytes.length > 0) {
         ptr = this.exports.gitx_alloc(cfgBytes.length);
+        if (ptr === 0) {
+          throw new GitxWasmError("alloc_error", "gitx_alloc returned null pointer for config");
+        }
         new Uint8Array(this.exports.memory.buffer, ptr, cfgBytes.length).set(cfgBytes);
       }
       const handle = this.exports.gitx_create_repo(ptr, cfgBytes.length);
@@ -354,6 +357,9 @@ export class WasmGitxModule {
     let reqPtr = 0;
     try {
       reqPtr = this.exports.gitx_alloc(reqBytes.length);
+      if (reqPtr === 0) {
+        throw new GitxWasmError("alloc_error", "gitx_alloc returned null pointer for request");
+      }
       new Uint8Array(this.exports.memory.buffer, reqPtr, reqBytes.length).set(reqBytes);
 
       const packed = this.exports.gitx_invoke(handle, reqPtr, reqBytes.length);
@@ -409,11 +415,12 @@ export class WasmAgentRepo {
    * Load `gitx_wasm.wasm` and create a fresh in-memory [`WasmAgentRepo`] in one call.
    */
   static async load(options?: WasmLoadOptions): Promise<WasmAgentRepo> {
+    const { wasm, useMinimalWasiShim, ...repoConfig } = options ?? {};
     const mod = await WasmGitxModule.load({
-      wasm: options?.wasm,
-      useMinimalWasiShim: options?.useMinimalWasiShim,
+      wasm,
+      useMinimalWasiShim,
     });
-    return mod.createRepo(options);
+    return mod.createRepo(Object.keys(repoConfig).length > 0 ? repoConfig : undefined);
   }
 
   private ensureActive(): void {

@@ -2,7 +2,7 @@
   "name": "@gitx/sdk",
   "version": "0.1.0",
   "description": "TypeScript SDK for GitX — zero-disk WASM AgentRepo, HTTP Server Client, and MCP JSON-RPC Client",
-  "license": "MIT",
+  "license": "SEE LICENSE IN ../../LICENSE",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",

@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use gitx_context::ContextStore;
 use gitx_core::{
-    Actor, ChangeId, ChangeSet, ChangeSetBuilder, DomainId, DomainTree, EntryKind, Identity,
-    ObjectHash, OpId, OpKind, OpLogEntry, VisibilityPolicy, WorkspaceRef,
+    Actor, ChangeId, ChangeSet, ChangeSetBuilder, DomainId, DomainTree, EntryKind, FileMode,
+    Identity, ObjectHash, OpId, OpKind, OpLogEntry, VisibilityPolicy, WorkspaceRef,
 };
 use gitx_crypto::{
     AclPolicy, PublicKeyBundle, SecretAuditLog, SecretEnvelope, SecretFinding, SecretKeyBundle,
@@ -72,6 +72,12 @@ pub struct Repo {
     pub config: RepoConfig,
 }
 
+type SecretDomainEntries = BTreeMap<String, (Vec<u8>, FileMode)>;
+type PartitionedWorkspaceScan = (
+    BTreeMap<DomainId, DomainTree>,
+    BTreeMap<DomainId, SecretDomainEntries>,
+);
+
 impl Repo {
     pub fn init(
         root: &Path,
@@ -116,7 +122,7 @@ impl Repo {
             local: keypair.to_secret_bundle(),
             recipients,
         };
-        save_json_file(&keys_dir.join("local.json"), &keyring)?;
+        save_secret_json_file(&keys_dir.join("local.json"), &keyring)?;
 
         let author = Identity {
             name,
@@ -194,16 +200,24 @@ impl Repo {
     fn create_initial_root_changeset(&self, author: &Identity) -> Result<ChangeSet> {
         let acl = self.load_acl()?;
         let cow = self.open_cow_workspace()?;
-        let scanned = cow.snapshot_by_domain(self.store.as_ref(), |p| acl.domain_for_path(p))?;
+        let (scanned, raw_secrets) = self.scan_workspace_partitioned(&cow, &acl)?;
         let keyring = self.load_keyring()?;
         let keypair = UserKeyPair::from_secret_bundle(&keyring.local)?;
         let recipients: Vec<PublicKeyBundle> = keyring.recipients.values().cloned().collect();
 
         let mut domain_trees = BTreeMap::new();
-        for (domain, mut tree) in scanned {
-            if domain.is_secret() {
-                tree = self.encrypt_secret_domain_tree(&domain, &tree, None, &keypair, &recipients)?;
-            }
+        for (domain, tree) in scanned {
+            let hash = self.store.put_tree(&tree)?;
+            domain_trees.insert(domain, hash);
+        }
+        for (domain, entries) in raw_secrets {
+            let tree = self.encrypt_secret_domain_entries(
+                &domain,
+                &entries,
+                None,
+                &keypair,
+                &recipients,
+            )?;
             let hash = self.store.put_tree(&tree)?;
             domain_trees.insert(domain, hash);
         }
@@ -330,7 +344,7 @@ impl Repo {
     }
 
     pub fn save_keyring(&self, keyring: &KeyringFile) -> Result<()> {
-        save_json_file(&self.keys_dir().join("local.json"), keyring)
+        save_secret_json_file(&self.keys_dir().join("local.json"), keyring)
     }
 
     pub fn load_local_keypair(&self) -> Result<UserKeyPair> {
@@ -396,7 +410,7 @@ impl Repo {
         let current = self.current_changeset()?;
         let acl = self.load_acl()?;
         let cow = self.open_cow_workspace()?;
-        let scanned = cow.snapshot_by_domain(self.store.as_ref(), |p| acl.domain_for_path(p))?;
+        let (scanned, raw_secrets) = self.scan_workspace_partitioned(&cow, &acl)?;
 
         let keyring = self.load_keyring()?;
         let keypair = UserKeyPair::from_secret_bundle(&keyring.local)?;
@@ -408,6 +422,7 @@ impl Repo {
         // Collect all domains present in either scanned files or existing ChangeSet.
         let mut all_domains: BTreeSet<DomainId> = BTreeSet::new();
         all_domains.extend(scanned.keys().cloned());
+        all_domains.extend(raw_secrets.keys().cloned());
         all_domains.extend(current.domain_trees.keys().cloned());
         all_domains.insert(DomainId::public());
 
@@ -423,11 +438,10 @@ impl Repo {
             };
 
             if domain.is_secret() {
-                let scanned_tree = scanned.get(&domain);
-                let merged_secret_tree = match scanned_tree {
-                    Some(st) => self.encrypt_secret_domain_tree(
+                let merged_secret_tree = match raw_secrets.get(&domain) {
+                    Some(entries) => self.encrypt_secret_domain_entries(
                         &domain,
-                        st,
+                        entries,
                         existing_tree.as_ref(),
                         &keypair,
                         &recipients,
@@ -532,10 +546,47 @@ impl Repo {
         })
     }
 
-    fn encrypt_secret_domain_tree(
+    /// Scan working-copy files and partition them across domains WITHOUT ever writing
+    /// `secret:*` plaintext bytes into the content-addressed object store.
+    fn scan_workspace_partitioned(
+        &self,
+        cow: &CowWorkspace,
+        acl: &AclPolicy,
+    ) -> Result<PartitionedWorkspaceScan> {
+        let files = cow.scan_files()?;
+        let mut plain_trees: BTreeMap<DomainId, DomainTree> = BTreeMap::new();
+        let mut secret_entries: BTreeMap<DomainId, SecretDomainEntries> = BTreeMap::new();
+
+        for (rel_path, data, mode) in files {
+            let domain = acl.domain_for_path(&rel_path);
+            if domain.is_secret() {
+                secret_entries
+                    .entry(domain)
+                    .or_default()
+                    .insert(rel_path, (data, mode));
+            } else {
+                let blob = self.store.put_blob_bytes(&data)?;
+                let tree = plain_trees
+                    .entry(domain.clone())
+                    .or_insert_with(|| DomainTree::new(domain));
+                tree.insert(
+                    rel_path,
+                    EntryKind::File {
+                        blob_hash: blob.manifest_hash(),
+                        mode,
+                        size: blob.total_size,
+                    },
+                );
+            }
+        }
+
+        Ok((plain_trees, secret_entries))
+    }
+
+    fn encrypt_secret_domain_entries(
         &self,
         domain: &DomainId,
-        scanned: &DomainTree,
+        scanned: &SecretDomainEntries,
         existing: Option<&DomainTree>,
         keypair: &UserKeyPair,
         recipients: &[PublicKeyBundle],
@@ -545,7 +596,7 @@ impl Repo {
         // Start by preserving existing encrypted secrets not present on disk.
         if let Some(existing_tree) = existing {
             for (path, kind) in &existing_tree.entries {
-                if !scanned.entries.contains_key(path)
+                if !scanned.contains_key(path)
                     && matches!(kind, EntryKind::EncryptedSecret { .. })
                 {
                     out.insert(path.clone(), kind.clone());
@@ -553,53 +604,43 @@ impl Repo {
             }
         }
 
-        for (path, kind) in &scanned.entries {
-            match kind {
-                EntryKind::File {
-                    blob_hash, mode, ..
-                } => {
-                    let plaintext = self.store.read_blob_bytes(*blob_hash)?;
-                    // Reuse existing encrypted entry if decrypted plaintext matches disk bytes.
-                    if let Some(existing_tree) = existing
-                        && let Some(
-                            existing_entry @ EntryKind::EncryptedSecret {
-                                envelope_hash,
-                                mode: existing_mode,
-                                ..
-                            },
-                        ) = existing_tree.entries.get(path)
-                        && existing_mode == mode
-                        && let Ok(env) = self.get_envelope(*envelope_hash)
-                        && let Ok(dec) = decrypt_secret(&env, path, keypair)
-                        && dec == plaintext
-                    {
-                        out.insert(path.clone(), existing_entry.clone());
-                        continue;
-                    }
-
-                    let next_epoch = existing
-                        .and_then(|t| t.entries.get(path))
-                        .and_then(|k| match k {
-                            EntryKind::EncryptedSecret { key_epoch, .. } => Some(*key_epoch),
-                            _ => None,
-                        })
-                        .unwrap_or(1);
-
-                    let env = encrypt_secret(domain, path, next_epoch, &plaintext, recipients)?;
-                    let env_hash = self.put_envelope(&env)?;
-                    out.insert(
-                        path.clone(),
-                        EntryKind::EncryptedSecret {
-                            envelope_hash: env_hash,
-                            key_epoch: next_epoch,
-                            mode: *mode,
-                        },
-                    );
-                }
-                other => {
-                    out.insert(path.clone(), other.clone());
-                }
+        for (path, (plaintext, mode)) in scanned {
+            // Reuse existing encrypted entry if decrypted plaintext matches disk bytes.
+            if let Some(existing_tree) = existing
+                && let Some(
+                    existing_entry @ EntryKind::EncryptedSecret {
+                        envelope_hash,
+                        mode: existing_mode,
+                        ..
+                    },
+                ) = existing_tree.entries.get(path)
+                && existing_mode == mode
+                && let Ok(env) = self.get_envelope(*envelope_hash)
+                && let Ok(dec) = decrypt_secret(&env, path, keypair)
+                && dec == *plaintext
+            {
+                out.insert(path.clone(), existing_entry.clone());
+                continue;
             }
+
+            let next_epoch = existing
+                .and_then(|t| t.entries.get(path))
+                .and_then(|k| match k {
+                    EntryKind::EncryptedSecret { key_epoch, .. } => Some(*key_epoch),
+                    _ => None,
+                })
+                .unwrap_or(1);
+
+            let env = encrypt_secret(domain, path, next_epoch, plaintext, recipients)?;
+            let env_hash = self.put_envelope(&env)?;
+            out.insert(
+                path.clone(),
+                EntryKind::EncryptedSecret {
+                    envelope_hash: env_hash,
+                    key_epoch: next_epoch,
+                    mode: *mode,
+                },
+            );
         }
 
         Ok(out)
@@ -901,6 +942,31 @@ pub fn save_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(value)?;
     fs::write(path, json)?;
+    Ok(())
+}
+
+/// Write a sensitive JSON file (such as private key material) with owner-only (`0o600`)
+/// permissions on Unix so keys are never created world-readable.
+pub fn save_secret_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(value)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(json.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 

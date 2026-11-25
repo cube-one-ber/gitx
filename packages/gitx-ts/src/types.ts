@@ -26,10 +26,12 @@ export interface AgentIdentity {
 }
 
 export interface SecretFinding {
-  path: string;
-  line: number;
   kind: string;
-  snippet: string;
+  severity: string;
+  path: string;
+  line: number | null;
+  message: string;
+  redacted_match: string;
 }
 
 export interface WorkspaceRef {
@@ -327,6 +329,7 @@ export interface ServerCommitRequest {
   embargo_advisory?: string;
   embargo_allowed_teams?: string[];
   context_prompt?: string;
+  secret_envelopes?: Record<string, Record<string, string>>;
 }
 
 export interface ServerCommitResponse {
@@ -346,10 +349,19 @@ export interface TreeFileEntry {
   content_base64?: string;
 }
 
+export interface TreeSecretEntry {
+  path: string;
+  domain: string;
+  key_epoch: number;
+  envelope_hash: string;
+  envelope_json: string;
+}
+
 export interface TreeResponse {
   rev: string | null;
   domains: string[];
   files: TreeFileEntry[];
+  secrets?: TreeSecretEntry[];
 }
 
 export interface BlobResponse {

@@ -80,6 +80,13 @@ pub fn merge_bytes(path: &str, base: &[u8], ours: &[u8], theirs: &[u8]) -> Merge
         return outcome;
     }
 
+    // Structured semantic merge for YAML
+    if (has_extension_ci(path, "yaml") || has_extension_ci(path, "yml"))
+        && let Some(outcome) = try_merge_yaml(base_str, ours_str, theirs_str)
+    {
+        return outcome;
+    }
+
     // Standard 3-way line merge first (guarantees zero formatting churn on clean line merges)
     let line_outcome = merge_lines(base_str, ours_str, theirs_str);
     #[cfg(feature = "ast")]
@@ -236,6 +243,110 @@ fn merge_json_value(
             }
         }
         Ok(serde_json::Value::Object(merged))
+    } else {
+        Err(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key-aware YAML merge
+// ---------------------------------------------------------------------------
+
+fn try_merge_yaml(base_str: &str, ours_str: &str, theirs_str: &str) -> Option<MergeOutcome> {
+    let ours_val: serde_yaml_ng::Value = serde_yaml_ng::from_str(ours_str).ok()?;
+    let theirs_val: serde_yaml_ng::Value = serde_yaml_ng::from_str(theirs_str).ok()?;
+    let base_val: serde_yaml_ng::Value = if base_str.trim().is_empty() {
+        if ours_val.is_mapping() && theirs_val.is_mapping() {
+            serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new())
+        } else {
+            return None;
+        }
+    } else {
+        serde_yaml_ng::from_str(base_str).ok()?
+    };
+
+    match merge_yaml_value(&base_val, &ours_val, &theirs_val) {
+        Ok(merged) => {
+            let rendered = serde_yaml_ng::to_string(&merged).ok()?;
+            Some(MergeOutcome::Clean(rendered.into_bytes()))
+        }
+        Err(()) => {
+            let line_outcome = merge_lines(base_str, ours_str, theirs_str);
+            if line_outcome.is_conflict() {
+                Some(line_outcome)
+            } else {
+                Some(whole_file_conflict(base_str, ours_str, theirs_str))
+            }
+        }
+    }
+}
+
+fn merge_yaml_value(
+    base: &serde_yaml_ng::Value,
+    ours: &serde_yaml_ng::Value,
+    theirs: &serde_yaml_ng::Value,
+) -> std::result::Result<serde_yaml_ng::Value, ()> {
+    if ours == theirs {
+        return Ok(ours.clone());
+    }
+    if ours == base {
+        return Ok(theirs.clone());
+    }
+    if theirs == base {
+        return Ok(ours.clone());
+    }
+
+    if let (
+        serde_yaml_ng::Value::Mapping(bm),
+        serde_yaml_ng::Value::Mapping(om),
+        serde_yaml_ng::Value::Mapping(tm),
+    ) = (base, ours, theirs)
+    {
+        let mut keys: Vec<serde_yaml_ng::Value> = Vec::new();
+        for k in bm.keys().chain(om.keys()).chain(tm.keys()) {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+
+        let mut merged = serde_yaml_ng::Mapping::new();
+        for key in keys {
+            let bv = bm.get(&key);
+            let ov = om.get(&key);
+            let tv = tm.get(&key);
+
+            if ov == tv {
+                if let Some(v) = ov {
+                    merged.insert(key, v.clone());
+                }
+            } else if ov == bv {
+                if let Some(v) = tv {
+                    merged.insert(key, v.clone());
+                }
+            } else if tv == bv {
+                if let Some(v) = ov {
+                    merged.insert(key, v.clone());
+                }
+            } else {
+                match (bv, ov, tv) {
+                    (Some(b_val), Some(o_val), Some(t_val)) => {
+                        let sub = merge_yaml_value(b_val, o_val, t_val)?;
+                        merged.insert(key, sub);
+                    }
+                    (
+                        None,
+                        Some(o_val @ serde_yaml_ng::Value::Mapping(_)),
+                        Some(t_val @ serde_yaml_ng::Value::Mapping(_)),
+                    ) => {
+                        let empty = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
+                        let sub = merge_yaml_value(&empty, o_val, t_val)?;
+                        merged.insert(key, sub);
+                    }
+                    _ => return Err(()),
+                }
+            }
+        }
+        Ok(serde_yaml_ng::Value::Mapping(merged))
     } else {
         Err(())
     }

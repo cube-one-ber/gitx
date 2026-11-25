@@ -1,9 +1,13 @@
+use crate::commands::remote::{
+    build_http_client, parse_json_response, resolve_rpc_target, run_async,
+};
 use crate::repo::{Repo, WorkspacePointer, load_json_file, save_json_file};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use gitx_core::{ChangeSetBuilder, DomainId, DomainTree, EntryKind, OpKind, VisibilityPolicy};
 use gitx_crypto::{PublicKeyBundle, UserKeyPair};
-use gitx_git_bridge::export_to_git_repo;
+use gitx_git_bridge::{export_to_git_repo, import_from_git_repo};
+use gitx_server::FleetSyncRecord;
 use gitx_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use gitx_vfs::FuseMountHandle;
@@ -13,6 +17,7 @@ use gitx_vfs::{
     apply_overlay, export_encrypted_overlay, export_overlay_with_metadata,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -49,14 +54,42 @@ struct MountRecord {
     stop_file: String,
 }
 
-pub fn cmd_ws_add(name: String, path: Option<PathBuf>, mem: bool, lazy: bool) -> Result<()> {
+pub fn cmd_ws_add(
+    name: String,
+    path: Option<PathBuf>,
+    mem: bool,
+    lazy: bool,
+    from_remote: Option<String>,
+    share: Vec<String>,
+) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
     let snap = repo.snapshot_working_copy()?;
 
-    let base_hash = repo
-        .store
-        .get_bookmark(&repo.config.default_branch)?
-        .unwrap_or(snap.changeset.id);
+    // Avoid stale-local-master footgun: prefer explicit `--from-remote` tracking bookmark, or
+    // `origin/<default_branch>` when it is strictly newer than local `master`.
+    let local_trunk = repo.store.get_bookmark(&repo.config.default_branch)?;
+    let remote_bm_name = format!(
+        "{}/{}",
+        from_remote.as_deref().unwrap_or("origin"),
+        repo.config.default_branch
+    );
+    let remote_trunk = repo.store.get_bookmark(&remote_bm_name)?;
+
+    let base_hash = if from_remote.is_some() {
+        remote_trunk.ok_or_else(|| {
+            anyhow!(
+                "remote tracking bookmark '{remote_bm_name}' not found; run `gitx pull` first"
+            )
+        })?
+    } else if let (Some(rem), Some(loc)) = (remote_trunk, local_trunk) {
+        if repo.is_ancestor(loc, rem)? && rem != loc {
+            rem
+        } else {
+            loc
+        }
+    } else {
+        remote_trunk.or(local_trunk).unwrap_or(snap.changeset.id)
+    };
 
     let store_dyn: Arc<dyn ObjectStore> = repo.store.clone();
     let mgr = WorkspaceManager::with_pool_dir(store_dyn, repo.pool_dir());
@@ -69,6 +102,7 @@ pub fn cmd_ws_add(name: String, path: Option<PathBuf>, mem: bool, lazy: bool) ->
         let ws_dir = path.unwrap_or_else(|| repo.gitx_dir.join("workspaces").join(&name));
         let (ws_ref, lazy_ws) = mgr.create_lazy_workspace(&name, &ws_dir, base_hash)?;
         lazy_virtual_count = Some(lazy_ws.stats().total_virtual_files);
+        hydrate_shared_overlays(&repo.root, &ws_dir, &share)?;
         ws_ref
     } else {
         let ws_dir = path.unwrap_or_else(|| repo.gitx_dir.join("workspaces").join(&name));
@@ -94,6 +128,7 @@ pub fn cmd_ws_add(name: String, path: Option<PathBuf>, mem: bool, lazy: bool) ->
             workspace: ws_ref.name.clone(),
         };
         save_json_file(&ws_dir.join(".gitx").join("workspace.json"), &pointer)?;
+        hydrate_shared_overlays(&repo.root, &ws_dir, &share)?;
         ws_ref
     };
 
@@ -557,4 +592,251 @@ fn resolve_machine_id(machine: Option<String>) -> String {
         .or_else(|| env::var("HOSTNAME").ok().filter(|s| !s.trim().is_empty()))
         .or_else(|| env::var("USER").ok().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| "local".to_string())
+}
+
+/// Reflink-hydrate shared heavy ignored directories (such as `node_modules` or build caches)
+/// from the primary workspace into a newly created workspace with minimal disk/APFS overhead.
+fn hydrate_shared_overlays(src_root: &Path, dst_root: &Path, share: &[String]) -> Result<()> {
+    for raw in share {
+        let rel = raw.trim().trim_start_matches("./").trim_end_matches('/');
+        if rel.is_empty() || rel.contains("..") || Path::new(rel).is_absolute() {
+            bail!("invalid --share overlay path '{raw}'");
+        }
+        let src = src_root.join(rel);
+        if !src.exists() {
+            continue;
+        }
+        let dst = dst_root.join(rel);
+        reflink_copy_tree(&src, &dst)?;
+    }
+    Ok(())
+}
+
+fn reflink_copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    if meta.is_symlink() {
+        let target = fs::read_link(src)?;
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, dst)?;
+        return Ok(());
+    }
+    if meta.is_file() {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        reflink_copy::reflink_or_copy(src, dst)?;
+        return Ok(());
+    }
+    if meta.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            reflink_copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Live cross-machine encrypted Fleet Sync ("Dropbox for Devs") via `gitx-server`.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_fleet_sync(
+    remote: Option<String>,
+    url: Option<String>,
+    include: String,
+    machine: Option<String>,
+    push: bool,
+    pull: bool,
+    token: Option<String>,
+) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let repo = Repo::open(&cwd)?;
+    let (target, auth) = resolve_rpc_target(remote.as_deref(), url.as_deref(), token.as_deref())?;
+
+    let do_push = push || !pull;
+    let do_pull = pull || !push;
+    let machine_id = resolve_machine_id(machine);
+
+    if do_pull {
+        let pulled: Option<FleetSyncRecord> = run_async(async {
+            let client = build_http_client()?;
+            let resp = auth
+                .apply(client.get(target.api_url("fleet")))
+                .send()
+                .await
+                .with_context(|| format!("failed to contact remote {}", target.base_url))?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            let rec: FleetSyncRecord = parse_json_response(resp, "fleet sync pull").await?;
+            Ok(Some(rec))
+        })?;
+
+        if let Some(rec) = pulled {
+            let keypair = repo.load_local_keypair()?;
+            let bundle = EncryptedFleetBundle::from_json(&rec.bundle_json)?;
+            let restored = apply_encrypted_overlay(&cwd, &bundle, &keypair)?;
+            println!(
+                "Fleet pull from {} ({} file(s) restored, source machine: {})",
+                target.full_name(),
+                restored.len(),
+                bundle.machine_id
+            );
+            for path in &restored {
+                println!("  <- {path}");
+            }
+        } else if pull && !push {
+            println!(
+                "No fleet overlay bundle stored yet for this identity on {}.",
+                target.full_name()
+            );
+        }
+    }
+
+    if do_push {
+        let patterns: Vec<&str> = include
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let keyring = repo.load_keyring()?;
+        let mut recipients: Vec<PublicKeyBundle> = keyring.recipients.values().cloned().collect();
+        if recipients.is_empty() {
+            let local_kp = UserKeyPair::from_secret_bundle(&keyring.local)?;
+            recipients.push(local_kp.public_bundle());
+        }
+        let domain = DomainId::secret("fleet")?;
+        let bundle =
+            export_encrypted_overlay(&cwd, &patterns, &machine_id, &domain, 1, &recipients)?;
+        let bundle_json = bundle.to_json()?;
+        let payload = json!({
+            "bundle_json": bundle_json,
+            "machine": machine_id,
+        });
+
+        let rec: FleetSyncRecord = run_async(async {
+            let client = build_http_client()?;
+            let resp = auth
+                .apply(client.post(target.api_url("fleet")))
+                .json(&payload)
+                .send()
+                .await
+                .with_context(|| format!("failed to contact remote {}", target.base_url))?;
+            parse_json_response(resp, "fleet sync push").await
+        })?;
+
+        println!(
+            "Fleet push to {} ({} file(s) encrypted for {} recipient(s), machine: {}, updated: {})",
+            target.full_name(),
+            bundle.file_count,
+            recipients.len(),
+            rec.machine.as_deref().unwrap_or(&machine_id),
+            rec.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        );
+    }
+
+    Ok(())
+}
+
+/// Bidirectional ACL-filtered Git mirror sync (e.g. GitHub / Forgejo / local bare Git remote).
+pub fn cmd_mirror_sync(git_remote: String, domains: String, branch: String) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let _snap = repo.snapshot_working_copy()?;
+
+    let allowed_domains: Vec<DomainId> = domains
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(DomainId::new)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if allowed_domains.is_empty() {
+        bail!("--domains must include at least one visibility domain (e.g. 'public')");
+    }
+
+    let tmp_dir = env::temp_dir().join(format!(
+        "gitx-mirror-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    fs::create_dir_all(&tmp_dir)?;
+
+    let result = (|| -> Result<()> {
+        let bookmarks = repo.store.list_bookmarks()?;
+        let proj = export_to_git_repo(repo.store.as_ref(), &tmp_dir, &allowed_domains, &bookmarks)?;
+
+        // 1. Push ACL-filtered projection to the Git mirror remote (if the branch exists in projection).
+        if proj.ref_map.contains_key(&branch) {
+            let push_out = Command::new("git")
+                .arg("-C")
+                .arg(&tmp_dir)
+                .args([
+                    "push",
+                    "--force-with-lease",
+                    &git_remote,
+                    &format!("refs/heads/{branch}:refs/heads/{branch}"),
+                ])
+                .output()?;
+            if !push_out.status.success() {
+                let stderr = String::from_utf8_lossy(&push_out.stderr);
+                // If remote has newer upstream commits, fetch & import them first.
+                let fetch_out = Command::new("git")
+                    .arg("-C")
+                    .arg(&tmp_dir)
+                    .args([
+                        "fetch",
+                        &git_remote,
+                        &format!("refs/heads/{branch}:refs/heads/{branch}"),
+                    ])
+                    .output()?;
+                if fetch_out.status.success() {
+                    let imp = import_from_git_repo(
+                        &tmp_dir,
+                        repo.store.as_ref(),
+                        allowed_domains[0].clone(),
+                    )?;
+                    println!(
+                        "Mirror pulled {} upstream commit(s) from '{}' (branch: {})",
+                        imp.imported_commits, git_remote, imp.branch
+                    );
+                } else {
+                    bail!("git mirror push failed: {}", stderr.trim());
+                }
+            } else {
+                println!(
+                    "Mirror pushed {} commit(s) to '{}' (branch: {}, omitted private files: {})",
+                    proj.exported_commits, git_remote, branch, proj.omitted_private_files
+                );
+            }
+        } else {
+            // Local repo has no projected commits for `branch`; attempt to pull from mirror.
+            let fetch_out = Command::new("git")
+                .arg("-C")
+                .arg(&tmp_dir)
+                .args([
+                    "fetch",
+                    &git_remote,
+                    &format!("refs/heads/{branch}:refs/heads/{branch}"),
+                ])
+                .output()?;
+            if fetch_out.status.success() {
+                let imp = import_from_git_repo(
+                    &tmp_dir,
+                    repo.store.as_ref(),
+                    allowed_domains[0].clone(),
+                )?;
+                println!(
+                    "Mirror imported {} commit(s) from '{}' (branch: {})",
+                    imp.imported_commits, git_remote, imp.branch
+                );
+            } else {
+                let stderr = String::from_utf8_lossy(&fetch_out.stderr);
+                bail!("git mirror fetch failed: {}", stderr.trim());
+            }
+        }
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+    result
 }

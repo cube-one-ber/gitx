@@ -1,4 +1,4 @@
-use crate::repo::{Repo, save_json_file};
+use crate::repo::{Repo, save_secret_json_file};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use gitx_core::{
@@ -124,10 +124,22 @@ pub fn cmd_secret_get(path: String, domain_raw: String) -> Result<()> {
 }
 
 pub fn cmd_secret_keygen(name: String) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains("..")
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!(
+            "invalid key name '{name}': must contain only ASCII alphanumerics, '-', '_', or '.' (no path traversal)"
+        );
+    }
     let repo = Repo::open(&env::current_dir()?)?;
     let keypair = UserKeyPair::generate_with_label(&name);
     let key_file = repo.keys_dir().join(format!("{name}.key.json"));
-    save_json_file(&key_file, &keypair.to_secret_bundle())?;
+    save_secret_json_file(&key_file, &keypair.to_secret_bundle())?;
 
     let pub_json = serde_json::to_string(&keypair.public_bundle())?;
     eprintln!(
@@ -362,17 +374,45 @@ pub fn cmd_embargo_publish(advisory: String) -> Result<()> {
             .ok_or_else(|| anyhow!("no active embargo found for advisory '{advisory}'"))?
     };
 
+    let acl = repo.load_acl()?;
     let embargo_domain = DomainId::embargo(&advisory)?;
     let embargo_tree = repo.get_domain_tree_or_empty(Some(&target_cs), &embargo_domain)?;
-    let mut pub_tree = repo.get_domain_tree_or_empty(Some(&target_cs), &DomainId::public())?;
-    for (path, kind) in embargo_tree.entries {
-        pub_tree.insert(path, kind);
+    let mut domain_trees_map: std::collections::BTreeMap<DomainId, DomainTree> =
+        std::collections::BTreeMap::new();
+    for (dom, &tree_hash) in &target_cs.domain_trees {
+        if dom != &embargo_domain {
+            domain_trees_map.insert(dom.clone(), repo.store.get_tree(tree_hash)?);
+        }
     }
-    let pub_tree_hash = repo.store.put_tree(&pub_tree)?;
 
-    let mut new_trees = target_cs.domain_trees.clone();
-    new_trees.remove(&embargo_domain);
-    new_trees.insert(DomainId::public(), pub_tree_hash);
+    for (path, kind) in embargo_tree.entries {
+        let dest_domain = acl.domain_for_path(&path);
+        if dest_domain.is_public()
+            && let EntryKind::File { blob_hash, .. } = &kind
+        {
+            let bytes = repo.store.read_blob_bytes(*blob_hash)?;
+            let findings = gitx_crypto::scan_content(&path, &bytes);
+            if !findings.is_empty() {
+                bail!(
+                    "refusing to publish embargo '{advisory}': secret detected in public path '{path}'"
+                );
+            }
+        }
+        let tree = domain_trees_map
+            .entry(dest_domain.clone())
+            .or_insert_with(|| DomainTree::new(dest_domain));
+        tree.insert(path, kind);
+    }
+
+    let mut new_trees = std::collections::BTreeMap::new();
+    for (dom, tree) in &domain_trees_map {
+        let hash = repo.store.put_tree(tree)?;
+        new_trees.insert(dom.clone(), hash);
+    }
+    if let std::collections::btree_map::Entry::Vacant(e) = new_trees.entry(DomainId::public()) {
+        let empty = DomainTree::new(DomainId::public());
+        e.insert(repo.store.put_tree(&empty)?);
+    }
 
     let published_policy = VisibilityPolicy {
         primary_domain: DomainId::public(),
@@ -413,5 +453,214 @@ pub fn cmd_embargo_publish(advisory: String) -> Result<()> {
         published_cs.change_id.short(),
         published_cs.id.short()
     );
+    Ok(())
+}
+
+pub fn cmd_secret_import_ssh(
+    private_path: Option<std::path::PathBuf>,
+    pub_path: Option<std::path::PathBuf>,
+    name: Option<String>,
+) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let mut keyring = repo.load_keyring()?;
+
+    if let Some(pub_spec) = pub_path {
+        let line = if pub_spec.is_file() {
+            fs::read_to_string(&pub_spec).with_context(|| {
+                format!("failed to read OpenSSH public key '{}'", pub_spec.display())
+            })?
+        } else {
+            pub_spec.to_string_lossy().into_owned()
+        };
+        let bundle = PublicKeyBundle::from_openssh_ed25519_pub(&line)?;
+        let fp = bundle.fingerprint();
+        let recipient_name = name
+            .or_else(|| bundle.label.clone())
+            .unwrap_or_else(|| format!("ssh-{}", &fp[..8.min(fp.len())]));
+        keyring.recipients.insert(recipient_name.clone(), bundle);
+        repo.save_keyring(&keyring)?;
+        println!(
+            "Imported OpenSSH public key as recipient '{}' (fingerprint: {})",
+            recipient_name, fp
+        );
+        return Ok(());
+    }
+
+    let key_path = match private_path {
+        Some(p) => p,
+        None => {
+            let home = env::var("HOME").context("HOME environment variable not set; pass --path")?;
+            std::path::PathBuf::from(home).join(".ssh").join("id_ed25519")
+        }
+    };
+
+    let pem = fs::read_to_string(&key_path).with_context(|| {
+        format!(
+            "failed to read OpenSSH private key '{}'",
+            key_path.display()
+        )
+    })?;
+    let kp = UserKeyPair::from_openssh_ed25519(&pem, name.clone())?;
+    let fp = kp.fingerprint();
+    let label = name
+        .or_else(|| kp.label().map(ToString::to_string))
+        .unwrap_or_else(|| "local-ssh".to_string());
+
+    keyring.local = kp.to_secret_bundle();
+    keyring.recipients.insert(label.clone(), kp.public_bundle());
+    repo.save_keyring(&keyring)?;
+
+    println!(
+        "Imported OpenSSH Ed25519 private key from {} as local identity '{}' (fingerprint: {})",
+        key_path.display(),
+        label,
+        fp
+    );
+    println!("  ssh-pub: {}", kp.to_openssh_ed25519_pub());
+    Ok(())
+}
+
+pub fn cmd_secret_revoke(target: String) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let mut keyring = repo.load_keyring()?;
+    let keypair = UserKeyPair::from_secret_bundle(&keyring.local)?;
+
+    let mut dropped_fps = Vec::new();
+    let keys_to_remove: Vec<String> = keyring
+        .recipients
+        .iter()
+        .filter(|(name, bundle)| *name == &target || bundle.fingerprint() == target)
+        .map(|(name, bundle)| {
+            dropped_fps.push(bundle.fingerprint());
+            name.clone()
+        })
+        .collect();
+    for k in &keys_to_remove {
+        keyring.recipients.remove(k);
+    }
+    if dropped_fps.is_empty() {
+        dropped_fps.push(target.clone());
+    }
+    repo.save_keyring(&keyring)?;
+
+    let recipients: Vec<PublicKeyBundle> = keyring.recipients.values().cloned().collect();
+    if recipients.is_empty() {
+        bail!("cannot revoke '{}': zero remaining recipients in keyring", target);
+    }
+
+    let cur = repo.current_changeset()?;
+    let mut new_trees = cur.domain_trees.clone();
+    let mut rotated_count = 0usize;
+
+    for (domain, &tree_hash) in &cur.domain_trees {
+        if !domain.is_secret() {
+            continue;
+        }
+        let mut secret_tree = repo.store.get_tree(tree_hash)?;
+        let mut changed_domain = false;
+        let paths: Vec<String> = secret_tree.entries.keys().cloned().collect();
+
+        for path in paths {
+            let Some(EntryKind::EncryptedSecret {
+                envelope_hash,
+                mode,
+                ..
+            }) = secret_tree.entries.get(&path).cloned()
+            else {
+                continue;
+            };
+            let old_env = repo.get_envelope(envelope_hash)?;
+            let rotated = rotate_secret(&old_env, &path, &keypair, &recipients)?;
+            let new_hash = repo.put_envelope(&rotated)?;
+            secret_tree.insert(
+                path.clone(),
+                EntryKind::EncryptedSecret {
+                    envelope_hash: new_hash,
+                    key_epoch: rotated.key_epoch,
+                    mode,
+                },
+            );
+            rotated_count += 1;
+            changed_domain = true;
+        }
+
+        if changed_domain {
+            let new_tree_hash = repo.store.put_tree(&secret_tree)?;
+            new_trees.insert(domain.clone(), new_tree_hash);
+        }
+    }
+
+    if rotated_count > 0 {
+        let updated = ChangeSetBuilder::new(cur.author.clone())
+            .change_id(cur.change_id)
+            .previous_revision(Some(cur.id))
+            .parents(cur.parents.clone())
+            .public_parents(cur.public_parents.clone())
+            .domain_trees(new_trees)
+            .committer(cur.committer.clone())
+            .visibility(cur.visibility.clone())
+            .has_conflicts(cur.has_conflicts)
+            .description(cur.description.clone())
+            .build();
+        repo.store.put_changeset(&updated)?;
+        repo.update_active_workspace_head(&updated)?;
+    }
+
+    println!(
+        "Revoked '{}' (removed {} keyring entry/entries, rotated {} secret(s) to new key epoch)",
+        target,
+        keys_to_remove.len(),
+        rotated_count
+    );
+
+    if let Ok(mut audit) = repo.load_audit_log() {
+        for fp in &dropped_fps {
+            audit.record_revoke(fp.clone(), DomainId::secret("all")?);
+            let exposed = audit.rotation_report_for_revoked(fp);
+            println!(
+                "Exposure audit for '{}' ({} secret version(s) previously decrypted):",
+                fp,
+                exposed.len()
+            );
+            for item in &exposed {
+                println!(
+                    "  - [{}] {} (epoch {}, decrypted {} time(s))",
+                    item.domain, item.path, item.key_epoch, item.access_count
+                );
+            }
+        }
+        let _ = repo.save_audit_log(&audit);
+    }
+
+    Ok(())
+}
+
+pub fn cmd_secret_rotate_report(target: String) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let keyring = repo.load_keyring()?;
+    let fp = keyring
+        .recipients
+        .get(&target)
+        .map(PublicKeyBundle::fingerprint)
+        .unwrap_or(target);
+
+    let audit = repo.load_audit_log()?;
+    let exposed = audit.rotation_report_for_revoked(&fp);
+    if exposed.is_empty() {
+        println!("No recorded secret decryptions for identity '{}'.", fp);
+        return Ok(());
+    }
+
+    println!(
+        "Deterministic rotation report for '{}' ({} exposed secret version(s)):",
+        fp,
+        exposed.len()
+    );
+    for item in &exposed {
+        println!(
+            "  - [{}] {} (epoch {}, decrypted {} time(s))",
+            item.domain, item.path, item.key_epoch, item.access_count
+        );
+    }
     Ok(())
 }

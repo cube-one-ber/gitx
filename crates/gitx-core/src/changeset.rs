@@ -194,7 +194,8 @@ impl ChangeSetBuilder {
     }
 
     pub fn build(self) -> ChangeSet {
-        let public_tree = if self.visibility.primary_domain.is_public() && self.visibility.embargo.is_none() {
+        let publicly_visible = self.visibility.is_publicly_visible();
+        let public_tree = if publicly_visible {
             self.domain_trees.get(&DomainId::public()).copied()
         } else {
             None
@@ -207,7 +208,7 @@ impl ChangeSetBuilder {
             author: &self.author,
             committer: &self.committer,
             created_at: self.created_at,
-            description: if self.visibility.primary_domain.is_public() && self.visibility.embargo.is_none() {
+            description: if publicly_visible {
                 &self.description
             } else {
                 ""

@@ -392,4 +392,72 @@ fn postgres_config_migrations_and_sql_metadata_backend_verification() {
             .validate()
             .is_err()
     );
+
+    // Credentials are redacted in Debug output and validation errors
+    let bad_secret_pg = PostgresConfig::new("mysql://admin:SuperSecretPass99@db.internal/gitx");
+    let dbg_str = format!("{bad_secret_pg:?}");
+    assert!(!dbg_str.contains("SuperSecretPass99"));
+    let err_str = bad_secret_pg.validate().unwrap_err().to_string();
+    assert!(!err_str.contains("SuperSecretPass99"));
+
+    let s3_dbg = format!(
+        "{:?}",
+        S3Config::new("b", "us-east-1").with_credentials("AKIAKEY", "VerySecretKey99")
+    );
+    assert!(!s3_dbg.contains("VerySecretKey99"));
+}
+
+#[test]
+fn local_store_rejects_oversized_lz4_header_and_enforces_atomic_revert() {
+    use gitx_store::LocalStore;
+
+    let tmp = TempDir::new().unwrap();
+    let store = LocalStore::open(tmp.path()).unwrap();
+
+    // Write a forged CAS chunk claiming a 1 GiB uncompressed payload
+    let fake_hash = ObjectHash::of_bytes(b"lz4-bomb-test");
+    let hex = fake_hash.to_hex();
+    let shard = tmp.path().join("cas").join(&hex[..2]);
+    std::fs::create_dir_all(&shard).unwrap();
+    let mut forged = Vec::new();
+    forged.extend_from_slice(&(1024u32 * 1024 * 1024).to_le_bytes());
+    forged.extend_from_slice(&[0u8; 16]);
+    std::fs::write(shard.join(&hex), &forged).unwrap();
+
+    let err = store.get_chunk(fake_hash).unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds limit"),
+        "expected decompression cap error, got: {err}"
+    );
+
+    // Atomic revert_land rejects non-tip land and double revert
+    let pub_dom = DomainId::public();
+    let t1 = store.put_tree(&DomainTree::new(pub_dom.clone())).unwrap();
+    let cs1 = ChangeSetBuilder::new(test_identity())
+        .domain_tree(pub_dom.clone(), t1)
+        .description("cs1")
+        .build();
+    store.put_changeset(&cs1).unwrap();
+    let cs2 = ChangeSetBuilder::new(test_identity())
+        .parents(vec![cs1.id])
+        .domain_tree(pub_dom, t1)
+        .description("cs2")
+        .build();
+    store.put_changeset(&cs2).unwrap();
+
+    let l1 = store
+        .record_land("master", None, cs1.id, vec![cs1.change_id])
+        .unwrap();
+    let l2 = store
+        .record_land("master", Some(cs1.id), cs2.id, vec![cs2.change_id])
+        .unwrap();
+
+    // Reverting non-tip l1 fails
+    assert!(store.revert_land(l1.land_seq).is_err());
+    // Reverting tip l2 succeeds and moves bookmark back to cs1
+    let rev = store.revert_land(l2.land_seq).unwrap();
+    assert_eq!(rev.new_head, cs1.id);
+    assert_eq!(store.get_bookmark("master").unwrap(), Some(cs1.id));
+    // Double-reverting l2 fails
+    assert!(store.revert_land(l2.land_seq).is_err());
 }

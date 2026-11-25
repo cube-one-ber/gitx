@@ -453,3 +453,57 @@ fn e2e_colocate_embargo_and_stack() {
     let emb_pub = gitx_ok(root, &["embargo", "publish", "cve-2026-0001"]);
     assert!(emb_pub.contains("is now public"));
 }
+
+#[test]
+fn e2e_cli_secrets_never_stored_plaintext_in_cas_and_key_hardening() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    gitx_ok(root, &["init", "--name", "Sec", "--email", "sec@example.com"]);
+    let canary = "SUPER_UNIQUE_PLAINTEXT_SECRET_CANARY_987654321";
+    fs::write(root.join(".env"), format!("API_TOKEN={canary}\n")).unwrap();
+    fs::write(root.join("public.txt"), "hello world\n").unwrap();
+
+    // Snapshot & land via normal describe/land workflow (without manually running `secret set` first)
+    gitx_ok(root, &["describe", "-m", "Add public and .env"]);
+    gitx_ok(root, &["land"]);
+
+    // Verify NO file under .gitx/store/cas contains the plaintext canary
+    fn collect_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    collect_files(&p, out);
+                } else if p.is_file() {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let cas_dir = root.join(".gitx/store/cas");
+    let mut cas_files = Vec::new();
+    collect_files(&cas_dir, &mut cas_files);
+    for path in cas_files {
+        let raw = fs::read(&path).unwrap();
+        assert!(
+            !raw.windows(canary.len()).any(|w| w == canary.as_bytes()),
+            "plaintext secret canary leaked into CAS file {}",
+            path.display()
+        );
+    }
+
+    // Secret keygen rejects path traversal names
+    let bad_keygen = run_gitx(root, &["secret", "keygen", "../escape"]);
+    assert!(!bad_keygen.status.success());
+
+    // Local key file has 0600 permissions on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let local_key = root.join(".gitx/keys/local.json");
+        assert!(local_key.is_file());
+        let mode = fs::metadata(&local_key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "local.json must have 0600 permissions");
+    }
+}

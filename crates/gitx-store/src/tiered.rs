@@ -3,7 +3,7 @@
 //! pluggable [`MetadataBackend`].
 
 use crate::metadata::{MetadataBackend, SqlMetadataBackend};
-use crate::store::{LandRecord, ObjectStore};
+use crate::store::{LandRecord, ObjectStore, safe_lz4_decompress};
 use bytes::Bytes;
 use gitx_core::{
     ChangeId, ChangeSet, GitxError, ObjectHash, OpId, OpLogEntry, Result, Stack, WorkspaceRef,
@@ -16,14 +16,22 @@ use object_store::path::Path as StorePath;
 use object_store::{ObjectStore as RemoteObjectStore, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 static STORE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static STORE_RUNTIME_INIT: Mutex<()> = Mutex::new(());
 
 fn shared_store_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    if let Some(rt) = STORE_RUNTIME.get() {
+        return Ok(rt);
+    }
+    let _guard = STORE_RUNTIME_INIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(rt) = STORE_RUNTIME.get() {
         return Ok(rt);
     }
@@ -33,7 +41,9 @@ fn shared_store_runtime() -> Result<&'static tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .map_err(|e| GitxError::Storage(format!("failed to start store runtime: {e}")))?;
-    let _ = STORE_RUNTIME.set(rt);
+    if let Err(unused_rt) = STORE_RUNTIME.set(rt) {
+        unused_rt.shutdown_background();
+    }
     Ok(STORE_RUNTIME.get().expect("runtime initialized"))
 }
 
@@ -42,7 +52,7 @@ fn shared_store_runtime() -> Result<&'static tokio::runtime::Runtime> {
 // ---------------------------------------------------------------------------
 
 /// Configuration for AWS S3 or S3-compatible object stores (e.g., Cloudflare R2, MinIO).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
@@ -53,6 +63,31 @@ pub struct S3Config {
     pub prefix: Option<String>,
     pub allow_http: bool,
     pub virtual_hosted_style_request: bool,
+}
+
+impl fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("prefix", &self.prefix)
+            .field("allow_http", &self.allow_http)
+            .field(
+                "virtual_hosted_style_request",
+                &self.virtual_hosted_style_request,
+            )
+            .finish()
+    }
 }
 
 impl S3Config {
@@ -162,12 +197,26 @@ impl S3Config {
 }
 
 /// Configuration for Google Cloud Storage (GCS).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcsConfig {
     pub bucket: String,
     pub service_account_path: Option<PathBuf>,
     pub service_account_key: Option<String>,
     pub prefix: Option<String>,
+}
+
+impl fmt::Debug for GcsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsConfig")
+            .field("bucket", &self.bucket)
+            .field("service_account_path", &self.service_account_path)
+            .field(
+                "service_account_key",
+                &self.service_account_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 impl GcsConfig {
@@ -577,17 +626,27 @@ impl TieredObjectStore {
 
     /// Executes an async `object_store` operation safely whether called from a plain OS thread,
     /// a `current_thread` Tokio runtime, or a `multi_thread` Tokio runtime.
-    fn block_on<F, T>(&self, fut: F) -> T
+    fn block_on<F, T>(&self, fut: F) -> Result<T>
     where
-        F: Future<Output = T> + Send,
+        F: Future<Output = Result<T>> + Send,
         T: Send,
     {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let rt = self.runtime;
-            std::thread::scope(|s| s.spawn(move || rt.block_on(fut)).join())
-                .expect("tiered object store runtime bridge panicked")
-        } else {
-            self.runtime.block_on(fut)
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                    tokio::task::block_in_place(|| self.runtime.block_on(fut))
+                } else {
+                    let rt = self.runtime;
+                    std::thread::scope(|s| s.spawn(move || rt.block_on(fut)).join()).map_err(
+                        |_| {
+                            GitxError::Storage(
+                                "tiered object store runtime bridge panicked".to_string(),
+                            )
+                        },
+                    )?
+                }
+            }
+            Err(_) => self.runtime.block_on(fut),
         }
     }
 
@@ -638,9 +697,7 @@ impl TieredObjectStore {
         })?;
 
         let decoded = if self.compress {
-            lz4_flex::decompress_size_prepended(&raw_bytes).map_err(|e| {
-                GitxError::Storage(format!("lz4 decompress failed for {label} {hash}: {e}"))
-            })?
+            safe_lz4_decompress(&raw_bytes, label, hash)?
         } else {
             raw_bytes.to_vec()
         };
@@ -705,6 +762,10 @@ impl ObjectStore for TieredObjectStore {
         self.metadata.get_revisions_for_change(change_id)
     }
 
+    fn delete_changeset(&self, id: ObjectHash) -> Result<()> {
+        self.metadata.delete_changeset(id)
+    }
+
     fn put_stack(&self, stack: &Stack) -> Result<()> {
         self.metadata.put_stack(stack)
     }
@@ -756,8 +817,16 @@ impl ObjectStore for TieredObjectStore {
         self.metadata.list_lands(target, limit)
     }
 
+    fn list_all_lands(&self, after_land_seq: u64, limit: usize) -> Result<Vec<LandRecord>> {
+        self.metadata.list_all_lands(after_land_seq, limit)
+    }
+
     fn mark_reverted(&self, land_seq: u64, reverted_by: u64) -> Result<()> {
         self.metadata.mark_reverted(land_seq, reverted_by)
+    }
+
+    fn revert_land(&self, land_seq: u64) -> Result<LandRecord> {
+        self.metadata.revert_land(land_seq)
     }
 
     fn get_bookmark(&self, name: &str) -> Result<Option<ObjectHash>> {
@@ -766,6 +835,19 @@ impl ObjectStore for TieredObjectStore {
 
     fn set_bookmark(&self, name: &str, hash: ObjectHash) -> Result<()> {
         self.metadata.set_bookmark(name, hash)
+    }
+
+    fn cas_bookmark(
+        &self,
+        name: &str,
+        expected: Option<ObjectHash>,
+        new_hash: ObjectHash,
+    ) -> Result<()> {
+        self.metadata.cas_bookmark(name, expected, new_hash)
+    }
+
+    fn cas_bookmarks(&self, updates: &[(String, Option<ObjectHash>, ObjectHash)]) -> Result<()> {
+        self.metadata.cas_bookmarks(updates)
     }
 
     fn list_bookmarks(&self) -> Result<BTreeMap<String, ObjectHash>> {

@@ -1,12 +1,14 @@
-use crate::store::{LandRecord, ObjectStore, sort_revisions_oldest_first};
+use crate::store::{
+    LandRecord, ObjectStore, safe_lz4_decompress, sort_revisions_oldest_first,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use gitx_core::{
     ChangeId, ChangeSet, GitxError, ObjectHash, OpId, OpLogEntry, Result, Stack, WorkspaceRef,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,7 +123,13 @@ impl LocalStore {
         let tmp_name = format!(".tmp.{hex}.{}.{n}", std::process::id());
         let tmp_path = shard_dir.join(tmp_name);
 
-        if let Err(err) = fs::write(&tmp_path, &compressed) {
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&compressed)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
             let _ = fs::remove_file(&tmp_path);
             return Err(err.into());
         }
@@ -130,6 +138,11 @@ impl LocalStore {
             let _ = fs::remove_file(&tmp_path);
             if !file_path.exists() {
                 return Err(err.into());
+            }
+        } else {
+            #[cfg(unix)]
+            if let Ok(dir) = File::open(&shard_dir) {
+                let _ = dir.sync_all();
             }
         }
         Ok(())
@@ -145,9 +158,7 @@ impl LocalStore {
             Err(err) => return Err(err.into()),
         };
 
-        lz4_flex::decompress_size_prepended(&compressed).map_err(|e| {
-            GitxError::Storage(format!("lz4 decompress failed for {label} {hash}: {e}"))
-        })
+        safe_lz4_decompress(&compressed, label, hash)
     }
 }
 
@@ -280,6 +291,13 @@ impl ObjectStore for LocalStore {
             items.push((seq, cs));
         }
         Ok(sort_revisions_oldest_first(items))
+    }
+
+    fn delete_changeset(&self, id: ObjectHash) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM changesets WHERE id = ?1", params![id.to_hex()])
+            .map_err(sqlite_err)?;
+        Ok(())
     }
 
     fn put_stack(&self, stack: &Stack) -> Result<()> {
@@ -492,6 +510,26 @@ impl ObjectStore for LocalStore {
         Ok(out)
     }
 
+    fn list_all_lands(&self, after_land_seq: u64, limit: usize) -> Result<Vec<LandRecord>> {
+        let conn = self.lock_conn()?;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = conn
+            .prepare(
+                "SELECT land_seq, target, previous_head, new_head, landed_changes, timestamp, reverted_by
+                 FROM lands WHERE land_seq > ?1 ORDER BY land_seq ASC LIMIT ?2",
+            )
+            .map_err(sqlite_err)?;
+
+        let mut rows = stmt
+            .query(params![after_land_seq as i64, limit_i64])
+            .map_err(sqlite_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_err)? {
+            out.push(row_to_land_record(row)?);
+        }
+        Ok(out)
+    }
+
     fn mark_reverted(&self, land_seq: u64, reverted_by: u64) -> Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn
@@ -528,6 +566,97 @@ impl ObjectStore for LocalStore {
         Ok(())
     }
 
+    fn revert_land(&self, land_seq: u64) -> Result<LandRecord> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_err)?;
+
+        let original = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT land_seq, target, previous_head, new_head, landed_changes, timestamp, reverted_by
+                     FROM lands WHERE land_seq = ?1",
+                )
+                .map_err(sqlite_err)?;
+            let mut rows = stmt.query(params![land_seq as i64]).map_err(sqlite_err)?;
+            match rows.next().map_err(sqlite_err)? {
+                Some(row) => row_to_land_record(row)?,
+                None => return Err(GitxError::NotFound(format!("land record {land_seq}"))),
+            }
+        };
+
+        if let Some(existing_rev) = original.reverted_by {
+            return Err(GitxError::Merge(format!(
+                "land record {land_seq} already reverted by {existing_rev}"
+            )));
+        }
+        let previous_head = original.previous_head.ok_or_else(|| {
+            GitxError::Merge(format!(
+                "land record {land_seq} has no previous_head to revert to"
+            ))
+        })?;
+
+        let current_head_str: Option<String> = tx
+            .query_row(
+                "SELECT hash FROM bookmarks WHERE name = ?1",
+                params![&original.target],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        let current_head = current_head_str
+            .as_deref()
+            .map(ObjectHash::from_str)
+            .transpose()?;
+
+        if current_head != Some(original.new_head) {
+            return Err(GitxError::Merge(format!(
+                "cannot revert land_seq {land_seq}: target '{}' head is {current_head:?}, expected {}",
+                original.target, original.new_head
+            )));
+        }
+
+        let timestamp = Utc::now();
+        let ts_str = timestamp.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let changes: Vec<ChangeId> = Vec::new();
+        let changes_blob = bincode::serialize(&changes).map_err(ser_err)?;
+        let prev_hex = Some(original.new_head.to_hex());
+        let new_hex = previous_head.to_hex();
+
+        tx.execute(
+            "INSERT INTO lands (target, previous_head, new_head, landed_changes, timestamp, reverted_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            params![&original.target, prev_hex, &new_hex, changes_blob, ts_str],
+        )
+        .map_err(sqlite_err)?;
+        let revert_seq = tx.last_insert_rowid() as u64;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO bookmarks (name, hash) VALUES (?1, ?2)",
+            params![&original.target, &new_hex],
+        )
+        .map_err(sqlite_err)?;
+
+        tx.execute(
+            "UPDATE lands SET reverted_by = ?1 WHERE land_seq = ?2",
+            params![revert_seq as i64, land_seq as i64],
+        )
+        .map_err(sqlite_err)?;
+
+        tx.commit().map_err(sqlite_err)?;
+
+        Ok(LandRecord {
+            land_seq: revert_seq,
+            target: original.target,
+            previous_head: Some(original.new_head),
+            new_head: previous_head,
+            landed_changes: changes,
+            timestamp,
+            reverted_by: None,
+        })
+    }
+
     fn get_bookmark(&self, name: &str) -> Result<Option<ObjectHash>> {
         let conn = self.lock_conn()?;
         let hash_str: Option<String> = conn
@@ -549,6 +678,80 @@ impl ObjectStore for LocalStore {
             params![name, hash.to_hex()],
         )
         .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    fn cas_bookmark(
+        &self,
+        name: &str,
+        expected: Option<ObjectHash>,
+        new_hash: ObjectHash,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_err)?;
+        let current_str: Option<String> = tx
+            .query_row(
+                "SELECT hash FROM bookmarks WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        let current = current_str
+            .as_deref()
+            .map(ObjectHash::from_str)
+            .transpose()?;
+        if current != expected {
+            return Err(GitxError::Merge(format!(
+                "CAS conflict updating bookmark '{name}': expected {expected:?}, actual {current:?}"
+            )));
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO bookmarks (name, hash) VALUES (?1, ?2)",
+            params![name, new_hash.to_hex()],
+        )
+        .map_err(sqlite_err)?;
+        tx.commit().map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    fn cas_bookmarks(&self, updates: &[(String, Option<ObjectHash>, ObjectHash)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_err)?;
+        for (name, expected, _) in updates {
+            let current_str: Option<String> = tx
+                .query_row(
+                    "SELECT hash FROM bookmarks WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_err)?;
+            let current = current_str
+                .as_deref()
+                .map(ObjectHash::from_str)
+                .transpose()?;
+            if current != *expected {
+                return Err(GitxError::Merge(format!(
+                    "CAS conflict updating bookmark '{name}': expected {expected:?}, actual {current:?}"
+                )));
+            }
+        }
+        for (name, _, new_hash) in updates {
+            tx.execute(
+                "INSERT OR REPLACE INTO bookmarks (name, hash) VALUES (?1, ?2)",
+                params![name, new_hash.to_hex()],
+            )
+            .map_err(sqlite_err)?;
+        }
+        tx.commit().map_err(sqlite_err)?;
         Ok(())
     }
 

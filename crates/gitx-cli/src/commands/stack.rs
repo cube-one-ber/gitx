@@ -426,3 +426,325 @@ pub fn cmd_undo() -> Result<()> {
     println!("Undid '{}' -> restored '{}'", latest.summary, target_op.summary);
     Ok(())
 }
+
+pub fn cmd_op_restore(op_spec: String) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let spec = op_spec.trim().to_lowercase();
+    if spec.is_empty() {
+        bail!("op id prefix must not be empty");
+    }
+
+    let ops = repo.store.list_ops(500)?;
+    let target_op = ops
+        .into_iter()
+        .find(|op| {
+            let full = op.id.0.to_string().to_lowercase();
+            let short = &full[full.len().saturating_sub(8)..];
+            full == spec || full.starts_with(&spec) || short == spec || full.ends_with(&spec)
+        })
+        .ok_or_else(|| anyhow!("no operation log entry matching '{op_spec}'"))?;
+
+    for (name, hash) in &target_op.bookmarks {
+        repo.store.set_bookmark(name, *hash)?;
+    }
+
+    let current_workspaces = repo.store.list_workspaces()?;
+    for existing_name in current_workspaces.keys() {
+        if !target_op.workspaces.contains_key(existing_name) {
+            repo.store.remove_workspace(existing_name)?;
+        }
+    }
+    for ws in target_op.workspaces.values() {
+        repo.store.put_workspace(ws)?;
+    }
+
+    if let Some(active_ws) = target_op.workspaces.get(&repo.config.active_workspace) {
+        let restored_cs = repo.store.get_changeset(active_ws.head_changeset)?;
+        repo.materialize_changeset(&restored_cs)?;
+    }
+
+    repo.append_op(
+        OpKind::Undo {
+            target_op: target_op.id,
+        },
+        format!("Restored op '{}' ({})", op_spec, target_op.summary),
+    )?;
+
+    println!("Restored operation '{}' — {}", op_spec, target_op.summary);
+    Ok(())
+}
+
+pub fn cmd_squash(message: Option<String>) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let snap = repo.snapshot_working_copy()?;
+    let cur = snap.changeset;
+
+    let Some(&parent_hash) = cur.parents.first() else {
+        bail!("cannot squash root ChangeSet {} (no parent)", cur.change_id.short());
+    };
+    let parent = repo.store.get_changeset(parent_hash)?;
+
+    let combined_desc = match message.filter(|m| !m.trim().is_empty()) {
+        Some(m) => m,
+        None => match (parent.description.trim(), cur.description.trim()) {
+            ("", c) => c.to_string(),
+            (p, "") => p.to_string(),
+            (p, c) => format!("{p}\n\n{c}"),
+        },
+    };
+
+    let squashed = ChangeSetBuilder::new(parent.author.clone())
+        .change_id(parent.change_id)
+        .previous_revision(Some(parent.id))
+        .parents(parent.parents.clone())
+        .public_parents(parent.public_parents.clone())
+        .domain_trees(cur.domain_trees.clone())
+        .committer(cur.committer.clone())
+        .visibility(parent.visibility.clone())
+        .has_conflicts(cur.has_conflicts)
+        .description(combined_desc)
+        .build();
+
+    repo.store.put_changeset(&squashed)?;
+
+    // Advance any bookmark that previously pointed at `parent.id` or `cur.id`.
+    for (bm, hash) in repo.store.list_bookmarks()? {
+        if hash == parent.id || hash == cur.id {
+            repo.store.set_bookmark(&bm, squashed.id)?;
+        }
+    }
+
+    // Start a clean working copy `@` on top of the squashed ChangeSet.
+    let next_working = ChangeSetBuilder::new(repo.config.author.clone())
+        .parents(vec![squashed.id])
+        .public_parents(vec![squashed.public_projection_hash])
+        .domain_trees(squashed.domain_trees.clone())
+        .visibility(VisibilityPolicy::public())
+        .description("")
+        .build();
+    repo.store.put_changeset(&next_working)?;
+    repo.update_active_workspace_head(&next_working)?;
+
+    repo.append_op(
+        OpKind::Squash {
+            from: cur.change_id,
+            into: parent.change_id,
+        },
+        format!(
+            "Squashed {} into {} ({})",
+            cur.change_id.short(),
+            squashed.change_id.short(),
+            squashed.id.short()
+        ),
+    )?;
+
+    println!(
+        "Squashed {} into {} ({}); active @ is now {}",
+        cur.change_id.short(),
+        squashed.change_id.short(),
+        squashed.id.short(),
+        next_working.change_id.short()
+    );
+    Ok(())
+}
+
+pub fn cmd_split(paths: Vec<String>, message: Option<String>) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let snap = repo.snapshot_working_copy()?;
+    let cur = snap.changeset;
+
+    let selected: std::collections::BTreeSet<String> = paths
+        .into_iter()
+        .flat_map(|item| {
+            item.split(',')
+                .map(|s| s.trim().trim_start_matches("./").to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if selected.is_empty() {
+        bail!("specify at least one path via --paths <path1,path2>");
+    }
+
+    let parent_cs = match cur.parents.first() {
+        Some(&p) => Some(repo.store.get_changeset(p)?),
+        None => None,
+    };
+
+    let mut all_domains = std::collections::BTreeSet::new();
+    if let Some(ref p) = parent_cs {
+        all_domains.extend(p.domain_trees.keys().cloned());
+    }
+    all_domains.extend(cur.domain_trees.keys().cloned());
+    all_domains.insert(DomainId::public());
+
+    let mut first_domain_trees = std::collections::BTreeMap::new();
+    let mut moved_any = false;
+
+    for dom in &all_domains {
+        let mut first_tree = repo.get_domain_tree_or_empty(parent_cs.as_ref(), dom)?;
+        let cur_tree = repo.get_domain_tree_or_empty(Some(&cur), dom)?;
+
+        for path in &selected {
+            match cur_tree.entries.get(path) {
+                Some(entry) => {
+                    if first_tree.entries.get(path) != Some(entry) {
+                        first_tree.insert(path.clone(), entry.clone());
+                        moved_any = true;
+                    }
+                }
+                None => {
+                    if first_tree.entries.remove(path).is_some() {
+                        moved_any = true;
+                    }
+                }
+            }
+        }
+
+        if dom.is_public() || !first_tree.entries.is_empty() {
+            let hash = repo.store.put_tree(&first_tree)?;
+            first_domain_trees.insert(dom.clone(), hash);
+        }
+    }
+
+    if !moved_any {
+        bail!(
+            "none of the selected paths ({}) differ from parent in {}",
+            selected.into_iter().collect::<Vec<_>>().join(", "),
+            cur.change_id.short()
+        );
+    }
+
+    let first_desc = message
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cur.description.trim().is_empty() {
+                format!(
+                    "Split ({})",
+                    selected.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            } else {
+                cur.description.clone()
+            }
+        });
+
+    let first_has_conflicts = repo.trees_have_conflicts(&first_domain_trees)?;
+    let first_cs = ChangeSetBuilder::new(cur.author.clone())
+        .parents(cur.parents.clone())
+        .public_parents(cur.public_parents.clone())
+        .domain_trees(first_domain_trees)
+        .committer(cur.committer.clone())
+        .visibility(cur.visibility.clone())
+        .has_conflicts(first_has_conflicts)
+        .description(first_desc)
+        .build();
+    repo.store.put_changeset(&first_cs)?;
+
+    // Remaining changes sit in a new revision of `cur.change_id` stacked directly on top of `first_cs`.
+    let remainder_cs = ChangeSetBuilder::new(cur.author.clone())
+        .change_id(cur.change_id)
+        .previous_revision(Some(cur.id))
+        .parents(vec![first_cs.id])
+        .public_parents(vec![first_cs.public_projection_hash])
+        .domain_trees(cur.domain_trees.clone())
+        .committer(cur.committer.clone())
+        .visibility(cur.visibility.clone())
+        .has_conflicts(cur.has_conflicts)
+        .description(cur.description.clone())
+        .build();
+    repo.store.put_changeset(&remainder_cs)?;
+    repo.update_active_workspace_head(&remainder_cs)?;
+
+    repo.append_op(
+        OpKind::Split {
+            source: cur.change_id,
+            created: first_cs.change_id,
+        },
+        format!(
+            "Split {} -> base {} + remainder {}",
+            cur.change_id.short(),
+            first_cs.change_id.short(),
+            remainder_cs.change_id.short()
+        ),
+    )?;
+
+    println!(
+        "Split {} into stack:\n  base:      {} ({}) — {}\n  remainder: {} ({})",
+        cur.change_id.short(),
+        first_cs.change_id.short(),
+        first_cs.id.short(),
+        first_cs.description,
+        remainder_cs.change_id.short(),
+        remainder_cs.id.short(),
+    );
+    Ok(())
+}
+
+pub fn cmd_rebase(onto: String) -> Result<()> {
+    let repo = Repo::open(&env::current_dir()?)?;
+    let snap = repo.snapshot_working_copy()?;
+    let cur = snap.changeset;
+    let onto_cs = repo.resolve_changeset(&onto)?;
+
+    if cur.parents.as_slice() == [onto_cs.id] {
+        println!(
+            "ChangeSet {} is already based on {} ({}).",
+            cur.change_id.short(),
+            onto,
+            onto_cs.id.short()
+        );
+        return Ok(());
+    }
+
+    let old_base = match cur.parents.first() {
+        Some(&p) => Some(repo.store.get_changeset(p)?),
+        None => None,
+    };
+
+    let (merged_trees, conflicts) = repo.merge_changeset_trees(old_base.as_ref(), &cur, &onto_cs)?;
+    let has_conflicts = !conflicts.is_empty() || repo.trees_have_conflicts(&merged_trees)?;
+
+    let rebased = ChangeSetBuilder::new(cur.author.clone())
+        .change_id(cur.change_id)
+        .previous_revision(Some(cur.id))
+        .parents(vec![onto_cs.id])
+        .public_parents(vec![onto_cs.public_projection_hash])
+        .domain_trees(merged_trees)
+        .committer(cur.committer.clone())
+        .visibility(cur.visibility.clone())
+        .has_conflicts(has_conflicts)
+        .description(cur.description.clone())
+        .build();
+
+    repo.store.put_changeset(&rebased)?;
+    repo.update_active_workspace_head(&rebased)?;
+    repo.materialize_changeset(&rebased)?;
+
+    repo.append_op(
+        OpKind::Rebase {
+            moved: vec![rebased.change_id],
+        },
+        format!(
+            "Rebased {} onto {} ({})",
+            rebased.change_id.short(),
+            onto,
+            onto_cs.id.short()
+        ),
+    )?;
+
+    println!(
+        "Rebased {} ({} -> {}) onto {} ({})",
+        rebased.change_id.short(),
+        cur.id.short(),
+        rebased.id.short(),
+        onto,
+        onto_cs.id.short()
+    );
+    if !conflicts.is_empty() {
+        println!(
+            "  [CONFLICT] First-class conflicts recorded in: {} (repo is NOT blocked; resolve at your own pace)",
+            conflicts.join(", ")
+        );
+    }
+    Ok(())
+}

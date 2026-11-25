@@ -93,6 +93,10 @@ pub trait ObjectStore: Send + Sync {
     fn list_changesets(&self) -> Result<Vec<ChangeSet>>;
     /// Returns all revisions for `change_id`, ordered oldest -> newest.
     fn get_revisions_for_change(&self, change_id: ChangeId) -> Result<Vec<ChangeSet>>;
+    /// Removes an unlanded changeset record (e.g. rolling back a CAS-failed embargo publish).
+    fn delete_changeset(&self, _id: ObjectHash) -> Result<()> {
+        Ok(())
+    }
 
     // ---- Stack storage ----
     fn put_stack(&self, stack: &Stack) -> Result<()>;
@@ -116,16 +120,110 @@ pub trait ObjectStore: Send + Sync {
     ) -> Result<LandRecord>;
     fn get_land(&self, land_seq: u64) -> Result<LandRecord>;
     fn list_lands(&self, target: &str, limit: usize) -> Result<Vec<LandRecord>>;
+    /// List committed land records across ALL targets strictly after `after_land_seq`, ordered
+    /// ascending by `land_seq` (for durable outbox reconciliation and crash recovery).
+    fn list_all_lands(&self, _after_land_seq: u64, _limit: usize) -> Result<Vec<LandRecord>> {
+        Ok(Vec::new())
+    }
     fn mark_reverted(&self, land_seq: u64, reverted_by: u64) -> Result<()>;
+
+    /// Atomically revert `land_seq` in a single transaction, verifying it has not already been
+    /// reverted and that the target bookmark still points at `original.new_head`.
+    fn revert_land(&self, land_seq: u64) -> Result<LandRecord> {
+        let original = self.get_land(land_seq)?;
+        if let Some(existing_rev) = original.reverted_by {
+            return Err(GitxError::Merge(format!(
+                "land record {land_seq} already reverted by {existing_rev}"
+            )));
+        }
+        let previous_head = original.previous_head.ok_or_else(|| {
+            GitxError::Merge(format!(
+                "land record {land_seq} has no previous_head to revert to"
+            ))
+        })?;
+        let revert_rec = self.record_land(
+            &original.target,
+            Some(original.new_head),
+            previous_head,
+            Vec::new(),
+        )?;
+        self.mark_reverted(land_seq, revert_rec.land_seq)?;
+        Ok(revert_rec)
+    }
 
     // ---- Bookmarks & Workspaces ----
     fn get_bookmark(&self, name: &str) -> Result<Option<ObjectHash>>;
     fn set_bookmark(&self, name: &str, hash: ObjectHash) -> Result<()>;
+
+    /// Compare-and-swap update of bookmark `name`: succeeds only if the current value equals `expected`.
+    fn cas_bookmark(
+        &self,
+        name: &str,
+        expected: Option<ObjectHash>,
+        new_hash: ObjectHash,
+    ) -> Result<()> {
+        let current = self.get_bookmark(name)?;
+        if current != expected {
+            return Err(GitxError::Merge(format!(
+                "CAS conflict updating bookmark '{name}': expected {expected:?}, actual {current:?}"
+            )));
+        }
+        self.set_bookmark(name, new_hash)
+    }
+
+    /// Atomically compare-and-swap multiple bookmarks `(name, expected, new_hash)` in one
+    /// transaction: if ANY bookmark does not match its expected head, NO bookmark is updated.
+    fn cas_bookmarks(&self, updates: &[(String, Option<ObjectHash>, ObjectHash)]) -> Result<()> {
+        for (name, expected, _) in updates {
+            let current = self.get_bookmark(name)?;
+            if current != *expected {
+                return Err(GitxError::Merge(format!(
+                    "CAS conflict updating bookmark '{name}': expected {expected:?}, actual {current:?}"
+                )));
+            }
+        }
+        for (name, expected, new_hash) in updates {
+            self.cas_bookmark(name, *expected, *new_hash)?;
+        }
+        Ok(())
+    }
     fn list_bookmarks(&self) -> Result<BTreeMap<String, ObjectHash>>;
     fn put_workspace(&self, ws: &WorkspaceRef) -> Result<()>;
     fn get_workspace(&self, name: &str) -> Result<Option<WorkspaceRef>>;
     fn list_workspaces(&self) -> Result<BTreeMap<String, WorkspaceRef>>;
     fn remove_workspace(&self, name: &str) -> Result<()>;
+}
+
+/// Upper bound on a single decompressed CAS object/chunk payload (256 MiB) to prevent OOM
+/// from corrupted or adversarial LZ4 size prefixes.
+#[cfg(any(feature = "local", feature = "distributed"))]
+pub(crate) const MAX_CAS_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
+#[cfg(any(feature = "local", feature = "distributed"))]
+pub(crate) fn safe_lz4_decompress(
+    compressed: &[u8],
+    label: &str,
+    hash: ObjectHash,
+) -> Result<Vec<u8>> {
+    if compressed.len() < 4 {
+        return Err(GitxError::Storage(format!(
+            "lz4 payload too short for {label} {hash}"
+        )));
+    }
+    let declared_len = u32::from_le_bytes([
+        compressed[0],
+        compressed[1],
+        compressed[2],
+        compressed[3],
+    ]) as usize;
+    if declared_len > MAX_CAS_DECOMPRESSED_BYTES {
+        return Err(GitxError::Storage(format!(
+            "lz4 declared size {declared_len} exceeds limit ({MAX_CAS_DECOMPRESSED_BYTES}) for {label} {hash}"
+        )));
+    }
+    lz4_flex::decompress_size_prepended(compressed).map_err(|e| {
+        GitxError::Storage(format!("lz4 decompress failed for {label} {hash}: {e}"))
+    })
 }
 
 /// Orders revisions of a single `ChangeId` from oldest to newest.

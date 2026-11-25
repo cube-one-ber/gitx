@@ -194,6 +194,11 @@ impl CowWorkspace {
         self.extra_ignores.push(pattern.into());
     }
 
+    /// Scan all non-ignored working files from disk without writing blobs to an `ObjectStore`.
+    pub fn scan_files(&self) -> Result<Vec<(String, Vec<u8>, FileMode)>> {
+        self.scan_working_files()
+    }
+
     /// Partition all non-ignored working files cleanly across Visibility Domains using
     /// `classify`.
     pub fn snapshot_by_domain<F>(
@@ -245,7 +250,7 @@ impl CowWorkspace {
             seq
         ));
 
-        fs::write(&tmp_path, &bytes)?;
+        write_private_temp_file(&tmp_path, &bytes)?;
         set_readonly_pool_permissions(&tmp_path)?;
 
         match fs::rename(&tmp_path, &pool_path) {
@@ -327,6 +332,7 @@ impl CowWorkspace {
 impl WorkspaceBackend for CowWorkspace {
     fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let norm = normalize_rel_path(path)?;
+        ensure_no_symlink_ancestors(&self.root, &norm)?;
         let full = self.root.join(&norm);
         match fs::symlink_metadata(&full) {
             Ok(meta) if meta.file_type().is_symlink() => {
@@ -343,6 +349,7 @@ impl WorkspaceBackend for CowWorkspace {
 
     fn write_file(&mut self, path: &str, data: &[u8], mode: FileMode) -> Result<()> {
         let norm = normalize_rel_path(path)?;
+        ensure_no_symlink_ancestors(&self.root, &norm)?;
         let full = self.root.join(&norm);
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent)?;
@@ -362,6 +369,7 @@ impl WorkspaceBackend for CowWorkspace {
 
     fn remove_file(&mut self, path: &str) -> Result<()> {
         let norm = normalize_rel_path(path)?;
+        ensure_no_symlink_ancestors(&self.root, &norm)?;
         let full = self.root.join(&norm);
         match fs::symlink_metadata(&full) {
             Ok(_) => {
@@ -415,8 +423,64 @@ impl WorkspaceBackend for CowWorkspace {
     fn materialize_tree(&mut self, tree: &DomainTree, store: &dyn ObjectStore) -> Result<()> {
         let mut new_tracked = BTreeSet::new();
 
+        // Pre-validate that no tree entry writes beneath a symlink entry in the same tree.
+        let mut symlink_paths: BTreeSet<String> = BTreeSet::new();
+        let mut normalized_entries: Vec<(String, &EntryKind)> = Vec::with_capacity(tree.entries.len());
         for (raw_path, kind) in &tree.entries {
             let norm = normalize_rel_path(raw_path)?;
+            if matches!(
+                kind,
+                EntryKind::File {
+                    mode: FileMode::Symlink,
+                    ..
+                }
+            ) {
+                symlink_paths.insert(norm.clone());
+            }
+            normalized_entries.push((norm, kind));
+        }
+        for (norm, kind) in &normalized_entries {
+            if let EntryKind::EncryptedSecret { key_epoch, .. } = kind {
+                return Err(GitxError::AccessDenied {
+                    domain: tree.domain.to_string(),
+                    reason: format!(
+                        "encrypted secret '{norm}' (key_epoch {key_epoch}) cannot be materialized without decryption"
+                    ),
+                });
+            }
+            for prefix in ancestor_rel_paths(norm) {
+                if symlink_paths.contains(&prefix) {
+                    return Err(GitxError::Workspace(format!(
+                        "refusing to materialize '{norm}' beneath symlink ancestor '{prefix}'"
+                    )));
+                }
+            }
+        }
+
+        let incoming_paths: BTreeSet<String> = normalized_entries
+            .iter()
+            .map(|(norm, _)| norm.clone())
+            .collect();
+
+        // Remove stale tracked files BEFORE materializing new entries (and never traverse a
+        // symlink ancestor) so replacing a directory with a symlink cannot delete files outside
+        // the workspace root.
+        for stale in self.tracked_files.difference(&incoming_paths) {
+            if ensure_no_symlink_ancestors(&self.root, stale).is_err() {
+                // Preserve tracking for any stale path that could not be safely inspected/removed.
+                new_tracked.insert(stale.clone());
+                continue;
+            }
+            let full = self.root.join(stale);
+            if fs::symlink_metadata(&full).is_ok() {
+                make_writable_if_needed(&full);
+                remove_if_exists(&full)?;
+                self.remove_empty_parent_dirs(&full);
+            }
+        }
+
+        for (norm, kind) in normalized_entries {
+            ensure_no_symlink_ancestors(&self.root, &norm)?;
             let dest = self.root.join(&norm);
 
             match kind {
@@ -465,27 +529,10 @@ impl WorkspaceBackend for CowWorkspace {
                     fs::write(&dest, &bytes)?;
                     apply_workspace_permissions(&dest, *mode)?;
                 }
-                EntryKind::EncryptedSecret { key_epoch, .. } => {
-                    return Err(GitxError::AccessDenied {
-                        domain: tree.domain.to_string(),
-                        reason: format!(
-                            "encrypted secret '{norm}' (key_epoch {key_epoch}) cannot be materialized without decryption"
-                        ),
-                    });
-                }
+                EntryKind::EncryptedSecret { .. } => unreachable!("validated above"),
             }
 
             new_tracked.insert(norm);
-        }
-
-        // Remove stale tracked files that are no longer in the materialized tree.
-        for stale in self.tracked_files.difference(&new_tracked) {
-            let full = self.root.join(stale);
-            if fs::symlink_metadata(&full).is_ok() {
-                make_writable_if_needed(&full);
-                fs::remove_file(&full)?;
-                self.remove_empty_parent_dirs(&full);
-            }
         }
 
         self.tracked_files = new_tracked;
@@ -538,9 +585,15 @@ fn is_unchanged_regular_file(dest: &Path, expected_blob: ObjectHash, expected_si
 
 pub(crate) fn remove_if_exists(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(_) => {
-            make_writable_if_needed(path);
-            fs::remove_file(path)?;
+        Ok(meta) => {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                // Only remove empty directories so replacing a directory path with a file never
+                // silently wipes untracked user files inside that directory.
+                fs::remove_dir(path)?;
+            } else {
+                make_writable_if_needed(path);
+                fs::remove_file(path)?;
+            }
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -625,6 +678,66 @@ pub(crate) fn detect_file_mode(path: &Path) -> Result<FileMode> {
         }
     }
     Ok(FileMode::Regular)
+}
+
+pub(crate) fn ancestor_rel_paths(rel_path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut parts = rel_path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        if !cur.is_empty() {
+            cur.push('/');
+        }
+        cur.push_str(part);
+        out.push(cur.clone());
+    }
+    out
+}
+
+pub(crate) fn ensure_no_symlink_ancestors(root: &Path, rel_path: &str) -> Result<()> {
+    let mut cur = root.to_path_buf();
+    let mut parts = rel_path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        cur.push(part);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(GitxError::Workspace(format!(
+                    "refusing to traverse symlink ancestor '{}' while accessing '{rel_path}'",
+                    cur.display()
+                )));
+            }
+            Ok(meta) if !meta.file_type().is_dir() => {
+                return Err(GitxError::Workspace(format!(
+                    "non-directory ancestor '{}' while accessing '{rel_path}'",
+                    cur.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(GitxError::Io(e)),
+        }
+    }
+    Ok(())
+}
+
+fn write_private_temp_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = fs::OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 pub(crate) fn write_symlink(dest: &Path, target_bytes: &[u8]) -> Result<()> {

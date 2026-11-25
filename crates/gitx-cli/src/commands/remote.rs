@@ -148,6 +148,16 @@ pub fn parse_token_headers(raw: &str) -> AuthHeaders {
         return AuthHeaders::default();
     }
 
+    if trimmed.starts_with("gitx1h.") || trimmed.starts_with("gitx1e.") {
+        return AuthHeaders {
+            user: None,
+            teams: Vec::new(),
+            roles: Vec::new(),
+            fingerprint: None,
+            raw_token: Some(trimmed.to_string()),
+        };
+    }
+
     if trimmed.contains('=') {
         let mut headers = AuthHeaders::default();
         for segment in trimmed.split([';', '&']) {
@@ -513,6 +523,34 @@ pub fn collect_pushable_files(
     Ok((files, is_default_acl))
 }
 
+/// Collect all already-envelope-encrypted `EntryKind::EncryptedSecret` JSON payloads across
+/// `secret:*` domain trees so `gitx push` syncs `.env` and secrets end-to-end encrypted
+/// (zero plaintext ever leaves the client).
+pub fn collect_pushable_secrets(
+    repo: &Repo,
+    cs: &gitx_core::ChangeSet,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for (domain, &tree_hash) in &cs.domain_trees {
+        if !domain.is_secret() {
+            continue;
+        }
+        let tree = repo.store.get_tree(tree_hash)?;
+        for (path, kind) in &tree.entries {
+            if let EntryKind::EncryptedSecret { envelope_hash, .. } = kind {
+                let raw = repo.store.get_raw_object(*envelope_hash)?;
+                let env_json = String::from_utf8(raw).with_context(|| {
+                    format!("stored secret envelope for '{path}' in '{domain}' is not valid UTF-8")
+                })?;
+                out.entry(domain.to_string())
+                    .or_default()
+                    .insert(path.clone(), env_json);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch a remote tree if the repository/revision exists; returns `Ok(None)` on 404.
 pub async fn fetch_remote_tree_optional(
     client: &Client,
@@ -781,38 +819,63 @@ pub fn cmd_push(
     target: Option<String>,
     message: Option<String>,
     token: Option<String>,
+    allow_conflicts: bool,
 ) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
     let snap = repo.snapshot_working_copy()?;
     let cs = snap.changeset;
 
+    let target_bm = target.unwrap_or_else(|| repo.config.default_branch.clone());
+
     if cs.has_conflicts {
-        bail!(
-            "cannot push ChangeSet {} while it contains unresolved conflicts",
-            cs.change_id.short()
-        );
+        if !allow_conflicts {
+            bail!(
+                "cannot push ChangeSet {} while it contains unresolved conflicts (pass --allow-conflicts on a non-trunk branch to share WIP conflicts)",
+                cs.change_id.short()
+            );
+        }
+        if target_bm == repo.config.default_branch {
+            bail!(
+                "refusing to push unresolved conflicts directly to trunk '{}' even with --allow-conflicts; specify a WIP --target branch",
+                target_bm
+            );
+        }
     }
 
     let mut cfg = load_remotes(&repo.gitx_dir)?;
-    let (remote_name, remote_entry) = {
-        let (n, e) = select_remote_entry(&cfg, remote.as_deref())?;
-        (n, e.clone())
-    };
-    let target_bm = target.unwrap_or_else(|| repo.config.default_branch.clone());
-
-    let auth = resolve_auth_headers(
-        token.as_deref(),
-        remote_entry.token.as_deref(),
-        Some(&repo.config.author),
-    );
-    let resolved = ResolvedRemote {
-        name: Some(remote_name.clone()),
-        base_url: remote_entry.url.clone(),
-        owner: remote_entry.owner.clone(),
-        repo: remote_entry.repo.clone(),
+    // Support zero-ceremony push-to-create directly to an http(s):// URL without `remote add` first!
+    let (remote_name_opt, resolved, auth) = match remote.as_deref() {
+        Some(spec) if spec.starts_with("http://") || spec.starts_with("https://") => {
+            let (base_url, owner, repo_name) = parse_remote_url(spec, None, None)?;
+            let resolved = ResolvedRemote {
+                name: None,
+                base_url,
+                owner,
+                repo: repo_name,
+            };
+            let auth = resolve_auth_headers(token.as_deref(), None, Some(&repo.config.author));
+            (None, resolved, auth)
+        }
+        other => {
+            let (n, e) = select_remote_entry(&cfg, other)?;
+            let e = e.clone();
+            let auth = resolve_auth_headers(
+                token.as_deref(),
+                e.token.as_deref(),
+                Some(&repo.config.author),
+            );
+            let resolved = ResolvedRemote {
+                name: Some(n.clone()),
+                base_url: e.url.clone(),
+                owner: e.owner.clone(),
+                repo: e.repo.clone(),
+            };
+            (Some(n), resolved, auth)
+        }
     };
 
     let (local_files, is_default_acl) = collect_pushable_files(&repo, &cs)?;
+    let local_secrets = collect_pushable_secrets(&repo, &cs)?;
 
     let commit_msg = message
         .filter(|m| !m.trim().is_empty())
@@ -832,29 +895,56 @@ pub fn cmd_push(
             fetch_remote_tree_optional(&client, &resolved, &auth, Some(&target_bm)).await?;
         let remote_head = remote_tree.as_ref().and_then(|t| t.rev.clone());
         let mut remote_files = BTreeMap::new();
+        let mut remote_secret_hashes: BTreeMap<(String, String), String> = BTreeMap::new();
         if let Some(ref tree) = remote_tree {
             for entry in &tree.files {
                 remote_files.insert(entry.path.clone(), decode_tree_file_bytes(entry)?);
+            }
+            for sec in &tree.secrets {
+                remote_secret_hashes.insert(
+                    (sec.domain.clone(), sec.path.clone()),
+                    sec.envelope_hash.clone(),
+                );
             }
         }
 
         let (mut upload, deletions) =
             build_push_delta(&local_files, is_default_acl, &remote_files);
 
-        if upload.is_empty() && deletions.is_empty() {
+        // Delta-filter encrypted secret envelopes so unchanged secrets don't force churn.
+        let mut upload_secrets: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut secret_count = 0usize;
+        for (dom, paths) in &local_secrets {
+            for (path, env_json) in paths {
+                let local_hash = serde_json::from_str::<gitx_crypto::SecretEnvelope>(env_json)
+                    .ok()
+                    .map(|e| e.hash().to_hex());
+                let unchanged = local_hash.is_some()
+                    && remote_secret_hashes.get(&(dom.clone(), path.clone())) == local_hash.as_ref();
+                if !unchanged {
+                    upload_secrets
+                        .entry(dom.clone())
+                        .or_default()
+                        .insert(path.clone(), env_json.clone());
+                    secret_count += 1;
+                }
+            }
+        }
+
+        if upload.is_empty() && deletions.is_empty() && secret_count == 0 {
             if let Some(head) = remote_head {
-                return Ok((None, Some(head), 0usize, 0usize));
+                return Ok((None, Some(head), 0usize, 0usize, 0usize));
             }
             if let Some(acl_bytes) = local_files.get(".gitxacl") {
                 upload.insert(".gitxacl".to_string(), BASE64_STANDARD.encode(acl_bytes));
             } else {
-                bail!("nothing to push (working tree has no pushable files)");
+                bail!("nothing to push (working tree has no pushable files or secrets)");
             }
         }
 
         let uploaded_count = upload.len();
         let deleted_count = deletions.len();
-        let payload = build_commit_payload(
+        let mut payload = build_commit_payload(
             &cs,
             &upload,
             &deletions,
@@ -863,6 +953,11 @@ pub fn cmd_push(
             None,
             true,
         );
+        if !upload_secrets.is_empty()
+            && let Some(map) = payload.as_object_mut()
+        {
+            map.insert("secret_envelopes".to_string(), json!(upload_secrets));
+        }
 
         let resp = auth
             .apply(client.post(resolved.api_url("commit")))
@@ -871,23 +966,31 @@ pub fn cmd_push(
             .await
             .with_context(|| format!("failed to push to {}", resolved.base_url))?;
         let committed: CommitResponse = parse_json_response(resp, "push commit").await?;
-        Ok((Some(committed), None, uploaded_count, deleted_count))
+        Ok((Some(committed), None, uploaded_count, deleted_count, secret_count))
     })?;
 
+    let remote_label = remote_name_opt
+        .as_deref()
+        .unwrap_or(resolved.base_url.as_str());
+
     match outcome {
-        (None, Some(head), _, _) => {
-            if let Some(entry) = cfg.remotes.get_mut(&remote_name) {
+        (None, Some(head), _, _, _) => {
+            if let Some(ref rname) = remote_name_opt
+                && let Some(entry) = cfg.remotes.get_mut(rname)
+            {
                 entry.last_pushed_head = Some(head.clone());
                 entry.remote_heads.insert(target_bm.clone(), head.clone());
+                save_remotes(&repo.gitx_dir, &cfg)?;
             }
-            save_remotes(&repo.gitx_dir, &cfg)?;
             println!(
-                "Already up to date with remote '{remote_name}' ({target_bm}: {}).",
+                "Already up to date with remote '{remote_label}' ({target_bm}: {}).",
                 short_hex(&head)
             );
         }
-        (Some(committed), _, uploaded_count, deleted_count) => {
-            if let Some(entry) = cfg.remotes.get_mut(&remote_name) {
+        (Some(committed), _, uploaded_count, deleted_count, secret_count) => {
+            if let Some(ref rname) = remote_name_opt
+                && let Some(entry) = cfg.remotes.get_mut(rname)
+            {
                 entry.last_pushed_head = Some(committed.changeset_id.clone());
                 entry
                     .remote_heads
@@ -895,20 +998,22 @@ pub fn cmd_push(
                 entry
                     .synced_commits
                     .insert(committed.changeset_id.clone(), cs.id.to_hex());
+                save_remotes(&repo.gitx_dir, &cfg)?;
+                let _ = repo
+                    .store
+                    .set_bookmark(&format!("{rname}/{target_bm}"), cs.id);
             }
-            save_remotes(&repo.gitx_dir, &cfg)?;
-            let _ = repo
-                .store
-                .set_bookmark(&format!("{remote_name}/{target_bm}"), cs.id);
 
             println!(
-                "Pushed to '{remote_name}' ({} -> {target_bm}):",
+                "Pushed to '{remote_label}' ({} -> {target_bm}):",
                 resolved.full_name()
             );
             println!("  changeset: {}", committed.changeset_id);
             println!("  change_id: {}", committed.change_id);
             println!("  domains:   {}", committed.domains_written.join(", "));
-            println!("  files:     +{uploaded_count} uploaded, -{deleted_count} deleted");
+            println!(
+                "  files:     +{uploaded_count} uploaded, -{deleted_count} deleted, +{secret_count} encrypted secret(s)"
+            );
         }
         _ => unreachable!(),
     }
@@ -1144,6 +1249,37 @@ pub fn cmd_pull(
         ),
     );
 
+    // Automatically decrypt and materialize any authorized `secret:*` envelopes onto disk
+    // when the local keypair is a recipient (recording decrypt audit entries).
+    let mut decrypted_secrets = 0usize;
+    if !tip_tree.secrets.is_empty()
+        && let Ok(keypair) = repo.load_local_keypair()
+    {
+        let mut audit = repo.load_audit_log().ok();
+        for sec in &tip_tree.secrets {
+            if let Ok(env) = serde_json::from_str::<gitx_crypto::SecretEnvelope>(&sec.envelope_json)
+                && let Ok(plaintext) = gitx_crypto::decrypt_secret(&env, &sec.path, &keypair)
+                && let Ok(norm_path) = gitx_vfs::normalize_rel_path(&sec.path)
+            {
+                let dest = repo.root.join(&norm_path);
+                if let Some(parent) = dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if fs::write(&dest, &plaintext).is_ok() {
+                    decrypted_secrets += 1;
+                    if let Some(ref mut a) = audit
+                        && let Ok(dom) = DomainId::new(&sec.domain)
+                    {
+                        a.record_decrypt(keypair.fingerprint(), dom, &norm_path, sec.key_epoch);
+                    }
+                }
+            }
+        }
+        if let Some(ref a) = audit {
+            let _ = repo.save_audit_log(a);
+        }
+    }
+
     println!(
         "Pulled from '{remote_name}' ({} @ {target_bm}):",
         resolved.full_name()
@@ -1160,6 +1296,13 @@ pub fn cmd_pull(
         }
     );
     println!("  files:       {}", tip_tree.files.len());
+    if !tip_tree.secrets.is_empty() {
+        println!(
+            "  secrets:     {} synced ({} decrypted locally)",
+            tip_tree.secrets.len(),
+            decrypted_secrets
+        );
+    }
     if !conflict_paths.is_empty() {
         println!("  conflicts:   {}", conflict_paths.join(", "));
     }
@@ -1197,6 +1340,27 @@ fn import_tree_as_changeset(
                 size: blob.total_size,
             },
         );
+    }
+
+    // Preserve any authorized encrypted secret envelopes inside their `secret:*` domain trees.
+    for sec in &tree_resp.secrets {
+        if let Ok(dom) = DomainId::new(&sec.domain)
+            && dom.is_secret()
+            && let Ok(env) = serde_json::from_str::<gitx_crypto::SecretEnvelope>(&sec.envelope_json)
+        {
+            let env_hash = repo.put_envelope(&env)?;
+            let tree = per_domain
+                .entry(dom.clone())
+                .or_insert_with(|| DomainTree::new(dom));
+            tree.insert(
+                sec.path.clone(),
+                EntryKind::EncryptedSecret {
+                    envelope_hash: env_hash,
+                    key_epoch: sec.key_epoch,
+                    mode: FileMode::Regular,
+                },
+            );
+        }
     }
 
     let pub_tree = per_domain

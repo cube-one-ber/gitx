@@ -41,6 +41,15 @@ impl ApiError {
         }
     }
 
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: msg.into(),
+            findings: None,
+        }
+    }
+
     pub fn forbidden(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,

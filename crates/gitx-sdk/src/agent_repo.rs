@@ -298,7 +298,23 @@ impl AgentRepo {
                 GitxError::NotFound(format!("workspace ref '{base_ref}'"))
             })?;
             let cs = self.store.get_changeset(ws_ref.head_changeset)?;
-            (cs, existing_vfs.clone_instant())
+            if !self.acl.can_read_changeset(&self.principal, &cs) {
+                return Err(GitxError::AccessDenied {
+                    domain: cs.visibility.primary_domain.to_string(),
+                    reason: format!(
+                        "principal '{}' cannot read base workspace '{base_ref}'",
+                        self.principal.id
+                    ),
+                });
+            }
+            let mut cloned = existing_vfs.clone_instant();
+            for path in cloned.list_files()? {
+                let dom = self.acl.domain_for_path(&path);
+                if !self.acl.can_read_domain(&self.principal, &dom) {
+                    let _ = cloned.remove_file(&path);
+                }
+            }
+            (cs, cloned)
         } else {
             let cs = self.resolve_changeset(base_ref)?;
             let vfs = self.materialize_authorized_vfs(&cs)?;
@@ -498,6 +514,19 @@ impl AgentRepo {
         Ok(diff_trees(&old_tree, &new_tree))
     }
 
+    /// Return path-level [`TreeDiffEntry`] items comparing an arbitrary `base_ref` to
+    /// `workspace`'s current working copy.
+    pub fn diff_entries_against(
+        &self,
+        workspace: &str,
+        base_ref: &str,
+    ) -> Result<Vec<TreeDiffEntry>> {
+        let base_cs = self.resolve_changeset(base_ref)?;
+        let old_tree = self.build_authorized_combined_tree(&base_cs)?;
+        let new_tree = self.snapshot_authorized_combined_tree(workspace)?;
+        Ok(diff_trees(&old_tree, &new_tree))
+    }
+
     /// Commit the current state of `workspace` as a new immutable [`ChangeSet`] with
     /// [`Actor::Agent`] provenance and an optional durable [`ContextRecord`] anchored to the
     /// modified lines.
@@ -513,22 +542,69 @@ impl AgentRepo {
         let old_combined = self.build_authorized_combined_tree(&parent_cs)?;
 
         let vfs = self.workspace_vfs(workspace)?;
-        let scanned = vfs.snapshot_by_domain(self.store.as_ref(), |p| self.acl.domain_for_path(p))?;
+        let mut scanned = vfs.snapshot_by_domain(self.store.as_ref(), |p| self.acl.domain_for_path(p))?;
 
         let mut secret_warnings = Vec::new();
         let mut new_domain_trees = BTreeMap::new();
 
-        // Preserve any domain trees in parent_cs that the current principal cannot read
-        // (zero-trust: unauthorized domains are never stripped or overwritten).
+        // Check context visibility write authorization before mutating any state.
+        if let Some(ref ctx) = context
+            && !self.acl.can_write_domain(&self.principal, &ctx.visibility)
+        {
+            return Err(GitxError::AccessDenied {
+                domain: ctx.visibility.to_string(),
+                reason: format!(
+                    "principal '{}' lacks write permission for context visibility domain '{}'",
+                    self.principal.id, ctx.visibility
+                ),
+            });
+        }
+
+        // Preserve unreadable domains and secret domains untouched by this workspace,
+        // and preserve readable-but-read-only domains as long as their materialized entries
+        // were not modified.
         for (domain, &tree_hash) in &parent_cs.domain_trees {
             if !self.acl.can_read_domain(&self.principal, domain) {
                 new_domain_trees.insert(domain.clone(), tree_hash);
+                scanned.remove(domain);
+                continue;
+            }
+            if domain.is_secret() && !scanned.contains_key(domain) {
+                // `build_authorized_combined_tree` intentionally omits `secret:*` entries from
+                // plaintext workspaces; preserve the parent's encrypted secret tree verbatim.
+                new_domain_trees.insert(domain.clone(), tree_hash);
+                continue;
+            }
+            if !self.acl.can_write_domain(&self.principal, domain) {
+                let parent_tree = self.store.get_tree(tree_hash)?;
+                let expected_plain: BTreeMap<&String, &EntryKind> = parent_tree
+                    .entries
+                    .iter()
+                    .filter(|(_, k)| !matches!(k, EntryKind::EncryptedSecret { .. }))
+                    .collect();
+                let scanned_plain: BTreeMap<&String, &EntryKind> = scanned
+                    .get(domain)
+                    .map(|t| t.entries.iter().collect())
+                    .unwrap_or_default();
+                if expected_plain == scanned_plain {
+                    new_domain_trees.insert(domain.clone(), tree_hash);
+                    scanned.remove(domain);
+                } else {
+                    return Err(GitxError::AccessDenied {
+                        domain: domain.to_string(),
+                        reason: format!(
+                            "principal '{}' lacks write permission for domain '{}'",
+                            self.principal.id, domain
+                        ),
+                    });
+                }
             }
         }
 
-        // Persist readable domains from the workspace snapshot.
-        for (domain, tree) in &scanned {
-            if !self.acl.can_write_domain(&self.principal, domain) {
+        // Persist modified writable domains from the workspace snapshot, preserving any
+        // `EncryptedSecret` entries that existed in `parent_cs` for those domains.
+        for (domain, mut tree) in scanned {
+            if !self.acl.can_write_domain(&self.principal, &domain) {
                 return Err(GitxError::AccessDenied {
                     domain: domain.to_string(),
                     reason: format!(
@@ -536,6 +612,17 @@ impl AgentRepo {
                         self.principal.id, domain
                     ),
                 });
+            }
+
+            if let Some(&parent_tree_hash) = parent_cs.domain_trees.get(&domain) {
+                let parent_tree = self.store.get_tree(parent_tree_hash)?;
+                for (path, kind) in parent_tree.entries {
+                    if matches!(kind, EntryKind::EncryptedSecret { .. })
+                        && !tree.entries.contains_key(&path)
+                    {
+                        tree.insert(path, kind);
+                    }
+                }
             }
 
             if domain.is_public() {
@@ -547,8 +634,24 @@ impl AgentRepo {
                 }
             }
 
-            let tree_hash = self.store.put_tree(tree)?;
-            new_domain_trees.insert(domain.clone(), tree_hash);
+            let tree_hash = self.store.put_tree(&tree)?;
+            new_domain_trees.insert(domain, tree_hash);
+        }
+
+        // If a principal deleted all files from a previously non-empty writable public domain,
+        // verify they actually have write permission on `public`.
+        if let Some(&parent_pub_hash) = parent_cs.domain_trees.get(&DomainId::public())
+            && !new_domain_trees.contains_key(&DomainId::public())
+            && !self.store.get_tree(parent_pub_hash)?.entries.is_empty()
+            && !self.acl.can_write_domain(&self.principal, &DomainId::public())
+        {
+            return Err(GitxError::AccessDenied {
+                domain: DomainId::public().to_string(),
+                reason: format!(
+                    "principal '{}' lacks write permission for domain 'public'",
+                    self.principal.id
+                ),
+            });
         }
 
         // Always include a public domain tree.

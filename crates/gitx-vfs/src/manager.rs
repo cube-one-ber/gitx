@@ -283,9 +283,14 @@ impl WorkspaceManager {
 
 fn validate_workspace_name(name: String) -> Result<String> {
     if name.is_empty()
+        || name.starts_with('/')
+        || name.ends_with('/')
         || !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        || name
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
     {
         return Err(GitxError::Workspace(format!(
             "invalid workspace name: '{name}'"
