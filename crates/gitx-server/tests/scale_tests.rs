@@ -183,7 +183,10 @@ async fn concurrent_16_agents_batched_merge_queue_and_monotonic_land_seq() {
         .unwrap();
 
     assert_eq!(drain.land_seq, Some(1));
-    assert_eq!(drain.previous_head.as_deref(), Some(base.changeset_id.as_str()));
+    assert_eq!(
+        drain.previous_head.as_deref(),
+        Some(base.changeset_id.as_str())
+    );
     assert!(drain.new_head.is_some());
     assert_eq!(drain.landed.len(), 16);
     assert!(drain.conflicted.is_empty());
@@ -699,7 +702,11 @@ async fn derived_trigram_cache_hits_blame_history_and_acl_isolation() {
     assert_eq!(stats_cold.trigram_cache_misses, 2);
     assert_eq!(stats_cold.trigram_cache_hits, 0);
     assert!(stats_cold.trigram_domains.contains(&"public".to_string()));
-    assert!(stats_cold.trigram_domains.contains(&"team:core".to_string()));
+    assert!(
+        stats_cold
+            .trigram_domains
+            .contains(&"team:core".to_string())
+    );
     assert!(stats_cold.trigram_total_postings > 0);
 
     // Warm grep by authorized `team:core` user -> cache HIT on both trees!

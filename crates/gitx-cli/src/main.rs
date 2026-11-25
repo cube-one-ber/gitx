@@ -93,11 +93,17 @@ enum Commands {
         message: Option<String>,
     },
 
-    /// Split selected paths out of `@` into a lower stacked ChangeSet ("edit first, organize later")
+    /// Split selected paths or hunks out of `@` into a lower stacked ChangeSet ("edit first, organize later")
     Split {
         /// Comma-separated or repeatable relative file paths to move into the base ChangeSet
-        #[arg(long = "paths", required = true)]
+        #[arg(long = "paths")]
         paths: Vec<String>,
+        /// Scriptable hunk selection (`<path>:<1,2,...>`, 1-based hunk indices, repeatable)
+        #[arg(long = "hunks")]
+        hunks: Vec<String>,
+        /// Interactive hunk-by-hunk patch selection (`gitx split -p`)
+        #[arg(short = 'p', long = "patch")]
+        patch: bool,
         /// Description for the newly created base ChangeSet
         #[arg(short = 'm', long = "message")]
         message: Option<String>,
@@ -186,7 +192,7 @@ enum Commands {
         action: FleetAction,
     },
 
-    /// Start the GitX HTTP/JSON, optional Tonic gRPC, and ACL-filtered Git Smart HTTP server
+    /// Start the GitX HTTP/JSON, optional Tonic gRPC, optional SSH, and ACL-filtered Git Smart HTTP server
     Serve {
         /// HTTP listen address (host:port)
         #[arg(long, default_value = "127.0.0.1:7878")]
@@ -194,6 +200,12 @@ enum Commands {
         /// Optional Tonic gRPC listen address (host:port) sharing the same server state
         #[arg(long)]
         grpc_addr: Option<String>,
+        /// Optional Git SSH listen address (host:port) sharing the same server state
+        #[arg(long)]
+        ssh_addr: Option<String>,
+        /// Authorized SSH public key binding (`<user>[:teams=a,b][:roles=admin]=<pubkey-or-path>`, repeatable)
+        #[arg(long = "ssh-key")]
+        ssh_keys: Vec<String>,
         /// Server data directory
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -206,9 +218,12 @@ enum Commands {
         /// Strictly reject unauthenticated X-Gitx-* proxy headers (require valid Bearer tokens)
         #[arg(long)]
         strict_auth: bool,
-        /// Optional tiered object_store backend URI (`memory://` or `fs:///path/to/cas`)
+        /// Optional tiered object_store backend URI (`memory://`, `fs:///path`, `s3://bucket[/prefix]`, `r2://acct/bucket[/prefix]`, `gcs://bucket[/prefix]`)
         #[arg(long)]
         object_store: Option<String>,
+        /// Optional PostgreSQL metadata URL (`postgres://user:pass@host/db`)
+        #[arg(long)]
+        postgres_url: Option<String>,
         /// Webhook URL notified via durable outbox on every atomic land/revert (repeatable)
         #[arg(long = "webhook-url")]
         webhook_urls: Vec<String>,
@@ -394,6 +409,9 @@ enum SecretAction {
         /// Optional label / recipient name
         #[arg(long)]
         name: Option<String>,
+        /// Passphrase for encrypted OpenSSH private keys (or set GITX_SSH_PASSPHRASE)
+        #[arg(long)]
+        passphrase: Option<String>,
     },
     /// Revoke a recipient across ALL secret domains, rotate all DEKs, and print exposure audit
     Revoke {
@@ -500,6 +518,9 @@ enum FleetAction {
         /// Pull and decrypt remote overlay bundle onto local workspace
         #[arg(long)]
         pull: bool,
+        /// Include active anonymous WIP ChangeSet edits inside the encrypted fleet bundle
+        #[arg(long)]
+        include_wip: bool,
         /// Authentication token override
         #[arg(long)]
         token: Option<String>,
@@ -656,6 +677,44 @@ enum RemoteAction {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Zero-clone server-side Tree-sitter AST symbols query (/symbols)
+    Symbols {
+        /// Optional repository-relative path filter
+        #[arg(long)]
+        path: Option<String>,
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Revision hash, ChangeId, or bookmark
+        #[arg(long)]
+        rev: Option<String>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Zero-clone server-side 3-way semantic rebase (/rebase)
+    Rebase {
+        /// Source ChangeSet hash, ChangeId, or bookmark to rebase
+        changeset_id: String,
+        /// Target revision hash, ChangeId, or bookmark to rebase onto
+        #[arg(long)]
+        onto: String,
+        /// Optional bookmark to advance to the rebased ChangeSet
+        #[arg(long)]
+        update_bookmark: Option<String>,
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -745,7 +804,12 @@ fn main() -> Result<()> {
             StackAction::Sync => commands::stack::cmd_stack_sync(),
         },
         Commands::Squash { message } => commands::stack::cmd_squash(message),
-        Commands::Split { paths, message } => commands::stack::cmd_split(paths, message),
+        Commands::Split {
+            paths,
+            hunks,
+            patch,
+            message,
+        } => commands::stack::cmd_split(paths, hunks, patch, message),
         Commands::Rebase { onto } => commands::stack::cmd_rebase(onto),
         Commands::Land { target } => commands::stack::cmd_land(target),
         Commands::Revert { land_seq } => commands::stack::cmd_revert(land_seq),
@@ -786,7 +850,8 @@ fn main() -> Result<()> {
                 path,
                 pub_key,
                 name,
-            } => commands::security::cmd_secret_import_ssh(path, pub_key, name),
+                passphrase,
+            } => commands::security::cmd_secret_import_ssh(path, pub_key, name, passphrase),
             SecretAction::Revoke { target } => commands::security::cmd_secret_revoke(target),
             SecretAction::RotateReport { target } => {
                 commands::security::cmd_secret_rotate_report(target)
@@ -798,7 +863,9 @@ fn main() -> Result<()> {
                 allow,
                 message,
             } => commands::security::cmd_embargo_create(advisory, allow, message),
-            EmbargoAction::Publish { advisory } => commands::security::cmd_embargo_publish(advisory),
+            EmbargoAction::Publish { advisory } => {
+                commands::security::cmd_embargo_publish(advisory)
+            }
         },
         Commands::Context { action } => match action {
             ContextAction::Add {
@@ -808,7 +875,9 @@ fn main() -> Result<()> {
                 model,
                 harness,
                 visibility,
-            } => commands::context::cmd_context_add(prompt, path, lines, model, harness, visibility),
+            } => {
+                commands::context::cmd_context_add(prompt, path, lines, model, harness, visibility)
+            }
         },
         Commands::Why { target, domains } => commands::context::cmd_why(target, domains),
         Commands::Checkpoint { action } => match action {
@@ -842,28 +911,44 @@ fn main() -> Result<()> {
                 machine,
                 push,
                 pull,
+                include_wip,
                 token,
-            } => commands::workspace::cmd_fleet_sync(remote, url, include, machine, push, pull, token),
+            } => commands::workspace::cmd_fleet_sync(
+                remote,
+                url,
+                include,
+                machine,
+                push,
+                pull,
+                include_wip,
+                token,
+            ),
         },
         Commands::Serve {
             addr,
             grpc_addr,
+            ssh_addr,
+            ssh_keys,
             data_dir,
             tokens,
             signing_secret,
             strict_auth,
             object_store,
+            postgres_url,
             webhook_urls,
             conflict_resolver_cmd,
             post_land_cmd,
         } => commands::serve::cmd_serve(
             addr,
             grpc_addr,
+            ssh_addr,
+            ssh_keys,
             data_dir,
             tokens,
             signing_secret,
             strict_auth,
             object_store,
+            postgres_url,
             webhook_urls,
             conflict_resolver_cmd,
             post_land_cmd,
@@ -936,6 +1021,28 @@ fn main() -> Result<()> {
             RemoteAction::Stats { remote, url, token } => {
                 commands::remote::cmd_remote_stats(remote, url, token)
             }
+            RemoteAction::Symbols {
+                path,
+                remote,
+                url,
+                rev,
+                token,
+            } => commands::remote::cmd_remote_symbols(path, remote, url, rev, token),
+            RemoteAction::Rebase {
+                changeset_id,
+                onto,
+                update_bookmark,
+                remote,
+                url,
+                token,
+            } => commands::remote::cmd_remote_rebase(
+                changeset_id,
+                onto,
+                update_bookmark,
+                remote,
+                url,
+                token,
+            ),
         },
         Commands::Push {
             remote,

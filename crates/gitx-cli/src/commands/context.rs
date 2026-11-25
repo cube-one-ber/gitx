@@ -103,9 +103,7 @@ pub fn cmd_why(target: String, domains: String) -> Result<()> {
         .why(&norm_path, line, &content, &allowed_domains)?;
 
     if matches.is_empty() {
-        println!(
-            "No context records found for {norm_path}:{line} in domains [{domains}]."
-        );
+        println!("No context records found for {norm_path}:{line} in domains [{domains}].");
         return Ok(());
     }
 
@@ -284,8 +282,8 @@ pub fn cmd_checkpoint_undo(checkpoint_id: String) -> Result<()> {
     let new_pub_hash = repo.store.put_tree(&merge_result.tree)?;
     let mut new_trees = cur_cs.domain_trees.clone();
     new_trees.insert(DomainId::public(), new_pub_hash);
-    let has_conflicts = !merge_result.conflict_paths.is_empty()
-        || repo.trees_have_conflicts(&new_trees)?;
+    let has_conflicts =
+        !merge_result.conflict_paths.is_empty() || repo.trees_have_conflicts(&new_trees)?;
 
     let updated = ChangeSetBuilder::new(cur_cs.author.clone())
         .change_id(cur_cs.change_id)

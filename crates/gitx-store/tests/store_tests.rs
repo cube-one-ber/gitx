@@ -40,8 +40,18 @@ fn run_fastcdc_blob_suite(store: &dyn ObjectStore) {
     // 1. Empty blob
     let empty_manifest = store.put_blob_bytes(&[]).unwrap();
     assert_eq!(empty_manifest.total_size, 0);
-    assert_eq!(store.get_blob_manifest(empty_manifest.manifest_hash()).unwrap(), empty_manifest);
-    assert_eq!(store.read_blob_bytes(empty_manifest.manifest_hash()).unwrap(), Vec::<u8>::new());
+    assert_eq!(
+        store
+            .get_blob_manifest(empty_manifest.manifest_hash())
+            .unwrap(),
+        empty_manifest
+    );
+    assert_eq!(
+        store
+            .read_blob_bytes(empty_manifest.manifest_hash())
+            .unwrap(),
+        Vec::<u8>::new()
+    );
 
     // 2. Small blob (<= 64 KiB inline threshold)
     let small = b"hello gitx content-addressed store!\n".repeat(100);
@@ -49,7 +59,12 @@ fn run_fastcdc_blob_suite(store: &dyn ObjectStore) {
     assert_eq!(small_manifest.total_size, small.len() as u64);
     assert_eq!(small_manifest.chunks.len(), 1);
     assert!(store.has_chunk(small_manifest.chunks[0].hash).unwrap());
-    assert_eq!(store.read_blob_bytes(small_manifest.manifest_hash()).unwrap(), small);
+    assert_eq!(
+        store
+            .read_blob_bytes(small_manifest.manifest_hash())
+            .unwrap(),
+        small
+    );
 
     // 3. Large blob (> 200 KiB -> multiple FastCDC chunks)
     let large = pseudo_random_bytes(320 * 1024, 0xCAFE_BABE_1234_5678);
@@ -65,16 +80,26 @@ fn run_fastcdc_blob_suite(store: &dyn ObjectStore) {
         let raw_chunk = store.get_chunk(chunk.hash).unwrap();
         assert_eq!(raw_chunk.len() as u64, chunk.length);
     }
-    let fetched_manifest = store.get_blob_manifest(large_manifest.manifest_hash()).unwrap();
+    let fetched_manifest = store
+        .get_blob_manifest(large_manifest.manifest_hash())
+        .unwrap();
     assert_eq!(fetched_manifest, large_manifest);
-    let reconstructed = store.read_blob_bytes(large_manifest.manifest_hash()).unwrap();
+    let reconstructed = store
+        .read_blob_bytes(large_manifest.manifest_hash())
+        .unwrap();
     assert_eq!(reconstructed, large);
 
     // Missing chunk / manifest returns NotFound
     let missing = ObjectHash::of_bytes(b"does-not-exist");
     assert!(!store.has_chunk(missing).unwrap());
-    assert!(matches!(store.get_chunk(missing), Err(GitxError::NotFound(_))));
-    assert!(matches!(store.get_blob_manifest(missing), Err(GitxError::NotFound(_))));
+    assert!(matches!(
+        store.get_chunk(missing),
+        Err(GitxError::NotFound(_))
+    ));
+    assert!(matches!(
+        store.get_blob_manifest(missing),
+        Err(GitxError::NotFound(_))
+    ));
 }
 
 fn run_raw_and_tree_suite(store: &dyn ObjectStore) {
@@ -85,7 +110,10 @@ fn run_raw_and_tree_suite(store: &dyn ObjectStore) {
     assert_eq!(store.get_raw_object(env_hash).unwrap(), envelope);
 
     let missing = ObjectHash::of_bytes(b"missing-raw-obj");
-    assert!(matches!(store.get_raw_object(missing), Err(GitxError::NotFound(_))));
+    assert!(matches!(
+        store.get_raw_object(missing),
+        Err(GitxError::NotFound(_))
+    ));
 
     // DomainTree with File, EncryptedSecret, and Conflict entries
     let blob = store.put_blob_bytes(b"fn main() {}\n").unwrap();
@@ -123,7 +151,10 @@ fn run_raw_and_tree_suite(store: &dyn ObjectStore) {
     assert_eq!(loaded, tree);
     assert!(loaded.has_conflicts());
 
-    assert!(matches!(store.get_tree(missing), Err(GitxError::NotFound(_))));
+    assert!(matches!(
+        store.get_tree(missing),
+        Err(GitxError::NotFound(_))
+    ));
 }
 
 fn run_changeset_history_suite(store: &dyn ObjectStore) {
@@ -239,7 +270,10 @@ fn run_stack_suite(store: &dyn ObjectStore) {
     assert_eq!(listed[1].name, "fix/perf");
 
     store.delete_stack("feat/auth").unwrap();
-    assert!(matches!(store.get_stack("feat/auth"), Err(GitxError::NotFound(_))));
+    assert!(matches!(
+        store.get_stack("feat/auth"),
+        Err(GitxError::NotFound(_))
+    ));
     assert_eq!(store.list_stacks().unwrap().len(), 1);
     // Idempotent delete
     store.delete_stack("feat/auth").unwrap();
@@ -341,7 +375,10 @@ fn run_oplog_and_undo_suite(store: &dyn ObjectStore) {
     assert_eq!(all_ops.len(), 3);
     assert_eq!(all_ops[2].id, op1.id);
 
-    assert!(matches!(store.get_op(OpId::new()), Err(GitxError::NotFound(_))));
+    assert!(matches!(
+        store.get_op(OpId::new()),
+        Err(GitxError::NotFound(_))
+    ));
 }
 
 fn run_land_ledger_and_cas_suite(store: &dyn ObjectStore) {
@@ -355,7 +392,9 @@ fn run_land_ledger_and_cas_suite(store: &dyn ObjectStore) {
     let c3 = ChangeId::new();
 
     // First land onto brand-new target fails if expected_previous is Some(...)
-    let err = store.record_land("main", Some(h1), h2, vec![c1]).unwrap_err();
+    let err = store
+        .record_land("main", Some(h1), h2, vec![c1])
+        .unwrap_err();
     assert!(matches!(err, GitxError::Merge(_)));
     assert_eq!(store.get_bookmark("main").unwrap(), None);
 
@@ -397,7 +436,10 @@ fn run_land_ledger_and_cas_suite(store: &dyn ObjectStore) {
     let l4 = store.record_land("main", Some(h2), h3, vec![]).unwrap();
     assert_eq!(l4.land_seq, 4);
     store.mark_reverted(l2.land_seq, l4.land_seq).unwrap();
-    assert_eq!(store.get_land(l2.land_seq).unwrap().reverted_by, Some(l4.land_seq));
+    assert_eq!(
+        store.get_land(l2.land_seq).unwrap().reverted_by,
+        Some(l4.land_seq)
+    );
 
     // Idempotent with same reverter, rejected with different reverter
     store.mark_reverted(l2.land_seq, l4.land_seq).unwrap();
@@ -517,7 +559,11 @@ fn local_store_sharded_cas_layout_and_compression() {
 
     let hex = hash.to_hex();
     let expected_path = dir.path().join("cas").join(&hex[..2]).join(&hex);
-    assert!(expected_path.is_file(), "expected sharded CAS file at {:?}", expected_path);
+    assert!(
+        expected_path.is_file(),
+        "expected sharded CAS file at {:?}",
+        expected_path
+    );
 
     let on_disk_len = std::fs::metadata(&expected_path).unwrap().len();
     assert!(
@@ -610,7 +656,17 @@ fn local_store_persistence_across_reopen() {
         };
         store.append_op(&op).unwrap();
 
-        (manifest_hash, tree_hash, rev1, rev2, stack, op, land1, land2, ws)
+        (
+            manifest_hash,
+            tree_hash,
+            rev1,
+            rev2,
+            stack,
+            op,
+            land1,
+            land2,
+            ws,
+        )
     };
 
     // Reopen from scratch and verify every piece of state persisted accurately
@@ -634,11 +690,18 @@ fn local_store_persistence_across_reopen() {
 
     // CAS must still reject stale head after reopen, and next land_seq must remain monotonic
     assert!(matches!(
-        reopened.record_land("main", Some(rev1.id), ObjectHash::of_bytes(b"stale"), vec![]),
+        reopened.record_land(
+            "main",
+            Some(rev1.id),
+            ObjectHash::of_bytes(b"stale"),
+            vec![]
+        ),
         Err(GitxError::Merge(_))
     ));
     let h3 = ObjectHash::of_bytes(b"head-after-reopen");
-    let land3 = reopened.record_land("main", Some(rev2.id), h3, vec![]).unwrap();
+    let land3 = reopened
+        .record_land("main", Some(rev2.id), h3, vec![])
+        .unwrap();
     assert_eq!(land3.land_seq, land2.land_seq + 1);
     assert_eq!(reopened.get_bookmark("main").unwrap(), Some(h3));
 }
@@ -679,9 +742,16 @@ fn concurrent_record_land_prevents_split_brain() {
             }
         }
 
-        assert_eq!(successes.len(), 1, "exactly one concurrent lander must win CAS");
+        assert_eq!(
+            successes.len(),
+            1,
+            "exactly one concurrent lander must win CAS"
+        );
         assert_eq!(conflicts, threads - 1);
-        assert_eq!(store.get_bookmark("main").unwrap(), Some(successes[0].new_head));
+        assert_eq!(
+            store.get_bookmark("main").unwrap(),
+            Some(successes[0].new_head)
+        );
         assert_eq!(store.list_lands("main", 10).unwrap().len(), 1);
     }
 }

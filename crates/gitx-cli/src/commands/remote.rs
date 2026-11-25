@@ -9,7 +9,7 @@ use gitx_core::{
 use gitx_server::{
     ActorAgentInput, BlameResponse, CommitResponse, DerivedStats, DiffResponse, GrepResponse,
     HEADER_FINGERPRINT, HEADER_ROLES, HEADER_TEAMS, HEADER_USER, LogEntry, LogResponse,
-    TreeFileEntry, TreeResponse,
+    RebaseResponse, SymbolsResponse, TreeFileEntry, TreeResponse,
 };
 use gitx_store::ObjectStore;
 use reqwest::{Client, RequestBuilder, StatusCode};
@@ -70,10 +70,7 @@ impl ResolvedRemote {
     pub fn api_url(&self, suffix: &str) -> String {
         let base = self.base_url.trim_end_matches('/');
         let suffix = suffix.trim_start_matches('/');
-        format!(
-            "{base}/v1/repos/{}/{}/{suffix}",
-            self.owner, self.repo
-        )
+        format!("{base}/v1/repos/{}/{}/{suffix}", self.owner, self.repo)
     }
 
     pub fn full_name(&self) -> String {
@@ -349,8 +346,8 @@ pub fn load_remotes(gitx_dir: &Path) -> Result<RemotesConfig> {
     if !path.is_file() {
         return Ok(RemotesConfig::default());
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
@@ -360,8 +357,7 @@ pub fn save_remotes(gitx_dir: &Path, cfg: &RemotesConfig) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let content = toml::to_string_pretty(cfg)?;
-    fs::write(&path, content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -908,8 +904,7 @@ pub fn cmd_push(
             }
         }
 
-        let (mut upload, deletions) =
-            build_push_delta(&local_files, is_default_acl, &remote_files);
+        let (mut upload, deletions) = build_push_delta(&local_files, is_default_acl, &remote_files);
 
         // Delta-filter encrypted secret envelopes so unchanged secrets don't force churn.
         let mut upload_secrets: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
@@ -920,7 +915,8 @@ pub fn cmd_push(
                     .ok()
                     .map(|e| e.hash().to_hex());
                 let unchanged = local_hash.is_some()
-                    && remote_secret_hashes.get(&(dom.clone(), path.clone())) == local_hash.as_ref();
+                    && remote_secret_hashes.get(&(dom.clone(), path.clone()))
+                        == local_hash.as_ref();
                 if !unchanged {
                     upload_secrets
                         .entry(dom.clone())
@@ -966,7 +962,13 @@ pub fn cmd_push(
             .await
             .with_context(|| format!("failed to push to {}", resolved.base_url))?;
         let committed: CommitResponse = parse_json_response(resp, "push commit").await?;
-        Ok((Some(committed), None, uploaded_count, deleted_count, secret_count))
+        Ok((
+            Some(committed),
+            None,
+            uploaded_count,
+            deleted_count,
+            secret_count,
+        ))
     })?;
 
     let remote_label = remote_name_opt
@@ -1071,7 +1073,8 @@ pub fn cmd_pull(
         commits.reverse();
 
         let tip_rev = tip_tree.rev.clone().or(log.rev.clone());
-        let mut with_trees: Vec<(LogEntry, Option<TreeResponse>)> = Vec::with_capacity(commits.len());
+        let mut with_trees: Vec<(LogEntry, Option<TreeResponse>)> =
+            Vec::with_capacity(commits.len());
 
         for entry in commits {
             let already_synced = existing_synced.contains_key(&entry.changeset_id);
@@ -1093,8 +1096,7 @@ pub fn cmd_pull(
                             short_hex(&entry.changeset_id)
                         )
                     })?;
-                let c_tree: TreeResponse =
-                    parse_json_response(c_resp, "fetch commit tree").await?;
+                let c_tree: TreeResponse = parse_json_response(c_resp, "fetch commit tree").await?;
                 with_trees.push((entry, Some(c_tree)));
             }
         }
@@ -1102,11 +1104,11 @@ pub fn cmd_pull(
         Ok((tip_tree, with_trees))
     })?;
 
-    let Some(remote_tip_id) = tip_tree
-        .rev
-        .clone()
-        .or_else(|| chronological_commits.last().map(|(e, _)| e.changeset_id.clone()))
-    else {
+    let Some(remote_tip_id) = tip_tree.rev.clone().or_else(|| {
+        chronological_commits
+            .last()
+            .map(|(e, _)| e.changeset_id.clone())
+    }) else {
         println!(
             "No visible commits on remote '{remote_name}' ({} @ {target_bm}) — repository may be empty or filtered by ACL.",
             resolved.full_name()
@@ -1123,11 +1125,7 @@ pub fn cmd_pull(
     // doesn't clobber the local `.gitxacl` file.
     let preserved_local_acl = {
         let p = repo.root.join(".gitxacl");
-        if p.is_file() {
-            fs::read(&p).ok()
-        } else {
-            None
-        }
+        if p.is_file() { fs::read(&p).ok() } else { None }
     };
 
     let mut synced_map = remote_entry.synced_commits.clone();
@@ -1145,7 +1143,10 @@ pub fn cmd_pull(
                 email: "remote@gitx.local".to_string(),
                 key_fingerprint: None,
             },
-            format!("Pulled {remote_name}/{target_bm} ({})", short_hex(&remote_tip_id)),
+            format!(
+                "Pulled {remote_name}/{target_bm} ({})",
+                short_hex(&remote_tip_id)
+            ),
             "public",
             preserved_local_acl.as_deref(),
         )?;
@@ -1367,9 +1368,7 @@ fn import_tree_as_changeset(
         .entry(DomainId::public())
         .or_insert_with(|| DomainTree::new(DomainId::public()));
 
-    if !remote_had_acl
-        && let Some(acl_bytes) = preserved_local_acl
-    {
+    if !remote_had_acl && let Some(acl_bytes) = preserved_local_acl {
         let blob = repo.store.put_blob_bytes(acl_bytes)?;
         pub_tree.insert(
             ".gitxacl".to_string(),
@@ -1616,10 +1615,90 @@ pub fn cmd_remote_stats(
     );
     println!(
         "  path_history: entries={} hits={} misses={}",
-        stats.path_history_entries,
-        stats.path_history_cache_hits,
-        stats.path_history_cache_misses
+        stats.path_history_entries, stats.path_history_cache_hits, stats.path_history_cache_misses
     );
+    println!(
+        "  symbols:      trees={} symbols={} hits={} misses={}",
+        stats.symbol_indexed_trees,
+        stats.symbol_total_symbols,
+        stats.symbol_cache_hits,
+        stats.symbol_cache_misses
+    );
+    Ok(())
+}
+
+pub fn cmd_remote_symbols(
+    path: Option<String>,
+    remote: Option<String>,
+    url: Option<String>,
+    rev: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let (target, auth) = resolve_rpc_target(remote.as_deref(), url.as_deref(), token.as_deref())?;
+    let resp: SymbolsResponse = run_async(async {
+        let client = build_http_client()?;
+        let mut req = auth.apply(client.get(target.api_url("symbols")));
+        if let Some(ref r) = rev {
+            req = req.query(&[("rev", r)]);
+        }
+        if let Some(ref p) = path {
+            req = req.query(&[("path", p)]);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("failed to query remote symbols from {}", target.base_url))?;
+        parse_json_response(resp, "remote symbols").await
+    })?;
+
+    if resp.symbols.is_empty() {
+        println!("No symbols found.");
+        return Ok(());
+    }
+    for sym in resp.symbols {
+        println!(
+            "[{}] {}:{}-{} {} {}",
+            sym.domain, sym.path, sym.line_start, sym.line_end, sym.kind, sym.name
+        );
+    }
+    Ok(())
+}
+
+pub fn cmd_remote_rebase(
+    changeset_id: String,
+    onto: String,
+    update_bookmark: Option<String>,
+    remote: Option<String>,
+    url: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let (target, auth) = resolve_rpc_target(remote.as_deref(), url.as_deref(), token.as_deref())?;
+    let payload = json!({
+        "changeset_id": changeset_id,
+        "onto": onto,
+        "update_bookmark": update_bookmark,
+    });
+    let resp: RebaseResponse = run_async(async {
+        let client = build_http_client()?;
+        let resp = auth
+            .apply(client.post(target.api_url("rebase")))
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("failed to rebase on remote {}", target.base_url))?;
+        parse_json_response(resp, "remote rebase").await
+    })?;
+
+    println!(
+        "Rebased {} onto {} -> {} (conflicts: {})",
+        short_id(&resp.change_id, 8),
+        short_hex(&resp.onto),
+        short_hex(&resp.changeset_id),
+        resp.conflicts.len()
+    );
+    if !resp.conflicts.is_empty() {
+        println!("  conflicts: {}", resp.conflicts.join(", "));
+    }
     Ok(())
 }
 
@@ -1628,11 +1707,7 @@ pub fn short_hex(s: &str) -> &str {
 }
 
 pub fn short_id(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        s
-    } else {
-        &s[..max_len]
-    }
+    if s.len() <= max_len { s } else { &s[..max_len] }
 }
 
 #[cfg(test)]

@@ -434,7 +434,9 @@ fn lazy_workspace_cow_overwrite_snapshot_by_domain_and_manager_integration() {
         vec!["README.md", "src/lib.rs"]
     );
     assert_eq!(
-        by_domain[&team_private].entries.get("packages/private/plan.md"),
+        by_domain[&team_private]
+            .entries
+            .get("packages/private/plan.md"),
         base_tree.entries.get("packages/private/plan.md")
     );
 }
@@ -485,8 +487,16 @@ fn encrypted_fleet_overlay_hides_env_plaintext_restores_authorized_and_rejects_u
     assert_eq!(encrypted.file_count, 3);
     assert_eq!(encrypted.envelope.domain, domain);
     assert_eq!(encrypted.envelope.key_epoch, 7);
-    assert!(encrypted.envelope.has_recipient(&workstation_key.fingerprint()));
-    assert!(!encrypted.envelope.has_recipient(&intruder_key.fingerprint()));
+    assert!(
+        encrypted
+            .envelope
+            .has_recipient(&workstation_key.fingerprint())
+    );
+    assert!(
+        !encrypted
+            .envelope
+            .has_recipient(&intruder_key.fingerprint())
+    );
 
     // Verify `.env` plaintext is completely hidden in raw ciphertext AND serialized JSON.
     let raw_ct_lossy = String::from_utf8_lossy(&encrypted.envelope.ciphertext);
@@ -522,8 +532,8 @@ fn encrypted_fleet_overlay_hides_env_plaintext_restores_authorized_and_rejects_u
     assert_eq!(count_files_on_disk(&intruder_dir), 0);
 
     // Authorized workstation key decrypts and restores all 3 overlay files cleanly.
-    let restored =
-        apply_encrypted_overlay(&workstation, &received, &workstation_key).expect("apply encrypted");
+    let restored = apply_encrypted_overlay(&workstation, &received, &workstation_key)
+        .expect("apply encrypted");
     assert_eq!(restored, vec![".env", ".env.local", "config/local.toml"]);
     assert_eq!(
         fs::read_to_string(workstation.join(".env")).unwrap(),
@@ -538,4 +548,72 @@ fn encrypted_fleet_overlay_hides_env_plaintext_restores_authorized_and_rejects_u
         "workers = 16\n"
     );
     assert!(!workstation.join("node_modules").exists());
+}
+
+#[test]
+fn encrypted_fleet_overlay_with_wip_snapshot_roundtrips_and_hides_plaintext() {
+    use gitx_core::{ChangeId, FileMode, ObjectHash};
+    use gitx_vfs::{
+        FleetWipSnapshot, OverlayFile, decrypt_encrypted_overlay, export_encrypted_overlay_with_wip,
+    };
+    use std::collections::BTreeMap;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let laptop = tmp.path().join("laptop");
+    fs::create_dir_all(&laptop).unwrap();
+    fs::write(
+        laptop.join(".env.local"),
+        b"LOCAL_TOKEN=top_secret_wip_env\n",
+    )
+    .unwrap();
+
+    let laptop_key = UserKeyPair::generate_with_label("laptop");
+    let peer_key = UserKeyPair::generate_with_label("desktop");
+    let outsider_key = UserKeyPair::generate_with_label("outsider");
+
+    let wip_content =
+        b"pub fn unfinished_feature() -> &'static str { \"WIP_UNPUBLISHED_CODE\" }\n".to_vec();
+    let mut wip_files = BTreeMap::new();
+    wip_files.insert(
+        "src/wip.rs".to_string(),
+        OverlayFile {
+            path: "src/wip.rs".to_string(),
+            mode: FileMode::Regular,
+            content_hash: ObjectHash::of_bytes(&wip_content),
+            content: wip_content.clone(),
+        },
+    );
+    let wip = FleetWipSnapshot {
+        change_id: ChangeId::new(),
+        base_changeset: Some(ObjectHash::of_bytes(b"base-cs")),
+        description: "WIP auth refactor".to_string(),
+        files: wip_files,
+        deleted_paths: vec!["src/old_unused.rs".to_string()],
+    };
+
+    let domain = DomainId::secret("fleet").unwrap();
+    let bundle = export_encrypted_overlay_with_wip(
+        &laptop,
+        &[".env.local"],
+        "laptop-1",
+        &domain,
+        1,
+        &[laptop_key.public_bundle(), peer_key.public_bundle()],
+        Some(wip.clone()),
+    )
+    .expect("export with wip");
+
+    // Plaintext of both `.env.local` and WIP source code must never appear in serialized bundle.
+    let wire_json = bundle.to_json().unwrap();
+    assert!(!wire_json.contains("top_secret_wip_env"));
+    assert!(!wire_json.contains("WIP_UNPUBLISHED_CODE"));
+
+    // Outsider cannot decrypt.
+    assert!(decrypt_encrypted_overlay(&bundle, &outsider_key).is_err());
+
+    // Authorized peer decrypts both overlay files and full WIP ChangeSet snapshot.
+    let decoded = decrypt_encrypted_overlay(&bundle, &peer_key).expect("decrypt with wip");
+    assert!(decoded.files.contains_key(".env.local"));
+    let restored_wip = decoded.wip_snapshot.expect("wip snapshot present");
+    assert_eq!(restored_wip, wip);
 }

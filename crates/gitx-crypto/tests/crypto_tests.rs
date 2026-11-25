@@ -132,7 +132,11 @@ fn multi_recipient_envelope_encrypt_decrypt_and_revocation_rotation() {
     let mut spliced = env_v2.clone();
     spliced.wrapped_keys.insert(
         carol.fingerprint(),
-        env_v1.wrapped_keys.get(&carol.fingerprint()).unwrap().clone(),
+        env_v1
+            .wrapped_keys
+            .get(&carol.fingerprint())
+            .unwrap()
+            .clone(),
     );
     assert!(decrypt_secret(&spliced, path, &carol).is_err());
 
@@ -212,7 +216,10 @@ fn rotation_report_for_revoked_lists_exact_exposed_versions() {
     log.record_revoke_at("fp_alice", sec_prod.clone(), t3 + Duration::minutes(1));
 
     let report = log.rotation_report_for_revoked("fp_alice");
-    assert_eq!(report, rotation_report_for_revoked(log.events(), "fp_alice"));
+    assert_eq!(
+        report,
+        rotation_report_for_revoked(log.events(), "fp_alice")
+    );
     assert_eq!(report.len(), 3);
 
     // Deterministic BTreeMap ordering: (secret:dev, .env, 1), (secret:prod, .env.prod, 1), (secret:prod, .env.prod, 2)
@@ -493,7 +500,11 @@ fn acl_embargo_and_private_changeset_visibility_isolation() {
 fn secret_scanner_detects_all_patterns_and_redacts_matches() {
     // 1. .env filename
     let env_findings = scan_content("apps/web/.env.local", b"PORT=3000\n");
-    assert!(env_findings.iter().any(|f| f.kind == SecretKind::DotEnvFile));
+    assert!(
+        env_findings
+            .iter()
+            .any(|f| f.kind == SecretKind::DotEnvFile)
+    );
 
     // 2. Private key header
     let pem_content = b"-----BEGIN OPENSSH PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n";
@@ -714,18 +725,28 @@ fn openssh_ed25519_import_derives_matching_x25519_and_decrypts_secrets() {
     let kp = UserKeyPair::from_openssh_ed25519(&pem, None).unwrap();
     assert_eq!(kp.label(), Some("theo@t3.gg"));
 
-    let pub_line = format_openssh_ed25519_pub(&kp.public_bundle().ed25519_public, Some("theo@t3.gg"));
+    let pub_line =
+        format_openssh_ed25519_pub(&kp.public_bundle().ed25519_public, Some("theo@t3.gg"));
     let imported_pub = PublicKeyBundle::from_openssh_ed25519_pub(&pub_line).unwrap();
 
     // Derived X25519 key & fingerprint from `.pub` MUST match the PEM private key identically.
     assert_eq!(imported_pub.x25519_public, kp.public_bundle().x25519_public);
-    assert_eq!(imported_pub.ed25519_public, kp.public_bundle().ed25519_public);
+    assert_eq!(
+        imported_pub.ed25519_public,
+        kp.public_bundle().ed25519_public
+    );
     assert_eq!(imported_pub.fingerprint(), kp.fingerprint());
 
     // Encrypting a `.env` secret to the teammate's OpenSSH `.pub` decrypts with their private key!
     let domain = DomainId::secret("prod").unwrap();
-    let env = encrypt_secret(&domain, ".env", 1, b"DATABASE_URL=postgres://secret\n", &[imported_pub])
-        .unwrap();
+    let env = encrypt_secret(
+        &domain,
+        ".env",
+        1,
+        b"DATABASE_URL=postgres://secret\n",
+        &[imported_pub],
+    )
+    .unwrap();
     let plain = decrypt_secret(&env, ".env", &kp).unwrap();
     assert_eq!(plain, b"DATABASE_URL=postgres://secret\n");
 
@@ -772,4 +793,179 @@ fn signed_hmac_and_ed25519_tokens_verify_and_reject_tamper_or_expiry() {
     assert!(verify_token_ed25519(&ed_tok, &kp.public_bundle(), 2_500).is_err());
     let other_kp = UserKeyPair::generate();
     assert!(verify_token_ed25519(&ed_tok, &other_kp.public_bundle(), 1_500).is_err());
+}
+
+#[test]
+fn openssh_ed25519_passphrase_encrypted_roundtrip_and_ssh_keygen_interop() {
+    use gitx_crypto::{
+        encode_openssh_ed25519_private_encrypted, format_openssh_ed25519_pub,
+        parse_openssh_ed25519_private_with_passphrase, parse_openssh_ed25519_pub,
+    };
+
+    let seed = [42u8; 32];
+    let pass = "correct-horse-battery-staple";
+    let enc_pem = encode_openssh_ed25519_private_encrypted(&seed, "alice@gitx", pass)
+        .expect("encode encrypted openssh key");
+    assert!(enc_pem.contains("BEGIN OPENSSH PRIVATE KEY"));
+
+    // Missing passphrase must return a clear error.
+    let no_pass_err =
+        parse_openssh_ed25519_private_with_passphrase(&enc_pem, None, None).unwrap_err();
+    assert!(
+        no_pass_err
+            .to_string()
+            .to_lowercase()
+            .contains("passphrase"),
+        "expected passphrase error, got: {no_pass_err}"
+    );
+
+    // Wrong passphrase must fail.
+    assert!(parse_openssh_ed25519_private_with_passphrase(&enc_pem, Some("wrong"), None).is_err());
+
+    // Correct passphrase recovers exact seed and public key.
+    let rec_kp = parse_openssh_ed25519_private_with_passphrase(&enc_pem, Some(pass), None).unwrap();
+    assert_eq!(rec_kp.to_secret_bundle().ed25519_secret, seed);
+    assert_eq!(rec_kp.public_bundle().label.as_deref(), Some("alice@gitx"));
+
+    let kp = UserKeyPair::from_openssh_ed25519_with_passphrase(&enc_pem, Some(pass), None).unwrap();
+    assert_eq!(
+        kp.public_bundle().ed25519_public,
+        rec_kp.public_bundle().ed25519_public
+    );
+
+    // Real `ssh-keygen -t ed25519 -N <passphrase>` interoperability test if available.
+    if let Ok(ver) = std::process::Command::new("ssh-keygen").arg("-V").output()
+        && (ver.status.success() || !ver.stderr.is_empty())
+    {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("gitx-ssh-keygen-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let key_path = tmp_dir.join("id_ed25519_enc");
+        let status = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                pass,
+                "-C",
+                "interop@gitx.dev",
+                "-f",
+                key_path.to_str().unwrap(),
+                "-q",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "ssh-keygen failed");
+
+        let disk_priv = std::fs::read_to_string(&key_path).unwrap();
+        let disk_pub = std::fs::read_to_string(tmp_dir.join("id_ed25519_enc.pub")).unwrap();
+
+        assert!(parse_openssh_ed25519_private_with_passphrase(&disk_priv, None, None).is_err());
+        assert!(
+            parse_openssh_ed25519_private_with_passphrase(&disk_priv, Some("bad"), None).is_err()
+        );
+        let parsed_kp =
+            parse_openssh_ed25519_private_with_passphrase(&disk_priv, Some(pass), None).unwrap();
+        let expected_pub = parse_openssh_ed25519_pub(&disk_pub).unwrap();
+        assert_eq!(
+            parsed_kp.public_bundle().ed25519_public,
+            expected_pub.ed25519_public
+        );
+        assert_eq!(
+            parsed_kp.public_bundle().label.as_deref(),
+            Some("interop@gitx.dev")
+        );
+        assert!(
+            format_openssh_ed25519_pub(
+                &parsed_kp.public_bundle().ed25519_public,
+                Some("interop@gitx.dev")
+            )
+            .starts_with("ssh-ed25519 ")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+}
+
+#[test]
+fn kms_hybrid_envelope_and_oidc_eddsa_jwt_verification() {
+    use gitx_crypto::{
+        KmsHybridEnvelope, LocalKmsProvider, OidcClaims, OidcVerifier, sign_oidc_jwt_eddsa,
+    };
+
+    let mut kms = LocalKmsProvider::new("local-kms");
+    kms.generate_key("kms://prod/app-secrets");
+    let other_kms =
+        LocalKmsProvider::new("local-kms").with_key("kms://prod/app-secrets", [99u8; 32]);
+
+    let dev_kp = UserKeyPair::generate_with_label("dev-alice");
+    let outsider_kp = UserKeyPair::generate_with_label("outsider");
+    let domain = DomainId::secret("prod").unwrap();
+
+    let hybrid = KmsHybridEnvelope::seal(
+        &domain,
+        ".env.prod",
+        3,
+        b"DATABASE_URL=postgres://prod/secret\n",
+        &[(&kms, "kms://prod/app-secrets")],
+        &[dev_kp.public_bundle()],
+    )
+    .expect("seal kms hybrid");
+
+    // Both KMS provider and authorized X25519 developer keypair decrypt identically.
+    assert_eq!(
+        hybrid.open_with_kms(&kms).unwrap(),
+        b"DATABASE_URL=postgres://prod/secret\n"
+    );
+    assert_eq!(
+        hybrid.open_with_keypair(&dev_kp).unwrap(),
+        b"DATABASE_URL=postgres://prod/secret\n"
+    );
+
+    // Wrong KMS master key and unauthorized developer key fail.
+    assert!(hybrid.open_with_kms(&other_kms).is_err());
+    assert!(hybrid.open_with_keypair(&outsider_kp).is_err());
+
+    // Tampering ciphertext fails AEAD check.
+    let mut tampered = hybrid.clone();
+    tampered.ciphertext[0] ^= 0xFF;
+    assert!(tampered.open_with_kms(&kms).is_err());
+
+    // OIDC EdDSA JWT verification.
+    let idp_kp = UserKeyPair::generate_with_label("idp-key-1");
+    let signing_key =
+        ed25519_dalek::SigningKey::from_bytes(&idp_kp.to_secret_bundle().ed25519_secret);
+    let verifying_key = signing_key.verifying_key();
+
+    let verifier = OidcVerifier::new("https://idp.example.com", "gitx-api")
+        .with_key("key-2026-01", verifying_key);
+
+    let claims = OidcClaims {
+        iss: "https://idp.example.com".to_string(),
+        sub: "alice@example.com".to_string(),
+        aud: "gitx-api".to_string(),
+        email: Some("alice@example.com".to_string()),
+        teams: vec!["core".to_string(), "security".to_string()],
+        roles: vec!["admin".to_string()],
+        iat: 1_000,
+        exp: 2_000,
+    };
+    let jwt = sign_oidc_jwt_eddsa(&claims, &signing_key, Some("key-2026-01")).unwrap();
+    let principal = verifier.verify_to_principal(&jwt, 1_500).unwrap();
+    assert_eq!(principal.id, "alice@example.com");
+    assert_eq!(principal.teams, vec!["core", "security"]);
+    assert_eq!(principal.roles, vec!["admin"]);
+    assert!(!principal.is_anonymous);
+
+    // Expiry, issuer, audience, unknown kid, and tampering are all rejected.
+    assert!(verifier.verify_to_principal(&jwt, 2_000).is_err());
+    let wrong_aud = OidcVerifier::new("https://idp.example.com", "other-aud")
+        .with_key("key-2026-01", verifying_key);
+    assert!(wrong_aud.verify_to_principal(&jwt, 1_500).is_err());
+    let wrong_iss = OidcVerifier::new("https://evil.example.com", "gitx-api")
+        .with_key("key-2026-01", verifying_key);
+    assert!(wrong_iss.verify_to_principal(&jwt, 1_500).is_err());
+    let bad_kid_jwt = sign_oidc_jwt_eddsa(&claims, &signing_key, Some("unknown-kid")).unwrap();
+    assert!(verifier.verify_to_principal(&bad_kid_jwt, 1_500).is_err());
 }

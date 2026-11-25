@@ -430,12 +430,8 @@ pub fn run_oplog_crash_recovery_sim(config: &SimConfig) -> Result<OpLogSimReport
                     .expect("filtered for Some(previous_head)");
                 let current_master = expected_bookmarks["master"];
 
-                let rev_rec = store.record_land(
-                    "master",
-                    Some(current_master),
-                    restore_head,
-                    Vec::new(),
-                )?;
+                let rev_rec =
+                    store.record_land("master", Some(current_master), restore_head, Vec::new())?;
                 if rev_rec.land_seq <= last_land_seq {
                     return Err(sim_err(format!(
                         "non-monotonic revert land_seq: got {}, previous {}",
@@ -484,7 +480,8 @@ pub fn run_oplog_crash_recovery_sim(config: &SimConfig) -> Result<OpLogSimReport
                 cs_files.insert(cs.id, files);
                 expected_change_heads.insert(cs.change_id, cs.id);
 
-                let rec = store.record_land("master", Some(master_head), cs.id, vec![cs.change_id])?;
+                let rec =
+                    store.record_land("master", Some(master_head), cs.id, vec![cs.change_id])?;
                 if rec.land_seq <= last_land_seq {
                     return Err(sim_err("non-monotonic fallback land_seq"));
                 }
@@ -953,7 +950,12 @@ packages/private/** -> team:core read=team:core,role:admin write=team:core,role:
         ("X-Gitx-Teams", "core"),
         ("X-Gitx-Roles", "admin"),
     ];
-    let auth_tree = get_text(&client, &srv.url("/v1/repos/acme/vault/tree"), &auth_headers).await?;
+    let auth_tree = get_text(
+        &client,
+        &srv.url("/v1/repos/acme/vault/tree"),
+        &auth_headers,
+    )
+    .await?;
     for required in [&secret_canary, &team_canary] {
         if !auth_tree.contains(required) {
             return Err(sim_err(format!(
@@ -1303,7 +1305,8 @@ pub async fn run_concurrent_merge_queue_stress(
     let srv = LiveTestServer::start(None).await?;
     let client = Client::new();
 
-    let base_rust = "//! Concurrent AST merge stress target.\n\npub fn base_entry() -> usize {\n    9999\n}\n";
+    let base_rust =
+        "//! Concurrent AST merge stress target.\n\npub fn base_entry() -> usize {\n    9999\n}\n";
     let base_pkg = "{\n  \"name\": \"gitx-concurrent-swarm\",\n  \"version\": \"1.0.0\"\n}\n";
 
     let base: CommitResponse = post_json(

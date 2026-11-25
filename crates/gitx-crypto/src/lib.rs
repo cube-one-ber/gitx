@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod envelope;
 pub mod keys;
+pub mod kms;
 pub mod scanner;
 pub mod ssh_keys;
 pub mod tokens;
@@ -13,12 +14,18 @@ pub use envelope::{
 pub use keys::{
     FINGERPRINT_HEX_LEN, PublicKeyBundle, SecretKeyBundle, UserKeyPair, compute_fingerprint,
 };
+pub use kms::{
+    KeyWrapProvider, KmsHybridEnvelope, KmsWrappedDek, LocalKmsProvider, OidcClaims, OidcVerifier,
+    sign_oidc_jwt_eddsa, sign_oidc_jwt_with_keypair,
+};
 pub use scanner::{
     SecretFinding, SecretKind, Severity, contains_secrets, route_domain_zero_trust, scan_content,
 };
 pub use ssh_keys::{
-    ed25519_public_to_x25519, encode_openssh_ed25519_private, format_openssh_ed25519_pub,
-    parse_openssh_ed25519_private, parse_openssh_ed25519_pub, user_keypair_from_ed25519_seed,
+    ed25519_public_to_x25519, encode_openssh_ed25519_private,
+    encode_openssh_ed25519_private_encrypted, format_openssh_ed25519_pub,
+    parse_openssh_ed25519_private, parse_openssh_ed25519_private_with_passphrase,
+    parse_openssh_ed25519_pub, user_keypair_from_ed25519_seed,
 };
 pub use tokens::{
     ED25519_TOKEN_PREFIX, HMAC_TOKEN_PREFIX, TokenClaims, sign_token_ed25519, sign_token_hmac,

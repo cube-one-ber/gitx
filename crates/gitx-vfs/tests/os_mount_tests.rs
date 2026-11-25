@@ -298,7 +298,9 @@ fn fuse_core_full_posix_lifecycle_demand_paging_and_o_dirty_snapshot() {
     assert_eq!(run_attr.perm, 0o755);
 
     // Demand-paged read + partial offset read + in-memory cache hit.
-    let _fh = core.open(lib_attr.ino, libc::O_RDONLY).expect("open lib.rs");
+    let _fh = core
+        .open(lib_attr.ino, libc::O_RDONLY)
+        .expect("open lib.rs");
     let full_bytes = core.read(lib_attr.ino, 0, 4096).expect("read lib.rs");
     assert_eq!(
         full_bytes,
@@ -318,14 +320,20 @@ fn fuse_core_full_posix_lifecycle_demand_paging_and_o_dirty_snapshot() {
 
     // Create + write a new file in an existing dir.
     let (new_attr, _fh) = core
-        .create(src_attr.ino, "created.rs", 0o644, libc::O_CREAT | libc::O_WRONLY)
+        .create(
+            src_attr.ino,
+            "created.rs",
+            0o644,
+            libc::O_CREAT | libc::O_WRONLY,
+        )
         .expect("create created.rs");
     let written = core
         .write(new_attr.ino, 0, b"pub const NEW: bool = true;\n")
         .expect("write created.rs");
     assert_eq!(written as usize, b"pub const NEW: bool = true;\n".len());
     assert_eq!(
-        core.read(new_attr.ino, 0, 128).expect("read back created.rs"),
+        core.read(new_attr.ino, 0, 128)
+            .expect("read back created.rs"),
         b"pub const NEW: bool = true;\n"
     );
 
@@ -336,7 +344,8 @@ fn fuse_core_full_posix_lifecycle_demand_paging_and_o_dirty_snapshot() {
         .expect("lookup guide.txt");
     core.write(guide_attr.ino, 4, b"XXXX").expect("cow patch");
     assert_eq!(
-        core.read(guide_attr.ino, 0, 64).expect("read patched guide"),
+        core.read(guide_attr.ino, 0, 64)
+            .expect("read patched guide"),
         b"0123XXXX89abcdef"
     );
 
@@ -383,7 +392,8 @@ fn fuse_core_full_posix_lifecycle_demand_paging_and_o_dirty_snapshot() {
     let (tmp_file, _) = core
         .create(scratch_attr.ino, "temp.txt", 0o644, 0)
         .expect("create temp.txt");
-    core.write(tmp_file.ino, 0, b"ephemeral").expect("write temp");
+    core.write(tmp_file.ino, 0, b"ephemeral")
+        .expect("write temp");
     assert_eq!(
         core.rmdir(ROOT_INO, "scratch"),
         Err(libc::ENOTEMPTY),
@@ -391,7 +401,8 @@ fn fuse_core_full_posix_lifecycle_demand_paging_and_o_dirty_snapshot() {
     );
     core.unlink(scratch_attr.ino, "temp.txt")
         .expect("unlink temp.txt");
-    core.rmdir(ROOT_INO, "scratch").expect("rmdir empty scratch");
+    core.rmdir(ROOT_INO, "scratch")
+        .expect("rmdir empty scratch");
     assert_eq!(core.lookup(ROOT_INO, "scratch"), Err(libc::ENOENT));
 
     // Rename file across directories (preserving inode number!).
@@ -408,12 +419,14 @@ fn fuse_core_full_posix_lifecycle_demand_paging_and_o_dirty_snapshot() {
         "POSIX rename must preserve inode number"
     );
     assert_eq!(
-        core.read(relocated_attr.ino, 0, 128).expect("read relocated"),
+        core.read(relocated_attr.ino, 0, 128)
+            .expect("read relocated"),
         b"pub const NEW: bool = true;\n"
     );
 
     // Unlink a base file -> creates tombstone, keeps rest untouched.
-    core.unlink(bin_attr.ino, "run.sh").expect("unlink base file");
+    core.unlink(bin_attr.ino, "run.sh")
+        .expect("unlink base file");
     assert_eq!(core.lookup(bin_attr.ino, "run.sh"), Err(libc::ENOENT));
     assert_eq!(core.stats().tombstones, 1);
 
@@ -492,12 +505,16 @@ fn loopback_vfs_server_and_client_end_to_end_over_tcp() {
     assert_eq!(count_files_on_disk(&overlay_root), 0);
 
     // Second client reads cached file -> cache hit, still 1 store read!
-    let cached = client2.read(mod_rs.ino, 10, 6).expect("client2 offset read");
+    let cached = client2
+        .read(mod_rs.ino, 10, 6)
+        .expect("client2 offset read");
     assert_eq!(cached, b"ANSWER");
     assert_eq!(counting.blob_reads(), 1);
 
     // 3. Mkdir, Create, Write, SetAttr, Rename, Remove over TCP.
-    let sub = client.mkdir(ROOT_INO, "agent_out").expect("mkdir agent_out");
+    let sub = client
+        .mkdir(ROOT_INO, "agent_out")
+        .expect("mkdir agent_out");
     let created = client
         .create(sub.ino, "draft.txt", false)
         .expect("create draft.txt");
@@ -513,7 +530,9 @@ fn loopback_vfs_server_and_client_end_to_end_over_tcp() {
         client.lookup(sub.ino, "draft.txt"),
         Err(GitxError::NotFound(_))
     ));
-    let final_attr = client.lookup(sub.ino, "final.txt").expect("lookup final.txt");
+    let final_attr = client
+        .lookup(sub.ino, "final.txt")
+        .expect("lookup final.txt");
     assert_eq!(
         client.read(final_attr.ino, 0, 256).expect("read final.txt"),
         b"hello via loopback tcp\n"
@@ -526,12 +545,16 @@ fn loopback_vfs_server_and_client_end_to_end_over_tcp() {
     assert_eq!(shrunk.size, 5);
     assert_eq!(shrunk.perm, 0o755);
     assert_eq!(
-        client2.read(final_attr.ino, 0, 64).expect("client2 read shrunk"),
+        client2
+            .read(final_attr.ino, 0, 64)
+            .expect("client2 read shrunk"),
         b"hello"
     );
 
     // Delete a base file over TCP.
-    client.remove(ROOT_INO, "README.md").expect("remove README.md");
+    client
+        .remove(ROOT_INO, "README.md")
+        .expect("remove README.md");
     assert!(matches!(
         client.lookup(ROOT_INO, "README.md"),
         Err(GitxError::NotFound(_))
@@ -708,8 +731,8 @@ fn loopback_vfs_server_rejects_non_loopback_bind_addr() {
     let store: Arc<dyn ObjectStore> = Arc::new(CountingStore::new());
     let base_tree = DomainTree::new(DomainId::public());
     let tmp = TempDir::new().unwrap();
-    let ws = LazyWorkspace::mount(tmp.path().join("overlay"), Arc::clone(&store), base_tree)
-        .unwrap();
+    let ws =
+        LazyWorkspace::mount(tmp.path().join("overlay"), Arc::clone(&store), base_tree).unwrap();
     let res = LoopbackVfsServer::start("0.0.0.0:0", ws, store);
     let err = match res {
         Ok(_) => panic!("expected non-loopback bind address to be rejected"),
@@ -719,4 +742,154 @@ fn loopback_vfs_server_rejects_non_loopback_bind_addr() {
         err.to_string().contains("loopback"),
         "expected loopback bind rejection, got: {err}"
     );
+}
+
+#[test]
+fn nfs3_rfc1813_loopback_end_to_end_mount_read_write_rename_remove_and_snapshot() {
+    use gitx_vfs::nfs3_rfc1813::{
+        MOUNT_PROGRAM, MOUNT_V3, MOUNTPROC3_EXPORT, MOUNTPROC3_NULL, NFS_PROGRAM, NFS_V3,
+        NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_NULL, NFSPROC3_PATHCONF, Nfs3LoopbackServer,
+        Nfs3WireClient, XdrWriter, macos_mount_nfs_args,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let overlay_root = tmp.path().join("overlay");
+    let counting = Arc::new(CountingStore::new());
+    let base_tree = seed_sample_tree(counting.as_ref());
+    counting.reset_counts();
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let ws = LazyWorkspace::mount(&overlay_root, Arc::clone(&store), base_tree.clone()).unwrap();
+
+    // Non-loopback bind address must be rejected.
+    let ws_bad = LazyWorkspace::mount(
+        tmp.path().join("overlay-bad"),
+        Arc::clone(&store),
+        base_tree.clone(),
+    )
+    .unwrap();
+    assert!(Nfs3LoopbackServer::start("0.0.0.0:0", ws_bad, Arc::clone(&store)).is_err());
+
+    let server = Nfs3LoopbackServer::start("127.0.0.1:0", ws, Arc::clone(&store)).unwrap();
+    let port = server.addr().port();
+    let macos_args = macos_mount_nfs_args(port, tmp.path());
+    assert!(
+        macos_args
+            .iter()
+            .any(|a| a.contains(&format!("port={port}")))
+    );
+    assert!(
+        macos_args
+            .iter()
+            .any(|a| a.contains(&format!("mountport={port}")))
+    );
+
+    let mut client = Nfs3WireClient::connect(server.addr()).unwrap();
+
+    // 1. MOUNTv3 NULL, EXPORT, MNT + NFSv3 NULL
+    assert!(
+        client
+            .call(MOUNT_PROGRAM, MOUNT_V3, MOUNTPROC3_NULL, &[])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !client
+            .call(MOUNT_PROGRAM, MOUNT_V3, MOUNTPROC3_EXPORT, &[])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        client
+            .call(NFS_PROGRAM, NFS_V3, NFSPROC3_NULL, &[])
+            .unwrap()
+            .is_empty()
+    );
+
+    let root_fh = client.mount("/").unwrap();
+    assert_eq!(root_fh.len(), 8);
+
+    // 2. FSSTAT, FSINFO, PATHCONF, and READDIR without hydrating any blobs!
+    let mut fh_arg = XdrWriter::new();
+    fh_arg.write_opaque(&root_fh);
+    let fh_bytes = fh_arg.into_bytes();
+    assert!(
+        !client
+            .call(NFS_PROGRAM, NFS_V3, NFSPROC3_FSSTAT, &fh_bytes)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !client
+            .call(NFS_PROGRAM, NFS_V3, NFSPROC3_FSINFO, &fh_bytes)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !client
+            .call(NFS_PROGRAM, NFS_V3, NFSPROC3_PATHCONF, &fh_bytes)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut root_names = client.readdir(&root_fh).unwrap();
+    root_names.sort();
+    assert_eq!(
+        root_names,
+        vec![".", "..", "README.md", "bin", "docs", "packages", "src"]
+    );
+    assert_eq!(
+        counting.blob_reads(),
+        0,
+        "NFSv3 READDIR must not hydrate blobs"
+    );
+
+    // 3. LOOKUP + demand-paged READ
+    let readme_fh = client.lookup(&root_fh, "README.md").unwrap();
+    let (readme_bytes, eof) = client.read(&readme_fh, 0, 4096).unwrap();
+    assert!(eof);
+    assert_eq!(readme_bytes, b"# GitX Virtual Mount\n");
+
+    let src_fh = client.lookup(&root_fh, "src").unwrap();
+    let nested_fh = client.lookup(&src_fh, "nested").unwrap();
+    let mod_fh = client.lookup(&nested_fh, "mod.rs").unwrap();
+    let (mod_bytes, _) = client.read(&mod_fh, 0, 4096).unwrap();
+    assert_eq!(mod_bytes, b"pub const ANSWER: u64 = 42;\n");
+    assert_eq!(counting.blob_reads(), 2);
+    assert_eq!(count_files_on_disk(&overlay_root), 0);
+
+    // 4. MKDIR, CREATE, WRITE, RENAME, overwrite base file, REMOVE base file
+    let gen_fh = client.mkdir(&root_fh, "generated").unwrap();
+    let tmp_fh = client.create(&gen_fh, "tmp.txt", 0o644).unwrap();
+    let written = client.write(&tmp_fh, 0, b"hello rfc1813 nfs3\n").unwrap();
+    assert_eq!(written, 19);
+    client
+        .rename(&gen_fh, "tmp.txt", &gen_fh, "output.txt")
+        .unwrap();
+    let out_fh = client.lookup(&gen_fh, "output.txt").unwrap();
+    let (out_bytes, _) = client.read(&out_fh, 0, 4096).unwrap();
+    assert_eq!(out_bytes, b"hello rfc1813 nfs3\n");
+
+    client
+        .write(&readme_fh, 0, b"# Edited via NFSv3\n")
+        .unwrap();
+    let docs_fh = client.lookup(&root_fh, "docs").unwrap();
+    client.remove(&docs_fh, "guide.txt").unwrap();
+    assert!(client.lookup(&docs_fh, "guide.txt").is_err());
+
+    // 5. Snapshot in O(dirty_files)
+    counting.reset_counts();
+    let snap = server.snapshot(DomainId::public()).unwrap();
+    assert_eq!(counting.blob_reads(), 0);
+    assert_eq!(counting.blob_writes(), 2);
+    let changes = WorkspaceManager::detect_changes(&snap, &base_tree);
+    assert_eq!(
+        changes,
+        WorkspaceChanges {
+            added: vec!["generated/output.txt".to_string()],
+            modified: vec!["README.md".to_string()],
+            removed: vec!["docs/guide.txt".to_string()],
+        }
+    );
+
+    server.shutdown();
 }

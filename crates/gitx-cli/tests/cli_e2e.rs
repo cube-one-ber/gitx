@@ -111,7 +111,10 @@ fn e2e_full_local_workflow() {
 
     // 9. revert land_seq 1 -> restores initial state (removes hello.txt and second.txt)
     let revert_out = gitx_ok(root, &["revert", "1"]);
-    assert!(revert_out.contains("Reverted land_seq 1"), "got:\n{revert_out}");
+    assert!(
+        revert_out.contains("Reverted land_seq 1"),
+        "got:\n{revert_out}"
+    );
     assert!(
         !root.join("hello.txt").exists(),
         "hello.txt should be removed after revert"
@@ -139,7 +142,10 @@ fn e2e_lock_free_multi_workspace() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
-    gitx_ok(root, &["init", "--name", "Bob", "--email", "bob@example.com"]);
+    gitx_ok(
+        root,
+        &["init", "--name", "Bob", "--email", "bob@example.com"],
+    );
     fs::write(root.join("README.md"), "# GitX Multi-Workspace\n").unwrap();
     gitx_ok(root, &["describe", "-m", "Add README"]);
     gitx_ok(root, &["land"]);
@@ -193,10 +199,14 @@ fn e2e_native_secrets_and_acl_git_export() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
-    gitx_ok(root, &["init", "--name", "Sec", "--email", "sec@example.com"]);
+    gitx_ok(
+        root,
+        &["init", "--name", "Sec", "--email", "sec@example.com"],
+    );
 
     fs::write(root.join("app.rs"), "pub fn main() { println!(\"ok\"); }\n").unwrap();
-    let secret_payload = "DATABASE_URL=postgres://user:supersecret@db:5432/prod\nAPI_KEY=sk-live-secret-999999999\n";
+    let secret_payload =
+        "DATABASE_URL=postgres://user:supersecret@db:5432/prod\nAPI_KEY=sk-live-secret-999999999\n";
     fs::write(root.join(".env"), secret_payload).unwrap();
 
     // Encrypt native secret into secret:dev
@@ -264,7 +274,10 @@ fn e2e_durable_context_relocation_and_checkpoint_undo() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
-    gitx_ok(root, &["init", "--name", "Dev", "--email", "dev@example.com"]);
+    gitx_ok(
+        root,
+        &["init", "--name", "Dev", "--email", "dev@example.com"],
+    );
 
     let initial_code = "\
 fn alpha() {
@@ -306,14 +319,16 @@ fn beta() {
     assert!(ctx_out.contains("Added context"));
 
     // Shift file lines down by inserting 5 header comment lines at top of `lib.rs`
-    let shifted_code = format!(
-        "// header 1\n// header 2\n// header 3\n// header 4\n// header 5\n{initial_code}"
-    );
+    let shifted_code =
+        format!("// header 1\n// header 2\n// header 3\n// header 4\n// header 5\n{initial_code}");
     fs::write(root.join("lib.rs"), &shifted_code).unwrap();
 
     // `why` with only `public` must NOT leak `team:core` record
     let why_pub = gitx_ok(root, &["why", "lib.rs:14", "--domains", "public"]);
-    assert!(why_pub.contains("No context records found"), "got:\n{why_pub}");
+    assert!(
+        why_pub.contains("No context records found"),
+        "got:\n{why_pub}"
+    );
 
     // `why` with `public,team:core` relocates anchor cleanly to shifted line 14!
     let why_team = gitx_ok(root, &["why", "lib.rs:14", "--domains", "public,team:core"]);
@@ -326,14 +341,31 @@ fn beta() {
     // Start a clean ChangeSet with base `lib.rs`
     gitx_ok(root, &["new", "-m", "Agent session"]);
     fs::write(root.join("lib.rs"), initial_code).unwrap();
-    gitx_ok(root, &["checkpoint", "save", "-m", "before agent edit", "--session", "sess-1"]);
+    gitx_ok(
+        root,
+        &[
+            "checkpoint",
+            "save",
+            "-m",
+            "before agent edit",
+            "--session",
+            "sess-1",
+        ],
+    );
 
     // Agent modifies `alpha()` (top of file) and saves checkpoint
     let after_agent = initial_code.replace("let a = 1;", "let a = 999; // agent edit");
     fs::write(root.join("lib.rs"), &after_agent).unwrap();
     let cp_save_out = gitx_ok(
         root,
-        &["checkpoint", "save", "-m", "agent tuned alpha", "--session", "sess-1"],
+        &[
+            "checkpoint",
+            "save",
+            "-m",
+            "agent tuned alpha",
+            "--session",
+            "sess-1",
+        ],
     );
     let agent_cp_id = cp_save_out
         .split_whitespace()
@@ -350,7 +382,10 @@ fn beta() {
 
     // Undo ONLY the agent checkpoint while preserving the human edit!
     let undo_cp_out = gitx_ok(root, &["checkpoint", "undo", &agent_cp_id]);
-    assert!(undo_cp_out.contains("Undid checkpoint"), "got:\n{undo_cp_out}");
+    assert!(
+        undo_cp_out.contains("Undid checkpoint"),
+        "got:\n{undo_cp_out}"
+    );
 
     let final_code = fs::read_to_string(root.join("lib.rs")).unwrap();
     assert!(
@@ -377,7 +412,11 @@ fn e2e_fleet_overlay_export_and_apply() {
     fs::write(machine_a.path().join(".env"), "TOKEN=abc123\n").unwrap();
     fs::write(machine_a.path().join(".env.local"), "DEBUG=1\n").unwrap();
     fs::create_dir_all(machine_a.path().join("node_modules/pkg")).unwrap();
-    fs::write(machine_a.path().join("node_modules/pkg/.env"), "SHOULD_NOT_EXPORT=1\n").unwrap();
+    fs::write(
+        machine_a.path().join("node_modules/pkg/.env"),
+        "SHOULD_NOT_EXPORT=1\n",
+    )
+    .unwrap();
 
     let exp_out = gitx_ok(
         machine_a.path(),
@@ -421,7 +460,10 @@ fn e2e_colocate_embargo_and_stack() {
     run_git_ok(root, &["commit", "-m", "Initial git commit"]);
 
     let init_out = gitx_ok(root, &["init", "--colocate"]);
-    assert!(init_out.contains("imported 1 commit(s) from Git"), "got:\n{init_out}");
+    assert!(
+        init_out.contains("imported 1 commit(s) from Git"),
+        "got:\n{init_out}"
+    );
 
     // Stack workflow
     fs::write(root.join("feature.txt"), "part 1\n").unwrap();
@@ -459,7 +501,10 @@ fn e2e_cli_secrets_never_stored_plaintext_in_cas_and_key_hardening() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
-    gitx_ok(root, &["init", "--name", "Sec", "--email", "sec@example.com"]);
+    gitx_ok(
+        root,
+        &["init", "--name", "Sec", "--email", "sec@example.com"],
+    );
     let canary = "SUPER_UNIQUE_PLAINTEXT_SECRET_CANARY_987654321";
     fs::write(root.join(".env"), format!("API_TOKEN={canary}\n")).unwrap();
     fs::write(root.join("public.txt"), "hello world\n").unwrap();

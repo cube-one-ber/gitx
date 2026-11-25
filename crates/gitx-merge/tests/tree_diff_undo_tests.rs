@@ -86,7 +86,10 @@ fn algebraic_tree_merge_stores_conflicts_and_supports_partial_resolution() {
     // Clean paths merged, conflicts recorded natively in tree
     assert!(result.clean_paths.contains(&"clean.txt".to_string()));
     assert!(result.clean_paths.contains(&"Cargo.toml".to_string()));
-    assert_eq!(result.conflict_paths, vec!["conflict_a.txt", "conflict_b.txt"]);
+    assert_eq!(
+        result.conflict_paths,
+        vec!["conflict_a.txt", "conflict_b.txt"]
+    );
     assert!(result.tree.has_conflicts());
     assert_eq!(
         result.tree.conflict_paths(),
@@ -179,10 +182,8 @@ fn algebraic_modify_delete_conflict_and_deletion_resolution() {
     assert!(term.adds[0].is_some());
     assert!(term.adds[1].is_none());
 
-    let mat = String::from_utf8(
-        materialize_conflict(&term, "gone.txt", |h| store.get(h)).unwrap(),
-    )
-    .unwrap();
+    let mat = String::from_utf8(materialize_conflict(&term, "gone.txt", |h| store.get(h)).unwrap())
+        .unwrap();
     assert!(mat.contains("modified by ours"));
     assert!(mat.contains("THEIRS (deleted)"));
 
@@ -226,7 +227,10 @@ fn diff_trees_and_unified_diff_statuses() {
         "conf.txt",
         EntryKind::Conflict {
             term: gitx_core::ConflictTerm {
-                adds: vec![Some(ObjectHash::of_bytes(b"1")), Some(ObjectHash::of_bytes(b"2"))],
+                adds: vec![
+                    Some(ObjectHash::of_bytes(b"1")),
+                    Some(ObjectHash::of_bytes(b"2")),
+                ],
                 removes: vec![Some(ObjectHash::of_bytes(b"0"))],
             },
             mode: FileMode::Regular,
@@ -262,7 +266,10 @@ fn render_interdiff_ignores_rebase_noise_and_shows_only_author_delta() {
         "src/feature.rs",
         store.file_entry(b"fn upstream() { 1 }\n\nfn helper() {}\n\nfn feature() { 10 }\n"),
     );
-    v1_base.insert("src/unrelated.rs", store.file_entry(b"pub const V: u32 = 1;\n"));
+    v1_base.insert(
+        "src/unrelated.rs",
+        store.file_entry(b"pub const V: u32 = 1;\n"),
+    );
 
     // v1_head: author implemented feature() -> 11
     let mut v1_head = v1_base.clone();
@@ -277,7 +284,10 @@ fn render_interdiff_ignores_rebase_noise_and_shows_only_author_delta() {
         "src/feature.rs",
         store.file_entry(b"fn upstream() { 2 }\n\nfn helper() {}\n\nfn feature() { 10 }\n"),
     );
-    v2_base.insert("src/unrelated.rs", store.file_entry(b"pub const V: u32 = 2;\n"));
+    v2_base.insert(
+        "src/unrelated.rs",
+        store.file_entry(b"pub const V: u32 = 2;\n"),
+    );
 
     // Case 1: pure mechanical rebase with ZERO author changes -> interdiff is empty!
     let mut v2_head_pure_rebase = v2_base.clone();
@@ -286,14 +296,11 @@ fn render_interdiff_ignores_rebase_noise_and_shows_only_author_delta() {
         store.file_entry(b"fn upstream() { 2 }\n\nfn helper() {}\n\nfn feature() { 11 }\n"),
     );
 
-    let pure_interdiff = render_interdiff(
-        &v1_base,
-        &v1_head,
-        &v2_base,
-        &v2_head_pure_rebase,
-        |h| store.get(h),
-    )
-    .unwrap();
+    let pure_interdiff =
+        render_interdiff(&v1_base, &v1_head, &v2_base, &v2_head_pure_rebase, |h| {
+            store.get(h)
+        })
+        .unwrap();
     assert!(
         pure_interdiff.is_empty(),
         "pure rebase should have empty interdiff, got:\n{pure_interdiff}"
@@ -306,13 +313,9 @@ fn render_interdiff_ignores_rebase_noise_and_shows_only_author_delta() {
         store.file_entry(b"fn upstream() { 2 }\n\nfn helper() {}\n\nfn feature() { 12 }\n"),
     );
 
-    let amended_interdiff = render_interdiff(
-        &v1_base,
-        &v1_head,
-        &v2_base,
-        &v2_head_amended,
-        |h| store.get(h),
-    )
+    let amended_interdiff = render_interdiff(&v1_base, &v1_head, &v2_base, &v2_head_amended, |h| {
+        store.get(h)
+    })
     .unwrap();
     assert!(amended_interdiff.contains("src/feature.rs"));
     assert!(amended_interdiff.contains("-fn feature() { 11 }"));
@@ -338,8 +341,8 @@ fn render_interdiff_handles_overlapping_rebase_conflict_fallback() {
     let mut v2_head = DomainTree::new(DomainId::public());
     v2_head.insert("val.txt", store.file_entry(b"val = 11\n"));
 
-    let interdiff = render_interdiff(&v1_base, &v1_head, &v2_base, &v2_head, |h| store.get(h))
-        .unwrap();
+    let interdiff =
+        render_interdiff(&v1_base, &v1_head, &v2_base, &v2_head, |h| store.get(h)).unwrap();
     assert!(interdiff.contains("v1/val.txt"));
     assert!(interdiff.contains("v2/val.txt"));
     assert!(interdiff.contains("+val = 11"));
@@ -361,7 +364,8 @@ fn revert_agent_step_preserves_subsequent_human_edits() {
     // TOML file: agent added `bad_crate`, human later added `good_crate` -> undo removes only `bad_crate`
     let before_toml = b"[dependencies]\nserde = \"1\"\n";
     let after_toml = b"[dependencies]\nserde = \"1\"\nbad_crate = \"0.1\"\n";
-    let current_toml = b"[dependencies]\nserde = \"1\"\nbad_crate = \"0.1\"\ngood_crate = \"2.0\"\n";
+    let current_toml =
+        b"[dependencies]\nserde = \"1\"\nbad_crate = \"0.1\"\ngood_crate = \"2.0\"\n";
 
     let toml_outcome = revert_agent_step("Cargo.toml", before_toml, after_toml, current_toml);
     match toml_outcome {

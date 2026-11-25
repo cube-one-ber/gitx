@@ -8,9 +8,7 @@ use crate::repo::Repo;
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use gitx_server::{
-    CommitResponse, DrainResponse, EnqueueResponse, QueueListResponse, QueueStatus,
-};
+use gitx_server::{CommitResponse, DrainResponse, EnqueueResponse, QueueListResponse, QueueStatus};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::env;
@@ -106,8 +104,7 @@ pub fn cmd_queue_enqueue(
             }
         }
 
-        let (mut upload, deletions) =
-            build_push_delta(&local_files, is_default_acl, &remote_files);
+        let (mut upload, deletions) = build_push_delta(&local_files, is_default_acl, &remote_files);
         if upload.is_empty() && deletions.is_empty() {
             if let Some(acl_bytes) = local_files.get(".gitxacl") {
                 upload.insert(".gitxacl".to_string(), BASE64_STANDARD.encode(acl_bytes));
@@ -261,9 +258,11 @@ pub fn cmd_queue_drain(
         parse_json_response(resp, "drain merge queue").await
     })?;
 
-    if let (Some(repo), Some(remote_name), Some(new_head)) =
-        (maybe_repo.as_ref(), resolved.name.as_deref(), drain.new_head.as_deref())
-        && let Ok(mut cfg) = load_remotes(&repo.gitx_dir)
+    if let (Some(repo), Some(remote_name), Some(new_head)) = (
+        maybe_repo.as_ref(),
+        resolved.name.as_deref(),
+        drain.new_head.as_deref(),
+    ) && let Ok(mut cfg) = load_remotes(&repo.gitx_dir)
         && let Some(entry) = cfg.remotes.get_mut(remote_name)
     {
         entry

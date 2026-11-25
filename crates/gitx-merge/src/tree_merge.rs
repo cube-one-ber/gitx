@@ -131,11 +131,7 @@ where
             }
             // Modify/delete, delete/modify, encrypted secret divergence, or algebraic conflict propagation
             _ => {
-                let term = combine_terms(
-                    entry_to_term(b),
-                    entry_to_term(o),
-                    entry_to_term(t),
-                );
+                let term = combine_terms(entry_to_term(b), entry_to_term(o), entry_to_term(t));
                 let mode = preferred_mode(b, o, t);
 
                 if term.is_resolved() {
@@ -182,11 +178,7 @@ where
 }
 
 /// Render human-readable conflict markers on demand from an algebraic `ConflictTerm`.
-pub fn materialize_conflict<F>(
-    term: &ConflictTerm,
-    path: &str,
-    read_blob: F,
-) -> Result<Vec<u8>>
+pub fn materialize_conflict<F>(term: &ConflictTerm, path: &str, read_blob: F) -> Result<Vec<u8>>
 where
     F: Fn(ObjectHash) -> Result<Vec<u8>>,
 {

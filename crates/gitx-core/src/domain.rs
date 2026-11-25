@@ -122,7 +122,11 @@ impl VisibilityPolicy {
         }
     }
 
-    pub fn embargoed(advisory_id: impl Into<String>, allowed_domains: Vec<DomainId>, disclose_at: Option<DateTime<Utc>>) -> Result<Self> {
+    pub fn embargoed(
+        advisory_id: impl Into<String>,
+        allowed_domains: Vec<DomainId>,
+        disclose_at: Option<DateTime<Utc>>,
+    ) -> Result<Self> {
         let advisory = advisory_id.into();
         let primary_domain = DomainId::embargo(&advisory)?;
         Ok(Self {
@@ -139,6 +143,7 @@ impl VisibilityPolicy {
     /// Returns `true` if a ChangeSet with this policy belongs to the public projection
     /// (public primary domain and NOT under an active embargo; published embargoes are public).
     pub fn is_publicly_visible(&self) -> bool {
-        self.primary_domain.is_public() && !matches!(self.embargo, Some(EmbargoState::Active { .. }))
+        self.primary_domain.is_public()
+            && !matches!(self.embargo, Some(EmbargoState::Active { .. }))
     }
 }

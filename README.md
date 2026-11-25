@@ -22,7 +22,7 @@ node --test packages/gitx-ts/tests/*.test.ts
 # Run GitX vs. Git benchmarks
 cargo run --release --bin gitx-bench
 
-# Run the CLI (26 top-level commands)
+# Run the CLI (31 top-level commands)
 cargo run --bin gitx -- --help
 ```
 
@@ -42,18 +42,26 @@ gitx git-export /tmp/public-mirror --domains public
 
 # Lock-free workspaces (in-memory, CoW reflink, demand-paged lazy, or OS virtual mount)
 gitx ws add agent-1 --lazy
-gitx ws mount agent-1 /tmp/agent-1-mnt --backend fuse      # or --backend loopback
+gitx ws mount agent-1 /tmp/agent-1-mnt --backend fuse      # or --backend nfs3 | loopback
 gitx ws unmount /tmp/agent-1-mnt
 
 # Tree-sitter AST symbol inspection (Rust, TypeScript, TSX, JavaScript)
 gitx symbols src/lib.rs --json
+
+# Hunk-level interactive or scriptable commit splitting
+gitx split --hunks src/lib.rs:1,3 -m "Split specific hunks"
+gitx split -p -m "Interactive hunk split"
 ```
 
 ### Always-Online Server, Zero-Clone RPCs, Merge Queue & MCP
 
 ```bash
-# Start the always-online HTTP/JSON + ACL-filtered Git Smart HTTP server
+# Start the always-online HTTP/JSON + gRPC + Git Smart HTTP + optional russh SSH / PostgreSQL / S3-R2-GCS server
 gitx serve --addr 127.0.0.1:7878
+# Optional production flags:
+#   --ssh-addr 127.0.0.1:2222 --ssh-key "user=alice;teams=core|ssh-ed25519 AAAA..."
+#   --postgres-url postgres://gitx:pass@127.0.0.1:5432/gitx
+#   --object-store s3://my-bucket/prefix?region=us-east-1  # or r2://acct/bucket, gcs://bucket
 
 # Configure a remote, push-to-create, pull, and run zero-clone server queries
 gitx remote add origin http://127.0.0.1:7878/acme/app --token "user=alice;teams=core"
@@ -62,6 +70,8 @@ gitx pull origin
 gitx remote grep "fn main"
 gitx remote diff master~1 master
 gitx remote blame src/lib.rs
+gitx remote symbols
+gitx remote rebase <changeset-id> --onto master
 gitx remote log --limit 10
 gitx remote stats
 
@@ -111,17 +121,17 @@ Measured on Linux (250-file repo, debug build):
 gitx/
 ├── crates/
 │   ├── gitx-core/         # ChangeSet, ChangeId, BLAKE3, FastCDC, VisibilityDomain, ConflictSet, OpLog
-│   ├── gitx-crypto/       # Envelope encryption (X25519 + ChaCha20), key epochs, .gitxacl, secret scanner
-│   ├── gitx-store/        # SQLite WAL + LZ4 FastCDC CAS (`LocalStore`), `MemoryStore`, `TieredObjectStore` (`object_store`), SQL metadata + Postgres DDL
+│   ├── gitx-crypto/       # Envelope encryption (X25519 + ChaCha20), passphrase OpenSSH Ed25519, KMS/OIDC, .gitxacl, secret scanner
+│   ├── gitx-store/        # SQLite WAL + LZ4 FastCDC CAS (`LocalStore`), `MemoryStore`, `TieredObjectStore` (`object_store`), live PostgreSQL (`tokio-postgres`) + SQLite metadata
 │   ├── gitx-merge/        # 3-way line merge, JSON/TOML key merge, Tree-sitter AST merge (RS/TS/TSX/JS), interdiffs
-│   ├── gitx-vfs/          # `MemVfs`, reflink `CowWorkspace`, demand-paged `LazyWorkspace`, Linux FUSE3 & loopback VFS mounts, encrypted fleet sync
-│   ├── gitx-context/      # Sub-commit agent checkpoints & durable `gitx why` store with fuzzy anchor relocation
-│   ├── gitx-git-bridge/   # Pure-Rust Git objects, ACL-filtered projection (`git fsck` verified), colocated import, Smart HTTP & SSH transport adapter
+│   ├── gitx-vfs/          # `MemVfs`, reflink `CowWorkspace`, demand-paged `LazyWorkspace`, Linux FUSE3, RFC 1813 NFSv3 & loopback mounts, encrypted fleet + WIP sync
+│   ├── gitx-context/      # Sub-commit agent checkpoints & durable `gitx why` store with Tree-sitter AST & fuzzy anchor relocation
+│   ├── gitx-git-bridge/   # Pure-Rust Git objects & `gitoxide` (`gix`) importer, ACL-filtered projection (`git fsck` verified), Smart HTTP & SSH transport adapter
 │   ├── gitx-proto/        # Protobuf / Tonic gRPC definitions (`proto/gitx.proto`) for client-server & zero-clone RPCs
-│   ├── gitx-server/       # Always-online Axum + Tonic gRPC server, zero-clone RPCs, Derived Data Engine, batched merge queue, Git HTTP
+│   ├── gitx-server/       # Always-online Axum + Tonic gRPC + `russh` SSH server, zero-clone RPCs, Derived Data Engine (`SymbolIndex`, trigrams), batched merge queue, Git HTTP
 │   ├── gitx-sdk/          # Zero-disk `AgentRepo` SDK + 13-tool JSON-RPC 2.0 MCP server
 │   ├── gitx-wasm/         # Pure-Rust `wasm32-wasip1` linear-memory ABI bindings over `AgentRepo`, `MemVfs`, merge, ACLs & MCP
-│   ├── gitx-cli/          # Single static `gitx` binary (26 commands: local, remote, push/pull, queue, mount, serve, mcp) + E2E tests
+│   ├── gitx-cli/          # Single static `gitx` binary (31 commands: local, stack/split, remote, push/pull, queue, mount, serve, mcp) + E2E tests
 │   └── gitx-sim/          # Hermetic crash/OpLog simulator, adversarial ACL fuzzer, 32-agent merge stress test & `gitx-bench`
 └── packages/
     └── gitx-ts/           # Zero-dependency `@gitx/sdk` TypeScript SDK (`WasmAgentRepo`, `GitxServerClient`, `GitxMcpClient`)
@@ -142,12 +152,14 @@ See [packages/gitx-ts/README.md](packages/gitx-ts/README.md) for TypeScript and 
 | **Phase 4** | `vfs://` lazy virtualized mounts (Linux FUSE3 + TCP loopback VFS), in-memory Agent/MCP/WASM/TS SDK (`@gitx/sdk`), encrypted multi-machine fleet sync | **Implemented** |
 | **Phase 5** | Sub-commit agent checkpoints, durable `gitx why` context store, batched agentic merge queue, hermetic simulation & fuzzing | **Implemented** |
 
-### Current Scope & Production Hardening
+### Production Capabilities & Deployment Notes
 
-GitX is currently an end-to-end functional implementation with the following remaining production-hardening items:
+All planned architecture milestones (Phases 0–5) are implemented end-to-end across the 13 Rust crates and `@gitx/sdk`:
 
-- **PostgreSQL Runtime Driver:** `gitx-store` includes validated `PostgresConfig` and versioned `POSTGRES_MIGRATIONS` DDL; runtime SQL execution currently runs on SQLite (`rusqlite`) alongside `TieredObjectStore` (`InMemory` / `FS` / S3 / R2 / GCS).
-- **Kernel macOS Virtual Mount:** Linux supports kernel FUSE3 (`fuser`); cross-platform/macOS loopback uses a custom TCP NFSv3-style RPC mount rather than kernel RFC 1813 NFSv3/FSKit.
-- **Git Interop Backend:** Colocated import and Git Smart HTTP/SSH projections use pure-Rust object writers paired with `git` transport subprocesses rather than `gitoxide` (`gix`).
+- **Live PostgreSQL & Tiered Object Storage:** `gitx-store` runs both embedded SQLite (`rusqlite`) and a live `tokio-postgres` runtime driver (`gitx serve --postgres-url postgres://...`) with versioned `POSTGRES_MIGRATIONS`, paired with `TieredObjectStore` supporting `memory://`, `fs://`, `s3://`, `r2://`, and `gcs://`/`gs://`.
+- **Kernel-Native Virtual Mounts:** Linux supports kernel FUSE3 (`fuser`), while macOS and cross-platform loopback support a real RFC 1813 NFSv3 + MOUNTv3 server over ONC-RPC v2 TCP (`gitx ws mount --backend nfs3`) as well as the custom loopback VFS protocol (`--backend loopback`).
+- **Pure-Rust Git Interop & Live SSH Server:** Colocated `.git` import runs directly via `gitoxide` (`gix`) with zero `git` CLI subprocesses (including packed packfiles & delta chains), colocated mode continuously syncs the `public` domain projection to `.git` after mutating operations, and `gitx-server` includes a live async `russh` SSH server (`gitx serve --ssh-addr ...`) enforcing Visibility Domains over `git-upload-pack` and `git-receive-pack`.
+- **Enterprise Crypto & Fleet Sync:** Supports passphrase-protected OpenSSH Ed25519 keys (`gitx secret import-ssh --passphrase`), pluggable KMS DEK wrapping (`KeyWrapProvider` / `KmsHybridEnvelope` / `LocalKmsProvider`), EdDSA OIDC JWT verification (`OidcVerifier`), and encrypted cross-machine WIP `ChangeSet` + `.env` overlay sync (`gitx fleet sync --include-wip`).
+- **Full HTTP + gRPC + TS SDK Parity:** Zero-clone server APIs cover `commit` (with `secret_envelopes`), `tree`, `blob`, `diff`, `grep`, `blame`, `log`, `why`, `symbols` (derived domain-partitioned AST `SymbolIndex`), `rebase`, `land`, `revert`, `publish_embargo`, `fleet`, and batched merge queue RPCs across HTTP/JSON, Tonic gRPC, CLI, and `@gitx/sdk`.
 
 Read the complete specification and verification plan in **[PLAN.md](PLAN.md)**.

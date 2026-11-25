@@ -417,7 +417,11 @@ impl ContextStore {
             .filter(|rec| rec.change_id == change_id && rec.is_visible_to(allowed_domains))
             .cloned()
             .collect();
-        records.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        records.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(records)
     }
 
@@ -440,12 +444,15 @@ impl ContextStore {
                 .records
                 .values()
                 .filter(|rec| {
-                    rec.is_visible_to(allowed_domains)
-                        && rec.anchors.iter().any(|a| a.path == path)
+                    rec.is_visible_to(allowed_domains) && rec.anchors.iter().any(|a| a.path == path)
                 })
                 .cloned()
                 .collect();
-            list.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+            list.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            });
             list
         };
 
@@ -489,7 +496,11 @@ impl ContextStore {
             .filter(|cp| cp.workspace == workspace)
             .cloned()
             .collect();
-        checkpoints.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        checkpoints.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         checkpoints.truncate(limit);
         Ok(checkpoints)
     }

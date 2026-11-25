@@ -229,11 +229,7 @@ impl CowWorkspace {
         Ok(trees)
     }
 
-    fn ensure_pool_blob(
-        &self,
-        blob_hash: ObjectHash,
-        store: &dyn ObjectStore,
-    ) -> Result<PathBuf> {
+    fn ensure_pool_blob(&self, blob_hash: ObjectHash, store: &dyn ObjectStore) -> Result<PathBuf> {
         let pool_path = self.pool_path_for(blob_hash);
         if pool_path.is_file() {
             return Ok(pool_path);
@@ -425,7 +421,8 @@ impl WorkspaceBackend for CowWorkspace {
 
         // Pre-validate that no tree entry writes beneath a symlink entry in the same tree.
         let mut symlink_paths: BTreeSet<String> = BTreeSet::new();
-        let mut normalized_entries: Vec<(String, &EntryKind)> = Vec::with_capacity(tree.entries.len());
+        let mut normalized_entries: Vec<(String, &EntryKind)> =
+            Vec::with_capacity(tree.entries.len());
         for (raw_path, kind) in &tree.entries {
             let norm = normalize_rel_path(raw_path)?;
             if matches!(
@@ -567,7 +564,11 @@ fn path_to_slash_string(path: &Path) -> String {
         .join("/")
 }
 
-fn is_unchanged_regular_file(dest: &Path, expected_blob: ObjectHash, expected_size: u64) -> Result<bool> {
+fn is_unchanged_regular_file(
+    dest: &Path,
+    expected_blob: ObjectHash,
+    expected_size: u64,
+) -> Result<bool> {
     let meta = match fs::symlink_metadata(dest) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),

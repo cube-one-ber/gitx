@@ -346,9 +346,7 @@ impl FuseCore {
         let mut buf = if start == 0 && current_size == 0 {
             Vec::with_capacity(data.len())
         } else {
-            self.workspace
-                .read_file(&path)
-                .map_err(gitx_err_to_errno)?
+            self.workspace.read_file(&path).map_err(gitx_err_to_errno)?
         };
 
         if end > buf.len() {
@@ -401,10 +399,7 @@ impl FuseCore {
                     .write_file(&path, &[], new_mode)
                     .map_err(gitx_err_to_errno)?;
             } else {
-                let mut bytes = self
-                    .workspace
-                    .read_file(&path)
-                    .map_err(gitx_err_to_errno)?;
+                let mut bytes = self.workspace.read_file(&path).map_err(gitx_err_to_errno)?;
                 bytes.resize(target_len, 0);
                 self.workspace
                     .write_file(&path, &bytes, new_mode)
@@ -412,10 +407,7 @@ impl FuseCore {
             }
             self.mtime = SystemTime::now();
         } else if new_mode != old_mode {
-            let bytes = self
-                .workspace
-                .read_file(&path)
-                .map_err(gitx_err_to_errno)?;
+            let bytes = self.workspace.read_file(&path).map_err(gitx_err_to_errno)?;
             self.workspace
                 .write_file(&path, &bytes, new_mode)
                 .map_err(gitx_err_to_errno)?;
@@ -1312,7 +1304,9 @@ impl Filesystem for GitxFuseFs {
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         let core = self.core.lock().unwrap_or_else(|e| e.into_inner());
         let files = core.stats().total_virtual_files as u64;
-        reply.statfs(1_000_000, 500_000, 500_000, files, 1_000_000, BLOCK_SIZE, 255, BLOCK_SIZE);
+        reply.statfs(
+            1_000_000, 500_000, 500_000, files, 1_000_000, BLOCK_SIZE, 255, BLOCK_SIZE,
+        );
     }
 
     fn access(&mut self, _req: &Request<'_>, ino: u64, _mask: i32, reply: ReplyEmpty) {
@@ -1392,10 +1386,7 @@ impl FuseMountHandle {
     }
 
     pub fn stats(&self) -> LazyStats {
-        self.core
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stats()
+        self.core.lock().unwrap_or_else(|e| e.into_inner()).stats()
     }
 
     pub fn snapshot(&self, domain: DomainId) -> Result<DomainTree> {

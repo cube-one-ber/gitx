@@ -1,4 +1,7 @@
-//! Colocated Git repository importer (`git` CLI -> `gitx-store`).
+//! Pure-Rust colocated Git repository importer powered by `gitoxide` (`gix`).
+//!
+//! Reads loose objects, packfiles, delta chains, refs, commits, trees, and blobs directly
+//! from `.git` without spawning any `git` CLI subprocesses.
 
 use chrono::{DateTime, Utc};
 use gitx_core::{
@@ -6,11 +9,10 @@ use gitx_core::{
     ObjectHash, Result, VisibilityPolicy,
 };
 use gitx_store::ObjectStore;
+use gix::bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 /// Summary of an import from an existing Git repository into `gitx-store`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,7 +23,9 @@ pub struct ImportReport {
 }
 
 struct ParsedCommitMeta {
-    parents: Vec<String>,
+    oid: gix::ObjectId,
+    tree_oid: gix::ObjectId,
+    parents: Vec<gix::ObjectId>,
     author: Identity,
     committer: Identity,
     created_at: DateTime<Utc>,
@@ -30,116 +34,49 @@ struct ParsedCommitMeta {
 
 struct ParsedTreeEntry {
     mode: FileMode,
-    blob_sha: String,
+    blob_oid: gix::ObjectId,
     path: String,
 }
 
-fn run_git_output(git_worktree: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(git_worktree)
-        .args(args)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitxError::GitBridge(format!(
-            "git {} failed (status {}): {}",
-            args.join(" "),
-            output.status,
-            stderr.trim()
-        )));
-    }
-    Ok(output.stdout)
-}
-
-fn detect_branch_name(git_worktree: &Path) -> String {
-    match Command::new("git")
-        .arg("-C")
-        .arg(git_worktree)
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if name.is_empty() {
-                "HEAD".to_string()
-            } else {
-                name
-            }
-        }
-        _ => "HEAD".to_string(),
-    }
-}
-
-fn head_exists(git_worktree: &Path) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(git_worktree)
-        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
-        .output()?;
-    Ok(output.status.success())
-}
-
-fn read_commit_meta(git_worktree: &Path, sha: &str) -> Result<ParsedCommitMeta> {
-    let raw = run_git_output(
-        git_worktree,
-        &[
-            "show",
-            "-s",
-            "--pretty=format:%P%x00%an%x00%ae%x00%at%x00%cn%x00%ce%x00%ct%x00%B",
-            sha,
-        ],
-    )?;
-
-    let text = String::from_utf8_lossy(&raw);
-    let parts: Vec<&str> = text.splitn(8, '\0').collect();
-    if parts.len() != 8 {
-        return Err(GitxError::GitBridge(format!(
-            "unexpected git show output for commit {sha}: got {} fields",
-            parts.len()
-        )));
-    }
-
-    let parents: Vec<String> = parts[0]
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect();
-    let author_name = parts[1].to_string();
-    let author_email = parts[2].to_string();
-    let author_ts: i64 = parts[3].trim().parse().map_err(|e| {
-        GitxError::GitBridge(format!(
-            "invalid author timestamp '{}' in commit {sha}: {e}",
-            parts[3]
-        ))
-    })?;
-    let committer_name = parts[4].to_string();
-    let committer_email = parts[5].to_string();
-    let _committer_ts: i64 = parts[6].trim().parse().map_err(|e| {
-        GitxError::GitBridge(format!(
-            "invalid committer timestamp '{}' in commit {sha}: {e}",
-            parts[6]
-        ))
+fn parse_commit_with_gix(repo: &gix::Repository, oid: gix::ObjectId) -> Result<ParsedCommitMeta> {
+    let obj = repo
+        .find_object(oid)
+        .map_err(|e| GitxError::GitBridge(format!("gitoxide failed to find commit {oid}: {e}")))?;
+    let commit = obj
+        .try_into_commit()
+        .map_err(|e| GitxError::GitBridge(format!("gitoxide object {oid} is not a commit: {e}")))?;
+    let decoded = commit.decode().map_err(|e| {
+        GitxError::GitBridge(format!("gitoxide failed to decode commit {oid}: {e}"))
     })?;
 
-    // Strip the single trailing newline that Git appends to standard commit messages.
-    let description = parts[7]
-        .strip_suffix('\n')
-        .unwrap_or(parts[7])
-        .to_string();
+    let tree_oid = decoded.tree();
+    let parents: Vec<gix::ObjectId> = decoded.parents().collect();
 
+    let author_sig = decoded.author().map_err(|e| {
+        GitxError::GitBridge(format!("gitoxide invalid author in commit {oid}: {e}"))
+    })?;
+    let committer_sig = decoded.committer().map_err(|e| {
+        GitxError::GitBridge(format!("gitoxide invalid committer in commit {oid}: {e}"))
+    })?;
+
+    let author_ts = author_sig.time().map(|t| t.seconds).unwrap_or(0);
     let created_at = DateTime::from_timestamp(author_ts, 0).unwrap_or_else(Utc::now);
 
+    let raw_msg = decoded.message.to_str_lossy();
+    let description = raw_msg.strip_suffix('\n').unwrap_or(&raw_msg).to_string();
+
     Ok(ParsedCommitMeta {
+        oid,
+        tree_oid,
         parents,
         author: Identity {
-            name: author_name,
-            email: author_email,
+            name: author_sig.name.to_str_lossy().into_owned(),
+            email: author_sig.email.to_str_lossy().into_owned(),
             key_fingerprint: None,
         },
         committer: Identity {
-            name: committer_name,
-            email: committer_email,
+            name: committer_sig.name.to_str_lossy().into_owned(),
+            email: committer_sig.email.to_str_lossy().into_owned(),
             key_fingerprint: None,
         },
         created_at,
@@ -147,197 +84,156 @@ fn read_commit_meta(git_worktree: &Path, sha: &str) -> Result<ParsedCommitMeta> 
     })
 }
 
-fn list_tree_entries(git_worktree: &Path, sha: &str) -> Result<Vec<ParsedTreeEntry>> {
-    let raw = run_git_output(git_worktree, &["ls-tree", "-r", "-z", sha])?;
-    let mut entries = Vec::new();
-
-    for record in raw.split(|&b| b == 0) {
-        if record.is_empty() {
-            continue;
-        }
-        let tab_pos = record.iter().position(|&b| b == b'\t').ok_or_else(|| {
-            GitxError::GitBridge(format!("malformed ls-tree record in commit {sha}"))
+fn collect_tree_entries_gix(
+    repo: &gix::Repository,
+    tree_oid: gix::ObjectId,
+    prefix: &str,
+    out: &mut Vec<ParsedTreeEntry>,
+) -> Result<()> {
+    let tree = repo.find_tree(tree_oid).map_err(|e| {
+        GitxError::GitBridge(format!("gitoxide failed to find tree {tree_oid}: {e}"))
+    })?;
+    for entry_res in tree.iter() {
+        let entry = entry_res
+            .map_err(|e| GitxError::GitBridge(format!("gitoxide tree entry decode error: {e}")))?;
+        let name = entry.filename().to_str().map_err(|e| {
+            GitxError::GitBridge(format!("non-UTF8 filename in git tree {tree_oid}: {e}"))
         })?;
-        let meta = std::str::from_utf8(&record[..tab_pos]).map_err(|e| {
-            GitxError::GitBridge(format!("non-UTF8 ls-tree metadata in commit {sha}: {e}"))
-        })?;
-        let path = String::from_utf8(record[tab_pos + 1..].to_vec()).map_err(|e| {
-            GitxError::GitBridge(format!("non-UTF8 file path in commit {sha}: {e}"))
-        })?;
-
-        let mut meta_parts = meta.split(' ');
-        let mode_str = meta_parts.next().unwrap_or("");
-        let kind = meta_parts.next().unwrap_or("");
-        let blob_sha = meta_parts.next().unwrap_or("");
-
-        if kind != "blob" {
-            // Skip gitlinks (submodules, mode 160000) or non-blob entries.
-            continue;
-        }
-
-        let mode = match mode_str {
-            "100644" => FileMode::Regular,
-            "100755" => FileMode::Executable,
-            "120000" => FileMode::Symlink,
-            other => {
-                return Err(GitxError::GitBridge(format!(
-                    "unsupported git blob mode '{other}' for '{path}' in commit {sha}"
-                )));
-            }
+        let rel_path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
         };
 
-        entries.push(ParsedTreeEntry {
-            mode,
-            blob_sha: blob_sha.to_string(),
-            path,
-        });
+        use gix::objs::tree::EntryKind as GitEntryKind;
+        match entry.mode().kind() {
+            GitEntryKind::Tree => {
+                collect_tree_entries_gix(repo, entry.oid().to_owned(), &rel_path, out)?;
+            }
+            GitEntryKind::Blob => {
+                out.push(ParsedTreeEntry {
+                    mode: FileMode::Regular,
+                    blob_oid: entry.oid().to_owned(),
+                    path: rel_path,
+                });
+            }
+            GitEntryKind::BlobExecutable => {
+                out.push(ParsedTreeEntry {
+                    mode: FileMode::Executable,
+                    blob_oid: entry.oid().to_owned(),
+                    path: rel_path,
+                });
+            }
+            GitEntryKind::Link => {
+                out.push(ParsedTreeEntry {
+                    mode: FileMode::Symlink,
+                    blob_oid: entry.oid().to_owned(),
+                    path: rel_path,
+                });
+            }
+            GitEntryKind::Commit => {
+                // Skip submodule gitlinks cleanly.
+            }
+        }
     }
-
-    Ok(entries)
+    Ok(())
 }
 
-/// Reads a batch of Git blobs cleanly using a single `git cat-file --batch` invocation.
-fn read_blobs_batch(
-    git_worktree: &Path,
-    blob_shas: &[String],
-) -> Result<HashMap<String, Vec<u8>>> {
-    if blob_shas.is_empty() {
-        return Ok(HashMap::new());
-    }
+/// Topologically sort all commits reachable from `head_oid` (parents strictly before children).
+fn load_commits_topo_order(
+    repo: &gix::Repository,
+    head_oid: gix::ObjectId,
+) -> Result<Vec<ParsedCommitMeta>> {
+    let mut loaded: HashMap<gix::ObjectId, ParsedCommitMeta> = HashMap::new();
+    let mut queue: VecDeque<gix::ObjectId> = VecDeque::new();
+    queue.push_back(head_oid);
 
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(git_worktree)
-        .args(["cat-file", "--batch"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GitxError::GitBridge("failed to open stdin for git cat-file".into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitxError::GitBridge("failed to open stdout for git cat-file".into()))?;
-
-    // Write all requested blob SHAs on a helper thread so large batches cannot deadlock pipes.
-    let input_bytes: Vec<u8> = {
-        let mut buf = Vec::with_capacity(blob_shas.len() * 41);
-        for sha in blob_shas {
-            buf.extend_from_slice(sha.as_bytes());
-            buf.push(b'\n');
+    while let Some(oid) = queue.pop_front() {
+        if loaded.contains_key(&oid) {
+            continue;
         }
-        buf
-    };
-    let writer = std::thread::spawn(move || -> std::io::Result<()> {
-        match stdin.write_all(&input_bytes) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
-            Err(err) => return Err(err),
-        }
-        match stdin.flush() {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
-            Err(err) => return Err(err),
-        }
-        drop(stdin);
-        Ok(())
-    });
-
-    struct ChildGuard {
-        child: Option<std::process::Child>,
-        writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
-    }
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            if let Some(writer) = self.writer.take() {
-                let _ = writer.join();
+        let meta = parse_commit_with_gix(repo, oid)?;
+        for &p in &meta.parents {
+            if !loaded.contains_key(&p) {
+                queue.push_back(p);
             }
         }
+        loaded.insert(oid, meta);
     }
 
-    let mut guard = ChildGuard {
-        child: Some(child),
-        writer: Some(writer),
-    };
+    let mut children: HashMap<gix::ObjectId, Vec<gix::ObjectId>> =
+        HashMap::with_capacity(loaded.len());
+    let mut in_degree: HashMap<gix::ObjectId, usize> = HashMap::with_capacity(loaded.len());
 
-    let mut reader = BufReader::new(stdout);
-    let mut results = HashMap::with_capacity(blob_shas.len());
-
-    for expected_sha in blob_shas {
-        let mut header_line = String::new();
-        let n = reader.read_line(&mut header_line)?;
-        if n == 0 {
-            return Err(GitxError::GitBridge(format!(
-                "unexpected EOF from git cat-file --batch while reading blob {expected_sha}"
-            )));
+    for (&oid, meta) in &loaded {
+        let mut uniq_parents = HashSet::new();
+        let mut deg = 0usize;
+        for &p in &meta.parents {
+            if loaded.contains_key(&p) && uniq_parents.insert(p) {
+                children.entry(p).or_default().push(oid);
+                deg += 1;
+            }
         }
-        let header = header_line.trim_end_matches(['\r', '\n']);
-        let parts: Vec<&str> = header.split(' ').collect();
-        if parts.len() != 3 || parts[1] != "blob" {
-            return Err(GitxError::GitBridge(format!(
-                "unexpected git cat-file --batch header for {expected_sha}: '{header}'"
-            )));
+        in_degree.insert(oid, deg);
+    }
+
+    let mut ready: BTreeSet<(DateTime<Utc>, gix::ObjectId)> = BTreeSet::new();
+    for (&oid, &deg) in &in_degree {
+        if deg == 0 {
+            ready.insert((loaded[&oid].created_at, oid));
         }
-        let size: usize = parts[2].parse().map_err(|e| {
-            GitxError::GitBridge(format!(
-                "invalid blob size '{}' for {expected_sha}: {e}",
-                parts[2]
-            ))
-        })?;
-
-        let mut data = vec![0u8; size];
-        reader.read_exact(&mut data)?;
-
-        // Consume trailing LF after payload.
-        let mut lf = [0u8; 1];
-        reader.read_exact(&mut lf)?;
-
-        results.insert(expected_sha.clone(), data);
     }
 
-    drop(reader);
-    if let Some(writer) = guard.writer.take() {
-        writer
-            .join()
-            .map_err(|_| GitxError::GitBridge("git cat-file stdin writer thread panicked".into()))??;
+    let mut ordered = Vec::with_capacity(loaded.len());
+    while let Some((_, oid)) = ready.pop_first() {
+        if let Some(child_ids) = children.get(&oid) {
+            for &child in child_ids {
+                if let Some(deg) = in_degree.get_mut(&child) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        ready.insert((loaded[&child].created_at, child));
+                    }
+                }
+            }
+        }
+        if let Some(meta) = loaded.remove(&oid) {
+            ordered.push(meta);
+        }
     }
 
-    let child = guard.child.take().expect("child still present");
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitxError::GitBridge(format!(
-            "git cat-file --batch failed: {}",
-            stderr.trim()
-        )));
+    if !loaded.is_empty() {
+        return Err(GitxError::GitBridge(
+            "cycle detected in imported Git commit graph".into(),
+        ));
     }
-
-    Ok(results)
+    Ok(ordered)
 }
 
 /// Imports an existing Git repository (working tree or bare repo) losslessly into `store`
-/// under `target_domain`.
-///
-/// Uses the real `git` CLI (`rev-list`, `ls-tree`, `cat-file --batch`, `show`) so packed objects,
-/// delta packs, symlinks, executable bits, and arbitrary binary blobs import cleanly.
+/// under `target_domain` using pure-Rust **`gitoxide` (`gix`)**—no `git` CLI subprocesses.
 pub fn import_from_git_repo(
     git_worktree: &Path,
     store: &dyn ObjectStore,
     target_domain: DomainId,
 ) -> Result<ImportReport> {
-    // Verify the directory is a valid Git repository.
-    run_git_output(git_worktree, &["rev-parse", "--git-dir"])?;
+    let repo = gix::open(git_worktree).map_err(|e| {
+        GitxError::GitBridge(format!(
+            "gitoxide failed to open repository '{}': {e}",
+            git_worktree.display()
+        ))
+    })?;
 
-    let branch = detect_branch_name(git_worktree);
-    if !head_exists(git_worktree)? {
+    let mut head = repo
+        .head()
+        .map_err(|e| GitxError::GitBridge(format!("gitoxide failed to read HEAD: {e}")))?;
+
+    let branch = head
+        .referent_name()
+        .map(|n| n.shorten().to_str_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    if head.is_unborn() {
         return Ok(ImportReport {
             imported_commits: 0,
             head_changeset: None,
@@ -345,19 +241,24 @@ pub fn import_from_git_repo(
         });
     }
 
-    let rev_list_raw =
-        run_git_output(git_worktree, &["rev-list", "--topo-order", "--reverse", "HEAD"])?;
-    let commits: Vec<String> = String::from_utf8_lossy(&rev_list_raw)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let head_commit = match head.peel_to_commit() {
+        Ok(c) => c,
+        Err(_) => {
+            return Ok(ImportReport {
+                imported_commits: 0,
+                head_changeset: None,
+                branch,
+            });
+        }
+    };
+    let head_oid = head_commit.id().detach();
 
-    let mut git_to_gitx: HashMap<String, ObjectHash> = HashMap::with_capacity(commits.len());
-    let mut git_to_pub_proj: HashMap<String, ObjectHash> = HashMap::with_capacity(commits.len());
-    // Cache git blob SHA -> (ChunkedBlob manifest hash, byte size).
-    let mut blob_cache: HashMap<String, (ObjectHash, u64)> = HashMap::new();
+    let commits = load_commits_topo_order(&repo, head_oid)?;
+
+    let mut git_to_gitx: HashMap<gix::ObjectId, ObjectHash> = HashMap::with_capacity(commits.len());
+    let mut git_to_pub_proj: HashMap<gix::ObjectId, ObjectHash> =
+        HashMap::with_capacity(commits.len());
+    let mut blob_cache: HashMap<gix::ObjectId, (ObjectHash, u64)> = HashMap::new();
     let mut head_changeset: Option<ObjectHash> = None;
 
     let visibility = if target_domain.is_public() {
@@ -366,36 +267,27 @@ pub fn import_from_git_repo(
         VisibilityPolicy::private(target_domain.clone(), false)
     };
 
-    for sha in &commits {
-        let meta = read_commit_meta(git_worktree, sha)?;
-        let tree_entries = list_tree_entries(git_worktree, sha)?;
-
-        // Batch-read all blobs not yet cached in this import pass.
-        let mut missing_blobs: Vec<String> = Vec::new();
-        for entry in &tree_entries {
-            if !blob_cache.contains_key(&entry.blob_sha)
-                && !missing_blobs.contains(&entry.blob_sha)
-            {
-                missing_blobs.push(entry.blob_sha.clone());
-            }
-        }
-
-        if !missing_blobs.is_empty() {
-            let fetched = read_blobs_batch(git_worktree, &missing_blobs)?;
-            for (blob_sha, bytes) in fetched {
-                let blob = store.put_blob_bytes(&bytes)?;
-                blob_cache.insert(blob_sha, (blob.manifest_hash(), blob.total_size));
-            }
-        }
+    for meta in &commits {
+        let mut tree_entries = Vec::new();
+        collect_tree_entries_gix(&repo, meta.tree_oid, "", &mut tree_entries)?;
 
         let mut domain_tree = DomainTree::new(target_domain.clone());
         for entry in tree_entries {
-            let &(manifest_hash, size) = blob_cache.get(&entry.blob_sha).ok_or_else(|| {
-                GitxError::GitBridge(format!(
-                    "missing cached blob {} for path '{}'",
-                    entry.blob_sha, entry.path
-                ))
-            })?;
+            let (manifest_hash, size) = if let Some(&cached) = blob_cache.get(&entry.blob_oid) {
+                cached
+            } else {
+                let blob_obj = repo.find_blob(entry.blob_oid).map_err(|e| {
+                    GitxError::GitBridge(format!(
+                        "gitoxide failed to read blob {}: {e}",
+                        entry.blob_oid
+                    ))
+                })?;
+                let stored = store.put_blob_bytes(&blob_obj.data)?;
+                let pair = (stored.manifest_hash(), stored.total_size);
+                blob_cache.insert(entry.blob_oid, pair);
+                pair
+            };
+
             domain_tree.insert(
                 entry.path,
                 EntryKind::File {
@@ -423,19 +315,19 @@ pub fn import_from_git_repo(
             Vec::new()
         };
 
-        let cs = ChangeSetBuilder::new(meta.author)
-            .committer(Actor::Human(meta.committer))
+        let cs = ChangeSetBuilder::new(meta.author.clone())
+            .committer(Actor::Human(meta.committer.clone()))
             .parents(parents)
             .public_parents(public_parents)
             .domain_tree(target_domain.clone(), tree_hash)
             .visibility(visibility.clone())
             .created_at(meta.created_at)
-            .description(meta.description)
+            .description(meta.description.clone())
             .build();
 
         let cs_id = store.put_changeset(&cs)?;
-        git_to_gitx.insert(sha.clone(), cs_id);
-        git_to_pub_proj.insert(sha.clone(), cs.public_projection_hash);
+        git_to_gitx.insert(meta.oid, cs_id);
+        git_to_pub_proj.insert(meta.oid, cs.public_projection_hash);
         head_changeset = Some(cs_id);
     }
 

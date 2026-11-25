@@ -386,11 +386,15 @@ proptest! {
 #[test]
 fn yaml_nested_key_merge_clean_and_same_key_conflict() {
     let base = b"service:\n  name: gitx\n  port: 7878\nfeatures:\n  auth: true\n";
-    let ours = b"service:\n  name: gitx\n  port: 7878\n  grpc_port: 50051\nfeatures:\n  auth: true\n";
+    let ours =
+        b"service:\n  name: gitx\n  port: 7878\n  grpc_port: 50051\nfeatures:\n  auth: true\n";
     let theirs = b"service:\n  name: gitx\n  port: 7878\nfeatures:\n  auth: true\n  fleet: true\n";
 
     let outcome = merge_bytes("config.yaml", base, ours, theirs);
-    assert!(outcome.is_clean(), "independent YAML keys must merge cleanly");
+    assert!(
+        outcome.is_clean(),
+        "independent YAML keys must merge cleanly"
+    );
     let text = String::from_utf8(outcome.into_bytes()).unwrap();
     assert!(text.contains("grpc_port: 50051"));
     assert!(text.contains("fleet: true"));

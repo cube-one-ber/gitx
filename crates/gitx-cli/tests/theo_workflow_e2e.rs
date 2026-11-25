@@ -137,7 +137,10 @@ write = team:core
     let pem = encode_openssh_ed25519_private(&[7u8; 32], "alice@t3.gg");
     fs::write(&ssh_priv, &pem).unwrap();
 
-    assert_ok(&machine_a, &["init", "--name", "Alice", "--email", "alice@t3.gg"]);
+    assert_ok(
+        &machine_a,
+        &["init", "--name", "Alice", "--email", "alice@t3.gg"],
+    );
     let imp_out = assert_ok(
         &machine_a,
         &[
@@ -192,7 +195,10 @@ write = team:core
     // Machine B (same SSH key): pull from server and verify `.env` auto-decrypts on disk!
     let machine_b = tmp.path().join("machine-b");
     fs::create_dir_all(&machine_b).unwrap();
-    assert_ok(&machine_b, &["init", "--name", "Alice", "--email", "alice@t3.gg"]);
+    assert_ok(
+        &machine_b,
+        &["init", "--name", "Alice", "--email", "alice@t3.gg"],
+    );
     assert_ok(
         &machine_b,
         &[
@@ -206,7 +212,14 @@ write = team:core
     );
     assert_ok(
         &machine_b,
-        &["remote", "add", "origin", &repo_url, "--token", &token_alice],
+        &[
+            "remote",
+            "add",
+            "origin",
+            &repo_url,
+            "--token",
+            &token_alice,
+        ],
     );
 
     let pull_out = assert_ok(&machine_b, &["pull", "origin"]);
@@ -233,7 +246,11 @@ write = team:core
 
     // Workspace `--share node_modules` hydrates heavy ignored dirs + lazy workspace works!
     fs::create_dir_all(machine_b.join("node_modules/pkg")).unwrap();
-    fs::write(machine_b.join("node_modules/pkg/index.js"), "module.exports = 1;\n").unwrap();
+    fs::write(
+        machine_b.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .unwrap();
     let ws_dir = tmp.path().join("ws-agent");
     assert_ok(
         &machine_b,
@@ -281,7 +298,13 @@ write = team:core
     );
     let mirror_out = assert_ok(
         &machine_b,
-        &["mirror", "sync", bare_mirror.to_str().unwrap(), "--domains", "public"],
+        &[
+            "mirror",
+            "sync",
+            bare_mirror.to_str().unwrap(),
+            "--domains",
+            "public",
+        ],
     );
     assert!(mirror_out.contains("Mirror pushed"));
     let ls_tree = Command::new("git")
@@ -296,4 +319,312 @@ write = team:core
         !files_list.contains(".env"),
         "public Git mirror must NEVER contain .env!"
     );
+}
+
+#[test]
+fn cli_colocated_continuous_sync_hunk_split_passphrase_ssh_wip_fleet_and_remote_symbols_rebase() {
+    use gitx_crypto::encode_openssh_ed25519_private_encrypted;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Continuous colocated `.git` sync (`gitx init --colocate`) with zero secret leak!
+    let coloc = tmp.path().join("colocated");
+    fs::create_dir_all(&coloc).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-b", "master", coloc.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&coloc)
+            .args(["config", "user.name", "Theo"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&coloc)
+            .args(["config", "user.email", "theo@t3.gg"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(coloc.join("README.md"), "# Colocated\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&coloc)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&coloc)
+            .args(["commit", "-m", "Initial git commit"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    assert_ok(
+        &coloc,
+        &[
+            "init",
+            "--colocate",
+            "--name",
+            "Theo",
+            "--email",
+            "theo@t3.gg",
+        ],
+    );
+    fs::write(coloc.join(".gitxacl"), ".env -> secret:dev\n").unwrap();
+    fs::write(
+        coloc.join("public.rs"),
+        "pub fn public_colocated() -> u32 { 7 }\n",
+    )
+    .unwrap();
+    fs::write(coloc.join(".env"), "TOP_SECRET_COLOC=never_in_dot_git\n").unwrap();
+    assert_ok(&coloc, &["describe", "-m", "Add public.rs + secret .env"]);
+    assert_ok(&coloc, &["land"]);
+
+    // `.git` must AUTOMATICALLY have `public.rs` on `master` and NEVER `.env`, passing `git fsck`!
+    let ls_tree = Command::new("git")
+        .arg("-C")
+        .arg(&coloc)
+        .args(["ls-tree", "-r", "--name-only", "refs/heads/master"])
+        .output()
+        .unwrap();
+    let tree_list = String::from_utf8_lossy(&ls_tree.stdout);
+    assert!(
+        tree_list.contains("public.rs"),
+        "colocated .git missing public.rs: {tree_list}"
+    );
+    assert!(
+        !tree_list.contains(".env"),
+        "colocated .git leaked .env: {tree_list}"
+    );
+    let fsck = Command::new("git")
+        .arg("-C")
+        .arg(&coloc)
+        .args(["fsck", "--full"])
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "git fsck failed on colocated .git: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // 2. Hunk-level `gitx split --hunks` AND interactive `gitx split -p`!
+    let split_repo = tmp.path().join("split-hunks");
+    fs::create_dir_all(&split_repo).unwrap();
+    assert_ok(
+        &split_repo,
+        &["init", "--name", "Theo", "--email", "theo@t3.gg"],
+    );
+    let mut base_lines = Vec::new();
+    for i in 1..=20 {
+        base_lines.push(format!("line {i}"));
+    }
+    let base_text = format!("{}\n", base_lines.join("\n"));
+    fs::write(split_repo.join("app.txt"), &base_text).unwrap();
+    assert_ok(&split_repo, &["describe", "-m", "Base 20 lines"]);
+    assert_ok(&split_repo, &["land"]);
+
+    // Modify line 2 (hunk 1) AND line 19 (hunk 2) so there are 2 disjoint hunks.
+    assert_ok(&split_repo, &["new", "-m", "Two hunks WIP"]);
+    let mut edited_lines = base_lines.clone();
+    edited_lines[1] = "line 2 EDITED_HUNK_1".to_string();
+    edited_lines[18] = "line 19 EDITED_HUNK_2".to_string();
+    fs::write(
+        split_repo.join("app.txt"),
+        format!("{}\n", edited_lines.join("\n")),
+    )
+    .unwrap();
+
+    let hunk_split_out = assert_ok(
+        &split_repo,
+        &["split", "--hunks", "app.txt:1", "-m", "Only Hunk 1"],
+    );
+    assert!(hunk_split_out.contains("Split"));
+
+    // Verify parent commit has ONLY hunk 1 while `@` still has BOTH hunks!
+    let log_out = assert_ok(&split_repo, &["log", "--limit", "5"]);
+    assert!(log_out.contains("Only Hunk 1"));
+    assert_eq!(
+        fs::read_to_string(split_repo.join("app.txt")).unwrap(),
+        format!("{}\n", edited_lines.join("\n"))
+    );
+    // Diff of `@` against its parent ("Only Hunk 1") should ONLY show HUNK_2!
+    let diff_after = assert_ok(&split_repo, &["diff"]);
+    assert!(
+        diff_after.contains("EDITED_HUNK_2"),
+        "expected hunk 2 remaining in @: {diff_after}"
+    );
+    assert!(
+        !diff_after.contains("EDITED_HUNK_1"),
+        "hunk 1 should already be in parent: {diff_after}"
+    );
+
+    // Test interactive `gitx split -p` via piped stdin (`y\nn\n`) on a fresh two-hunk edit!
+    assert_ok(&split_repo, &["land"]);
+    assert_ok(&split_repo, &["new", "-m", "Interactive patch WIP"]);
+    edited_lines[2] = "line 3 PATCH_A".to_string();
+    edited_lines[17] = "line 18 PATCH_B".to_string();
+    fs::write(
+        split_repo.join("app.txt"),
+        format!("{}\n", edited_lines.join("\n")),
+    )
+    .unwrap();
+
+    let mut child = Command::new(gitx_bin())
+        .current_dir(&split_repo)
+        .args(["split", "-p", "-m", "Interactive Patch A"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"y\nn\n").unwrap();
+    let patch_out = child.wait_with_output().unwrap();
+    assert!(
+        patch_out.status.success(),
+        "gitx split -p failed: {}",
+        String::from_utf8_lossy(&patch_out.stderr)
+    );
+    let diff_patch = assert_ok(&split_repo, &["diff"]);
+    assert!(diff_patch.contains("PATCH_B"));
+    assert!(!diff_patch.contains("PATCH_A"));
+
+    // 3. Passphrase-protected OpenSSH Ed25519 import + WIP Fleet Sync + Remote Symbols & Rebase!
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server_dir = tmp.path().join("srv-gaps");
+    let config = ServerConfig::new(&server_dir);
+    let base_url = rt.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            gitx_server::serve(listener, config).await.unwrap();
+        });
+        format!("http://{addr}")
+    });
+
+    let ssh_enc_path = tmp.path().join("id_ed25519_enc");
+    let enc_pem =
+        encode_openssh_ed25519_private_encrypted(&[55u8; 32], "theo@t3.gg", "secret-pass-123")
+            .unwrap();
+    fs::write(&ssh_enc_path, &enc_pem).unwrap();
+
+    let box_a = tmp.path().join("box-a");
+    fs::create_dir_all(&box_a).unwrap();
+    assert_ok(&box_a, &["init", "--name", "Theo", "--email", "theo@t3.gg"]);
+
+    // Wrong passphrase must fail cleanly.
+    let bad_imp = run_gitx(
+        &box_a,
+        &[
+            "secret",
+            "import-ssh",
+            "--path",
+            ssh_enc_path.to_str().unwrap(),
+            "--passphrase",
+            "wrong",
+        ],
+    );
+    assert!(!bad_imp.status.success());
+
+    // Correct passphrase succeeds!
+    assert_ok(
+        &box_a,
+        &[
+            "secret",
+            "import-ssh",
+            "--path",
+            ssh_enc_path.to_str().unwrap(),
+            "--passphrase",
+            "secret-pass-123",
+        ],
+    );
+
+    fs::write(box_a.join("lib.rs"), "pub fn alpha_sym() -> u32 { 1 }\n").unwrap();
+    fs::write(box_a.join(".env.local"), "WIP_FLAG=1\n").unwrap();
+    let repo_url = format!("{base_url}/t3/gaps");
+    assert_ok(
+        &box_a,
+        &["remote", "add", "origin", &repo_url, "--token", "user=theo"],
+    );
+    assert_ok(&box_a, &["push", "origin", "-m", "Initial lib.rs"]);
+
+    // `gitx remote symbols` finds `alpha_sym` on the server!
+    let sym_out = assert_ok(&box_a, &["remote", "symbols"]);
+    assert!(
+        sym_out.contains("alpha_sym"),
+        "expected alpha_sym in: {sym_out}"
+    );
+
+    // Make an uncommitted WIP edit and push via `gitx fleet sync --include-wip --push`!
+    fs::write(box_a.join("wip_notes.rs"), "pub fn wip_on_laptop() {}\n").unwrap();
+    let fleet_wip_push = assert_ok(
+        &box_a,
+        &[
+            "fleet",
+            "sync",
+            "--remote",
+            "origin",
+            "--include",
+            ".env.local",
+            "--include-wip",
+            "--push",
+        ],
+    );
+    assert!(
+        fleet_wip_push.contains("WIP file(s)"),
+        "expected WIP file(s) in: {fleet_wip_push}"
+    );
+
+    // Pull on box-b with same encrypted SSH key and verify both `.env.local` AND `wip_notes.rs` arrive!
+    let box_b = tmp.path().join("box-b");
+    fs::create_dir_all(&box_b).unwrap();
+    assert_ok(&box_b, &["init", "--name", "Theo", "--email", "theo@t3.gg"]);
+    assert_ok(
+        &box_b,
+        &[
+            "secret",
+            "import-ssh",
+            "--path",
+            ssh_enc_path.to_str().unwrap(),
+            "--passphrase",
+            "secret-pass-123",
+        ],
+    );
+    assert_ok(
+        &box_b,
+        &["remote", "add", "origin", &repo_url, "--token", "user=theo"],
+    );
+    assert_ok(&box_b, &["pull", "origin"]);
+    let fleet_wip_pull = assert_ok(&box_b, &["fleet", "sync", "--remote", "origin", "--pull"]);
+    assert!(fleet_wip_pull.contains("WIP"));
+    assert_eq!(
+        fs::read_to_string(box_b.join(".env.local")).unwrap(),
+        "WIP_FLAG=1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(box_b.join("wip_notes.rs")).unwrap(),
+        "pub fn wip_on_laptop() {}\n"
+    );
+
+    // `gitx remote rebase` against the live server!
+    let log_json = assert_ok(&box_a, &["remote", "log", "--limit", "5"]);
+    assert!(log_json.contains("Initial lib.rs"));
 }

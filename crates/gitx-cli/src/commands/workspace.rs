@@ -12,9 +12,11 @@ use gitx_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use gitx_vfs::FuseMountHandle;
 use gitx_vfs::{
-    EncryptedFleetBundle, FleetOverlayBundle, FleetWorkspaceMetadata, LazyWorkspace,
-    LoopbackVfsServer, WorkspaceBackendKind, WorkspaceManager, apply_encrypted_overlay,
-    apply_overlay, export_encrypted_overlay, export_overlay_with_metadata,
+    EncryptedFleetBundle, FleetOverlayBundle, FleetWipSnapshot, FleetWorkspaceMetadata,
+    LazyWorkspace, LoopbackVfsServer, Nfs3LoopbackServer, OverlayFile, WorkspaceBackendKind,
+    WorkspaceManager, apply_encrypted_overlay, apply_overlay, decrypt_encrypted_overlay,
+    export_encrypted_overlay, export_encrypted_overlay_with_wip, export_overlay_with_metadata,
+    macos_mount_nfs_args,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -32,6 +34,7 @@ use std::time::Duration;
 pub enum MountBackend {
     Fuse,
     Loopback,
+    Nfs3,
 }
 
 impl MountBackend {
@@ -39,6 +42,7 @@ impl MountBackend {
         match self {
             MountBackend::Fuse => "fuse",
             MountBackend::Loopback => "loopback",
+            MountBackend::Nfs3 => "nfs3",
         }
     }
 }
@@ -77,9 +81,7 @@ pub fn cmd_ws_add(
 
     let base_hash = if from_remote.is_some() {
         remote_trunk.ok_or_else(|| {
-            anyhow!(
-                "remote tracking bookmark '{remote_bm_name}' not found; run `gitx pull` first"
-            )
+            anyhow!("remote tracking bookmark '{remote_bm_name}' not found; run `gitx pull` first")
         })?
     } else if let (Some(rem), Some(loc)) = (remote_trunk, local_trunk) {
         if repo.is_ancestor(loc, rem)? && rem != loc {
@@ -328,6 +330,45 @@ pub fn cmd_ws_mount(name: String, mountpoint: PathBuf, backend: MountBackend) ->
             println!("Unmounted {}", mountpoint.display());
             Ok(())
         }
+        MountBackend::Nfs3 => {
+            let server = Nfs3LoopbackServer::start("127.0.0.1:0", lazy_ws, store_dyn)?;
+            let addr = server.addr();
+            let stats = server.stats();
+
+            let record = MountRecord {
+                workspace: name.clone(),
+                mountpoint: mount_key.clone(),
+                backend: backend.as_str().to_string(),
+                overlay_root: overlay_root.to_string_lossy().into_owned(),
+                pid: std::process::id(),
+                addr: Some(addr.to_string()),
+                stop_file: stop_file.to_string_lossy().into_owned(),
+            };
+            register_mount_record(&repo.gitx_dir, record)?;
+
+            let mount_hint = macos_mount_nfs_args(addr.port(), &mountpoint).join(" ");
+            println!(
+                "Mounted workspace '{}' at {} (backend: nfs3, addr: {}, virtual_files: {}, overlay_dirty: {}, pid: {}, mount_nfs: {})",
+                name,
+                mountpoint.display(),
+                addr,
+                stats.total_virtual_files,
+                stats.overlay_dirty_files,
+                std::process::id(),
+                mount_hint
+            );
+            io::stdout().flush()?;
+
+            while !stop_file.exists() {
+                thread::sleep(Duration::from_millis(50));
+            }
+
+            server.shutdown();
+            let _ = fs::remove_file(&stop_file);
+            let _ = unregister_mount_record(&repo.gitx_dir, &mount_key);
+            println!("Unmounted {}", mountpoint.display());
+            Ok(())
+        }
     }
 }
 
@@ -368,7 +409,10 @@ pub fn cmd_ws_unmount(mountpoint: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    bail!("mountpoint '{}' is not an active gitx mount", resolved.display());
+    bail!(
+        "mountpoint '{}' is not an active gitx mount",
+        resolved.display()
+    );
 }
 
 fn mounts_registry_path(gitx_dir: &Path) -> PathBuf {
@@ -416,10 +460,7 @@ fn unmount_os_fuse(mountpoint: &Path) -> Result<()> {
             return Ok(());
         }
     }
-    bail!(
-        "failed to unmount FUSE mountpoint {}",
-        mountpoint.display()
-    )
+    bail!("failed to unmount FUSE mountpoint {}", mountpoint.display())
 }
 
 pub fn cmd_git_export(target_dir: PathBuf, domains: String) -> Result<()> {
@@ -448,8 +489,14 @@ pub fn cmd_git_export(target_dir: PathBuf, domains: String) -> Result<()> {
 
     println!("Exported Git repository to {}", target_dir.display());
     println!("  exported_commits:        {}", report.exported_commits);
-    println!("  skipped_private_commits: {}", report.skipped_private_commits);
-    println!("  omitted_private_files:   {}", report.omitted_private_files);
+    println!(
+        "  skipped_private_commits: {}",
+        report.skipped_private_commits
+    );
+    println!(
+        "  omitted_private_files:   {}",
+        report.omitted_private_files
+    );
     for (branch, oid) in &report.ref_map {
         println!("  ref refs/heads/{branch}: {oid}");
     }
@@ -480,7 +527,8 @@ pub fn cmd_fleet_export(
 
         let machine_id = resolve_machine_id(machine);
         let domain = DomainId::secret("fleet")?;
-        let bundle = export_encrypted_overlay(&cwd, &patterns, &machine_id, &domain, 1, &recipients)?;
+        let bundle =
+            export_encrypted_overlay(&cwd, &patterns, &machine_id, &domain, 1, &recipients)?;
         let json = bundle.to_json()?;
 
         if let Some(parent) = bundle_path.parent()
@@ -649,6 +697,7 @@ pub fn cmd_fleet_sync(
     machine: Option<String>,
     push: bool,
     pull: bool,
+    include_wip: bool,
     token: Option<String>,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
@@ -677,11 +726,32 @@ pub fn cmd_fleet_sync(
         if let Some(rec) = pulled {
             let keypair = repo.load_local_keypair()?;
             let bundle = EncryptedFleetBundle::from_json(&rec.bundle_json)?;
-            let restored = apply_encrypted_overlay(&cwd, &bundle, &keypair)?;
+            let decoded = decrypt_encrypted_overlay(&bundle, &keypair)?;
+            let restored = apply_overlay(&cwd, &decoded)?;
+            let mut wip_restored = 0usize;
+            if let Some(ref wip) = decoded.wip_snapshot {
+                let wip_bundle = FleetOverlayBundle {
+                    format_version: FleetOverlayBundle::CURRENT_FORMAT_VERSION,
+                    created_at: decoded.created_at,
+                    workspace: decoded.workspace.clone(),
+                    files: wip.files.clone(),
+                    wip_snapshot: None,
+                };
+                let applied = apply_overlay(&cwd, &wip_bundle)?;
+                wip_restored = applied.len();
+                for del_path in &wip.deleted_paths {
+                    let target_file = cwd.join(del_path);
+                    if target_file.is_file() {
+                        let _ = fs::remove_file(&target_file);
+                    }
+                }
+                let _ = repo.snapshot_working_copy();
+            }
             println!(
-                "Fleet pull from {} ({} file(s) restored, source machine: {})",
+                "Fleet pull from {} ({} overlay file(s), {} WIP file(s) restored, source machine: {})",
                 target.full_name(),
                 restored.len(),
+                wip_restored,
                 bundle.machine_id
             );
             for path in &restored {
@@ -707,9 +777,22 @@ pub fn cmd_fleet_sync(
             let local_kp = UserKeyPair::from_secret_bundle(&keyring.local)?;
             recipients.push(local_kp.public_bundle());
         }
+        let wip_snapshot = if include_wip {
+            build_local_wip_snapshot(&repo)?
+        } else {
+            None
+        };
+        let wip_count = wip_snapshot.as_ref().map(|w| w.files.len()).unwrap_or(0);
         let domain = DomainId::secret("fleet")?;
-        let bundle =
-            export_encrypted_overlay(&cwd, &patterns, &machine_id, &domain, 1, &recipients)?;
+        let bundle = export_encrypted_overlay_with_wip(
+            &cwd,
+            &patterns,
+            &machine_id,
+            &domain,
+            1,
+            &recipients,
+            wip_snapshot,
+        )?;
         let bundle_json = bundle.to_json()?;
         let payload = json!({
             "bundle_json": bundle_json,
@@ -728,9 +811,10 @@ pub fn cmd_fleet_sync(
         })?;
 
         println!(
-            "Fleet push to {} ({} file(s) encrypted for {} recipient(s), machine: {}, updated: {})",
+            "Fleet push to {} ({} overlay file(s), {} WIP file(s) encrypted for {} recipient(s), machine: {}, updated: {})",
             target.full_name(),
             bundle.file_count,
+            wip_count,
             recipients.len(),
             rec.machine.as_deref().unwrap_or(&machine_id),
             rec.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
@@ -738,6 +822,60 @@ pub fn cmd_fleet_sync(
     }
 
     Ok(())
+}
+
+fn build_local_wip_snapshot(repo: &Repo) -> Result<Option<FleetWipSnapshot>> {
+    let snap = repo.snapshot_working_copy()?;
+    let cur = snap.changeset;
+    let parent_cs = match cur.parents.first() {
+        Some(&p) => Some(repo.store.get_changeset(p)?),
+        None => None,
+    };
+
+    let mut files = BTreeMap::new();
+    let mut deleted_paths = Vec::new();
+    for (dom, &tree_hash) in &cur.domain_trees {
+        if dom.is_secret() {
+            continue;
+        }
+        let cur_tree = repo.store.get_tree(tree_hash)?;
+        let base_tree = repo.get_domain_tree_or_empty(parent_cs.as_ref(), dom)?;
+        for (path, entry) in &cur_tree.entries {
+            if base_tree.entries.get(path) != Some(entry)
+                && let EntryKind::File {
+                    blob_hash, mode, ..
+                } = entry
+            {
+                let content = repo.store.read_blob_bytes(*blob_hash)?;
+                let content_hash = gitx_core::ObjectHash::of_typed("gitx:raw:v1", &content);
+                files.insert(
+                    path.clone(),
+                    OverlayFile {
+                        path: path.clone(),
+                        mode: *mode,
+                        content,
+                        content_hash,
+                    },
+                );
+            }
+        }
+        for path in base_tree.entries.keys() {
+            if !cur_tree.entries.contains_key(path) {
+                deleted_paths.push(path.clone());
+            }
+        }
+    }
+
+    if files.is_empty() && deleted_paths.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(FleetWipSnapshot {
+        change_id: cur.change_id,
+        base_changeset: cur.parents.first().copied(),
+        description: cur.description,
+        files,
+        deleted_paths,
+    }))
 }
 
 /// Bidirectional ACL-filtered Git mirror sync (e.g. GitHub / Forgejo / local bare Git remote).

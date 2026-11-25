@@ -74,9 +74,8 @@ pub fn decode_pkt_lines(input: &[u8]) -> Result<Vec<PktLine>> {
                 "truncated pkt-line length prefix".to_string(),
             ));
         }
-        let len_str = std::str::from_utf8(&input[pos..pos + 4]).map_err(|e| {
-            GitxError::GitBridge(format!("non-UTF8 pkt-line length prefix: {e}"))
-        })?;
+        let len_str = std::str::from_utf8(&input[pos..pos + 4])
+            .map_err(|e| GitxError::GitBridge(format!("non-UTF8 pkt-line length prefix: {e}")))?;
         let len = usize::from_str_radix(len_str, 16).map_err(|e| {
             GitxError::GitBridge(format!("invalid pkt-line hex length '{len_str}': {e}"))
         })?;

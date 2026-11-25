@@ -443,6 +443,35 @@ export interface ServerLandRequest {
   expected_head?: string;
 }
 
+export interface ServerRebaseRequest {
+  changeset_id: string;
+  onto: string;
+  update_bookmark?: string;
+}
+
+export interface ServerRebaseResponse {
+  changeset_id: string;
+  change_id: string;
+  onto: string;
+  has_conflicts: boolean;
+  conflicts: string[];
+  updated_bookmark: string | null;
+}
+
+export interface IndexedSymbol {
+  path: string;
+  domain: string;
+  name: string;
+  kind: string;
+  line_start: number;
+  line_end: number;
+}
+
+export interface ServerSymbolsResponse {
+  rev: string | null;
+  symbols: IndexedSymbol[];
+}
+
 export interface ServerLandResponse {
   land_seq: number;
   target: string;

@@ -116,11 +116,17 @@ fn e2e_remote_config_add_list_show_rm() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
-    gitx_ok(root, &["init", "--name", "Alice", "--email", "alice@acme.dev"]);
+    gitx_ok(
+        root,
+        &["init", "--name", "Alice", "--email", "alice@acme.dev"],
+    );
 
     // Empty list initially
     let empty_list = gitx_ok(root, &["remote", "list"]);
-    assert!(empty_list.contains("No remotes configured"), "got:\n{empty_list}");
+    assert!(
+        empty_list.contains("No remotes configured"),
+        "got:\n{empty_list}"
+    );
 
     // Auto-parse owner & repo from URL
     let add1 = gitx_ok(
@@ -135,7 +141,10 @@ fn e2e_remote_config_add_list_show_rm() {
         ],
     );
     assert!(add1.contains("Added remote 'origin'"), "got:\n{add1}");
-    assert!(add1.contains("http://127.0.0.1:7878/acme/demo"), "got:\n{add1}");
+    assert!(
+        add1.contains("http://127.0.0.1:7878/acme/demo"),
+        "got:\n{add1}"
+    );
     assert!(root.join(".gitx/remotes.toml").is_file());
 
     // Explicit --owner and --repo flags
@@ -152,18 +161,29 @@ fn e2e_remote_config_add_list_show_rm() {
             "upstream-repo",
         ],
     );
-    assert!(add2.contains("http://127.0.0.1:7878/org/upstream-repo"), "got:\n{add2}");
+    assert!(
+        add2.contains("http://127.0.0.1:7878/org/upstream-repo"),
+        "got:\n{add2}"
+    );
 
     // Duplicate remote add must fail cleanly
     let dup = run_gitx(
         root,
-        &["remote", "add", "origin", "http://127.0.0.1:7878/acme/other"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "http://127.0.0.1:7878/acme/other",
+        ],
     );
     assert!(!dup.status.success());
 
     // List both remotes
     let list_out = gitx_ok(root, &["remote", "list"]);
-    assert!(list_out.contains("origin\thttp://127.0.0.1:7878/acme/demo"), "got:\n{list_out}");
+    assert!(
+        list_out.contains("origin\thttp://127.0.0.1:7878/acme/demo"),
+        "got:\n{list_out}"
+    );
     assert!(list_out.contains("[token]"), "got:\n{list_out}");
     assert!(
         list_out.contains("upstream\thttp://127.0.0.1:7878/org/upstream-repo"),
@@ -180,7 +200,10 @@ fn e2e_remote_config_add_list_show_rm() {
 
     // Remove upstream and confirm it's gone
     let rm_out = gitx_ok(root, &["remote", "rm", "upstream"]);
-    assert!(rm_out.contains("Removed remote 'upstream'"), "got:\n{rm_out}");
+    assert!(
+        rm_out.contains("Removed remote 'upstream'"),
+        "got:\n{rm_out}"
+    );
 
     let list_after = gitx_ok(root, &["remote", "list"]);
     assert!(list_after.contains("origin"));
@@ -219,13 +242,19 @@ fn e2e_push_to_create_and_pull_roundtrip_with_history_and_deletions() {
     gitx_ok(repo_a.path(), &["describe", "-m", "Initial public library"]);
 
     let push1 = gitx_ok(repo_a.path(), &["push"]);
-    assert!(push1.contains("Pushed to 'origin' (acme/alpha -> master)"), "got:\n{push1}");
+    assert!(
+        push1.contains("Pushed to 'origin' (acme/alpha -> master)"),
+        "got:\n{push1}"
+    );
     let c1_id = extract_field(&push1, "changeset:").to_string();
     assert!(!c1_id.is_empty());
 
     // Pushing again with no changes reports up-to-date
     let noop_push = gitx_ok(repo_a.path(), &["push"]);
-    assert!(noop_push.contains("Already up to date"), "got:\n{noop_push}");
+    assert!(
+        noop_push.contains("Already up to date"),
+        "got:\n{noop_push}"
+    );
 
     // Verify `remote show` recorded the remote head
     let show_out = gitx_ok(repo_a.path(), &["remote", "show", "origin"]);
@@ -238,13 +267,27 @@ fn e2e_push_to_create_and_pull_roundtrip_with_history_and_deletions() {
     )
     .unwrap();
     fs::remove_file(repo_a.path().join("docs/guide.md")).unwrap();
-    fs::write(repo_a.path().join("src/extra.rs"), "pub const VERSION: u32 = 2;\n").unwrap();
+    fs::write(
+        repo_a.path().join("src/extra.rs"),
+        "pub const VERSION: u32 = 2;\n",
+    )
+    .unwrap();
 
     let push2 = gitx_ok(
         repo_a.path(),
-        &["push", "origin", "--target", "master", "-m", "Add farewell and drop old guide"],
+        &[
+            "push",
+            "origin",
+            "--target",
+            "master",
+            "-m",
+            "Add farewell and drop old guide",
+        ],
     );
-    assert!(push2.contains("-1 deleted"), "expected deletion count in:\n{push2}");
+    assert!(
+        push2.contains("-1 deleted"),
+        "expected deletion count in:\n{push2}"
+    );
 
     // Initialize fresh Repo B and pull from the server
     gitx_ok(
@@ -254,13 +297,19 @@ fn e2e_push_to_create_and_pull_roundtrip_with_history_and_deletions() {
     gitx_ok(repo_b.path(), &["remote", "add", "origin", &url]);
 
     let pull_out = gitx_ok(repo_b.path(), &["pull"]);
-    assert!(pull_out.contains("Pulled from 'origin' (acme/alpha @ master)"), "got:\n{pull_out}");
+    assert!(
+        pull_out.contains("Pulled from 'origin' (acme/alpha @ master)"),
+        "got:\n{pull_out}"
+    );
     assert!(pull_out.contains("2 imported"), "got:\n{pull_out}");
 
     // Verify file contents and deletion materialized in Repo B
     let pulled_lib = fs::read_to_string(repo_b.path().join("src/lib.rs")).unwrap();
     assert!(pulled_lib.contains("pub fn greet()"), "got:\n{pulled_lib}");
-    assert!(pulled_lib.contains("pub fn farewell()"), "got:\n{pulled_lib}");
+    assert!(
+        pulled_lib.contains("pub fn farewell()"),
+        "got:\n{pulled_lib}"
+    );
     assert_eq!(
         fs::read_to_string(repo_b.path().join("src/extra.rs")).unwrap(),
         "pub const VERSION: u32 = 2;\n"
@@ -340,30 +389,52 @@ fn e2e_zero_clone_remote_rpc_grep_diff_blame_log_stats() {
         &["remote", "diff", &c1, &c2, "--url", &url],
     );
     assert!(diff_out.contains("+pub fn beta()"), "got:\n{diff_out}");
-    assert!(diff_out.contains("+\"beta_marker\"".trim_start_matches('+')) || diff_out.contains("beta_marker"), "got:\n{diff_out}");
+    assert!(
+        diff_out.contains("+\"beta_marker\"".trim_start_matches('+'))
+            || diff_out.contains("beta_marker"),
+        "got:\n{diff_out}"
+    );
 
     let blame_out = gitx_ok(
         scratch_no_repo.path(),
         &["remote", "blame", "src/lib.rs", "--url", &url, "--rev", &c2],
     );
-    assert!(blame_out.contains(&c1[..12]), "expected c1 attribution in blame:\n{blame_out}");
-    assert!(blame_out.contains(&c2[..12]), "expected c2 attribution in blame:\n{blame_out}");
+    assert!(
+        blame_out.contains(&c1[..12]),
+        "expected c1 attribution in blame:\n{blame_out}"
+    );
+    assert!(
+        blame_out.contains(&c2[..12]),
+        "expected c2 attribution in blame:\n{blame_out}"
+    );
     assert!(blame_out.contains("pub fn alpha()"), "got:\n{blame_out}");
     assert!(blame_out.contains("pub fn beta()"), "got:\n{blame_out}");
 
     // Query /derived/stats — trigram & path_history should reflect cached indices from grep & blame
     let stats_out = gitx_ok(scratch_no_repo.path(), &["remote", "stats", "--url", &url]);
-    assert!(stats_out.contains("Derived data stats for acme/rpc-demo"), "got:\n{stats_out}");
+    assert!(
+        stats_out.contains("Derived data stats for acme/rpc-demo"),
+        "got:\n{stats_out}"
+    );
     assert!(stats_out.contains("trigram:"), "got:\n{stats_out}");
-    assert!(stats_out.contains("trees=1"), "expected trigram indexed tree in:\n{stats_out}");
+    assert!(
+        stats_out.contains("trees=1"),
+        "expected trigram indexed tree in:\n{stats_out}"
+    );
     assert!(stats_out.contains("path_history:"), "got:\n{stats_out}");
-    assert!(stats_out.contains("entries=1"), "expected path_history entry in:\n{stats_out}");
+    assert!(
+        stats_out.contains("entries=1"),
+        "expected path_history entry in:\n{stats_out}"
+    );
 
     // Confirm zero local .gitx directory was created in scratch_no_repo
     assert!(!scratch_no_repo.path().join(".gitx").exists());
 
     // Also verify configured-remote form inside Repo A (without --url)
-    let repo_grep = gitx_ok(repo_a.path(), &["remote", "grep", "alpha_marker", "--remote", "origin"]);
+    let repo_grep = gitx_ok(
+        repo_a.path(),
+        &["remote", "grep", "alpha_marker", "--remote", "origin"],
+    );
     assert!(repo_grep.contains("src/lib.rs:2:"), "got:\n{repo_grep}");
 }
 
@@ -378,7 +449,10 @@ fn e2e_remote_merge_queue_enqueue_list_drain() {
     let verifier = TempDir::new().unwrap();
 
     // 1. Seed initial commit on server
-    gitx_ok(seed.path(), &["init", "--name", "Seed", "--email", "seed@acme.dev"]);
+    gitx_ok(
+        seed.path(),
+        &["init", "--name", "Seed", "--email", "seed@acme.dev"],
+    );
     gitx_ok(
         seed.path(),
         &[
@@ -467,7 +541,14 @@ fn e2e_remote_merge_queue_enqueue_list_drain() {
     // 5. Inspect queue list before draining
     let list_before = gitx_ok(
         agent1.path(),
-        &["queue", "list", "--remote", "origin", "--token", "merge-bot"],
+        &[
+            "queue",
+            "list",
+            "--remote",
+            "origin",
+            "--token",
+            "merge-bot",
+        ],
     );
     assert!(list_before.contains("pending: 2"), "got:\n{list_before}");
     assert!(list_before.contains("agent-1"), "got:\n{list_before}");
@@ -495,7 +576,14 @@ fn e2e_remote_merge_queue_enqueue_list_drain() {
     // 7. Queue list after drain shows 0 pending and landed(seq=1)
     let list_after = gitx_ok(
         agent1.path(),
-        &["queue", "list", "--remote", "origin", "--token", "merge-bot"],
+        &[
+            "queue",
+            "list",
+            "--remote",
+            "origin",
+            "--token",
+            "merge-bot",
+        ],
     );
     assert!(list_after.contains("pending: 0"), "got:\n{list_after}");
     assert!(list_after.contains("landed(seq=1)"), "got:\n{list_after}");
@@ -511,10 +599,22 @@ fn e2e_remote_merge_queue_enqueue_list_drain() {
     assert!(verifier.path().join("agents/alpha.rs").is_file());
     assert!(verifier.path().join("agents/beta.rs").is_file());
     let merged_lib = fs::read_to_string(verifier.path().join("src/lib.rs")).unwrap();
-    assert!(!merged_lib.contains("<<<<<<<"), "unexpected conflict markers:\n{merged_lib}");
-    assert!(merged_lib.contains("pub fn base_fn()"), "got:\n{merged_lib}");
-    assert!(merged_lib.contains("pub fn alpha_fn()"), "got:\n{merged_lib}");
-    assert!(merged_lib.contains("pub fn beta_fn()"), "got:\n{merged_lib}");
+    assert!(
+        !merged_lib.contains("<<<<<<<"),
+        "unexpected conflict markers:\n{merged_lib}"
+    );
+    assert!(
+        merged_lib.contains("pub fn base_fn()"),
+        "got:\n{merged_lib}"
+    );
+    assert!(
+        merged_lib.contains("pub fn alpha_fn()"),
+        "got:\n{merged_lib}"
+    );
+    assert!(
+        merged_lib.contains("pub fn beta_fn()"),
+        "got:\n{merged_lib}"
+    );
 }
 
 #[test]
@@ -558,8 +658,14 @@ fn e2e_token_acl_domain_isolation() {
         "pub const SECRET_ALGO: &str = \"CORE_SECRET_FORMULA_999\";\n",
     )
     .unwrap();
-    let priv_push = gitx_ok(repo_core.path(), &["push", "-m", "Add private core algorithm"]);
-    assert!(priv_push.contains("team:core"), "expected team:core domain in:\n{priv_push}");
+    let priv_push = gitx_ok(
+        repo_core.path(),
+        &["push", "-m", "Add private core algorithm"],
+    );
+    assert!(
+        priv_push.contains("team:core"),
+        "expected team:core domain in:\n{priv_push}"
+    );
 
     // 2. Unauthorized user pulls -> ONLY sees public file, ZERO private file or private commit history!
     gitx_ok(
@@ -574,11 +680,17 @@ fn e2e_token_acl_domain_isolation() {
 
     assert!(repo_outsider.path().join("src/public.rs").is_file());
     assert!(
-        !repo_outsider.path().join("packages/private/vault.rs").exists(),
+        !repo_outsider
+            .path()
+            .join("packages/private/vault.rs")
+            .exists(),
         "unauthorized token must NOT pull team:core private file!"
     );
     let outsider_log = gitx_ok(repo_outsider.path(), &["log"]);
-    assert!(outsider_log.contains("Add public greeting"), "got:\n{outsider_log}");
+    assert!(
+        outsider_log.contains("Add public greeting"),
+        "got:\n{outsider_log}"
+    );
     assert!(
         !outsider_log.contains("Add private core algorithm"),
         "unauthorized token must NOT receive private commit message:\n{outsider_log}"
@@ -587,7 +699,13 @@ fn e2e_token_acl_domain_isolation() {
     // 3. Unauthorized user cannot grep or blame private content (neither with outsider token nor anonymous)
     let unauth_grep = gitx_ok(
         repo_outsider.path(),
-        &["remote", "grep", "CORE_SECRET_FORMULA_999", "--remote", "origin"],
+        &[
+            "remote",
+            "grep",
+            "CORE_SECRET_FORMULA_999",
+            "--remote",
+            "origin",
+        ],
     );
     assert!(
         unauth_grep.contains("(no matches"),
@@ -662,7 +780,10 @@ fn e2e_token_acl_domain_isolation() {
         "got:\n{private_content}"
     );
     let auth_log = gitx_ok(repo_authorized.path(), &["log"]);
-    assert!(auth_log.contains("Add private core algorithm"), "got:\n{auth_log}");
+    assert!(
+        auth_log.contains("Add private core algorithm"),
+        "got:\n{auth_log}"
+    );
 
     let auth_grep = gitx_ok(
         repo_authorized.path(),

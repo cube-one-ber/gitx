@@ -1326,7 +1326,9 @@ async fn security_acl_self_auth_bearer_tokens_embargo_and_queue_isolation() {
     assert!(emb_secret_overwrite.status().is_success());
 
     let publish_secret_overwrite = client
-        .post(tok_url("/v1/repos/sec/tokrepo/embargo/cve-2026-sec-overwrite/publish"))
+        .post(tok_url(
+            "/v1/repos/sec/tokrepo/embargo/cve-2026-sec-overwrite/publish",
+        ))
         .header("Authorization", "Bearer alice-token-123")
         .json(&json!({ "target": "master" }))
         .send()
@@ -1801,7 +1803,12 @@ async fn security_acl_self_auth_bearer_tokens_embargo_and_queue_isolation() {
         .await
         .unwrap();
     assert!(core_tree.files.iter().any(|f| f.path == "PUBLIC.md"));
-    assert!(!core_tree.files.iter().any(|f| f.path == "packages/private/core.rs"));
+    assert!(
+        !core_tree
+            .files
+            .iter()
+            .any(|f| f.path == "packages/private/core.rs")
+    );
 
     // Embargo advisory-ID hijacking & Git Smart HTTP isolation regression (Grok R7 blocker/should):
     // 1. Alice (team:security) commits an active embargo under advisory `cve-2026-0001`.
@@ -2488,7 +2495,8 @@ domain team:core read=team:core write=team:core
 }
 
 #[tokio::test]
-async fn round9_create_repo_acl_survives_master_updates_outbox_reconciles_crash_and_multiref_push_atomic() {
+async fn round9_create_repo_acl_survives_master_updates_outbox_reconciles_crash_and_multiref_push_atomic()
+ {
     use axum::routing::post as axum_post;
     use gitx_server::{
         DrainResponse, OutboxResponse, WebhookOutbox, outbox::replay_pending_events,

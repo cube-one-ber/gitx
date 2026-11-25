@@ -109,7 +109,11 @@ fn mem_vfs_fan_out_50_parallel_workspaces_off_same_base_without_locking() {
                 );
                 let mut local_fork = instant_fork.clone_instant();
                 local_fork
-                    .write_file("scratch.txt", format!("fork {i}").as_bytes(), FileMode::Regular)
+                    .write_file(
+                        "scratch.txt",
+                        format!("fork {i}").as_bytes(),
+                        FileMode::Regular,
+                    )
                     .unwrap();
                 assert!(!instant_fork.contains("scratch.txt"));
 
@@ -145,10 +149,7 @@ fn mem_vfs_fan_out_50_parallel_workspaces_off_same_base_without_locking() {
     assert_eq!(unique_hashes.len(), 50);
 
     // Base MemVfs is still completely pristine.
-    assert_eq!(
-        base_mem.read_file("README.md").unwrap(),
-        b"# gitx repo\n"
-    );
+    assert_eq!(base_mem.read_file("README.md").unwrap(), b"# gitx repo\n");
     assert_eq!(base_mem.list_files().unwrap().len(), 3);
 }
 
@@ -230,7 +231,9 @@ fn cow_workspace_materialization_pool_exec_mode_and_roundtrip() {
     ws2.write_file("README.md", b"# edited in ws2\n", FileMode::Regular)
         .expect("edit ws2");
     assert_eq!(ws1.read_file("README.md").unwrap(), b"# gitx repo\n");
-    let snap2 = ws2.snapshot_tree(DomainId::public(), store.as_ref()).unwrap();
+    let snap2 = ws2
+        .snapshot_tree(DomainId::public(), store.as_ref())
+        .unwrap();
     let diff = WorkspaceManager::detect_changes(&snap2, &base_tree);
     assert_eq!(
         diff,
@@ -342,10 +345,18 @@ fn fleet_overlay_bundle_export_excludes_os_dirs_and_applies_to_second_machine() 
     fs::create_dir_all(&machine_b).unwrap();
 
     // Populate machine A with private overlay files + OS/build/VCS dirs containing matching names.
-    fs::write(machine_a.join(".env"), b"DATABASE_URL=postgres://localhost/dev\n").unwrap();
+    fs::write(
+        machine_a.join(".env"),
+        b"DATABASE_URL=postgres://localhost/dev\n",
+    )
+    .unwrap();
     fs::write(machine_a.join(".env.local"), b"LOCAL_OVERRIDE=true\n").unwrap();
     fs::create_dir_all(machine_a.join("apps/web")).unwrap();
-    fs::write(machine_a.join("apps/web/.env.local"), b"NEXT_PUBLIC_PORT=3000\n").unwrap();
+    fs::write(
+        machine_a.join("apps/web/.env.local"),
+        b"NEXT_PUBLIC_PORT=3000\n",
+    )
+    .unwrap();
     fs::create_dir_all(machine_a.join("config")).unwrap();
     fs::write(machine_a.join("config/dev.local.toml"), b"threads = 8\n").unwrap();
 
@@ -360,9 +371,17 @@ fn fleet_overlay_bundle_export_excludes_os_dirs_and_applies_to_second_machine() 
 
     // Files inside strictly excluded directories — even if named `.env` or matched by glob!
     fs::create_dir_all(machine_a.join("node_modules/some-pkg")).unwrap();
-    fs::write(machine_a.join("node_modules/some-pkg/.env"), b"SHOULD_NOT_SYNC").unwrap();
+    fs::write(
+        machine_a.join("node_modules/some-pkg/.env"),
+        b"SHOULD_NOT_SYNC",
+    )
+    .unwrap();
     fs::create_dir_all(machine_a.join("target/debug")).unwrap();
-    fs::write(machine_a.join("target/debug/.env.local"), b"SHOULD_NOT_SYNC").unwrap();
+    fs::write(
+        machine_a.join("target/debug/.env.local"),
+        b"SHOULD_NOT_SYNC",
+    )
+    .unwrap();
     fs::create_dir_all(machine_a.join(".git")).unwrap();
     fs::write(machine_a.join(".git/.env"), b"SHOULD_NOT_SYNC").unwrap();
     fs::create_dir_all(machine_a.join(".gitx")).unwrap();

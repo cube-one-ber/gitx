@@ -210,20 +210,15 @@ pub(crate) fn safe_lz4_decompress(
             "lz4 payload too short for {label} {hash}"
         )));
     }
-    let declared_len = u32::from_le_bytes([
-        compressed[0],
-        compressed[1],
-        compressed[2],
-        compressed[3],
-    ]) as usize;
+    let declared_len =
+        u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]) as usize;
     if declared_len > MAX_CAS_DECOMPRESSED_BYTES {
         return Err(GitxError::Storage(format!(
             "lz4 declared size {declared_len} exceeds limit ({MAX_CAS_DECOMPRESSED_BYTES}) for {label} {hash}"
         )));
     }
-    lz4_flex::decompress_size_prepended(compressed).map_err(|e| {
-        GitxError::Storage(format!("lz4 decompress failed for {label} {hash}: {e}"))
-    })
+    lz4_flex::decompress_size_prepended(compressed)
+        .map_err(|e| GitxError::Storage(format!("lz4 decompress failed for {label} {hash}: {e}")))
 }
 
 /// Orders revisions of a single `ChangeId` from oldest to newest.

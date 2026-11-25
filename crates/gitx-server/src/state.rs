@@ -3,10 +3,10 @@ use crate::outbox::WebhookOutbox;
 use crate::queue::{ConflictResolverFn, MergeQueue};
 use gitx_context::ContextStore;
 use gitx_core::{ChangeSet, DomainId, EmbargoState, EntryKind, GitxError, ObjectHash, Result};
-use gitx_crypto::{AclPolicy, Principal};
+use gitx_crypto::{AclPolicy, OidcVerifier, Principal};
 use gitx_store::{
-    BlobBackendConfig, CacheConfig, LocalStore, MetadataBackend, ObjectStore, SqlMetadataBackend,
-    TieredObjectStore,
+    BlobBackendConfig, CacheConfig, LocalStore, MetadataBackend, ObjectStore, PostgresConfig,
+    SqlMetadataBackend, TieredObjectStore,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -38,11 +38,20 @@ pub struct ServerConfig {
     /// Optional distributed/tiered blob storage backend (`TieredObjectStore`).
     /// When `None`, each repo uses embedded `LocalStore`.
     pub blob_backend: Option<BlobBackendConfig>,
+    /// Optional live PostgreSQL metadata backend configuration (`tokio-postgres`).
+    /// When set, server repositories persist ChangeSets, bookmarks, lands, stacks, and OpLog in PostgreSQL.
+    pub postgres_config: Option<PostgresConfig>,
     /// Optional HTTP webhook URLs dispatched asynchronously from each repo's `land_outbox`.
     pub webhook_urls: Vec<String>,
     /// Optional post-land verification shell command. If it exits non-zero, the server
     /// automatically performs an O(1) atomic `revert_land`.
     pub post_land_cmd: Option<String>,
+    /// Optional OIDC EdDSA JWT verifier for mapping OIDC bearer tokens to `Principal`s.
+    pub oidc_verifier: Option<OidcVerifier>,
+    /// Optional SSH public key (`ssh-ed25519 <b64>`) -> `Principal` bindings for `serve_ssh`.
+    pub ssh_authorized_keys: BTreeMap<String, Principal>,
+    /// Allow unauthenticated / unknown SSH keys read-only access to the `public` domain.
+    pub allow_anonymous_ssh_read: bool,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -55,8 +64,12 @@ impl fmt::Debug for ServerConfig {
             .field("has_signing_secret", &self.token_signing_secret.is_some())
             .field("trust_proxy_headers", &self.trust_proxy_headers)
             .field("blob_backend", &self.blob_backend)
+            .field("postgres_config", &self.postgres_config)
             .field("webhook_urls", &self.webhook_urls)
             .field("has_post_land_cmd", &self.post_land_cmd.is_some())
+            .field("has_oidc_verifier", &self.oidc_verifier.is_some())
+            .field("ssh_authorized_key_count", &self.ssh_authorized_keys.len())
+            .field("allow_anonymous_ssh_read", &self.allow_anonymous_ssh_read)
             .finish()
     }
 }
@@ -71,8 +84,12 @@ impl ServerConfig {
             token_signing_secret: None,
             trust_proxy_headers: None,
             blob_backend: None,
+            postgres_config: None,
             webhook_urls: Vec::new(),
             post_land_cmd: None,
+            oidc_verifier: None,
+            ssh_authorized_keys: BTreeMap::new(),
+            allow_anonymous_ssh_read: true,
         }
     }
 
@@ -121,6 +138,43 @@ impl ServerConfig {
         self.post_land_cmd = Some(cmd.into());
         self
     }
+
+    /// Configure a live PostgreSQL metadata backend (`postgres://...`).
+    pub fn with_postgres_config(mut self, config: PostgresConfig) -> Self {
+        self.postgres_config = Some(config);
+        self
+    }
+
+    /// Configure an OIDC EdDSA JWT verifier for bearer token authentication.
+    pub fn with_oidc_verifier(mut self, verifier: OidcVerifier) -> Self {
+        self.oidc_verifier = Some(verifier);
+        self
+    }
+
+    /// Authorize an OpenSSH public key (`<type> <base64> [comment]`) for a [`Principal`].
+    pub fn with_ssh_authorized_key(
+        mut self,
+        openssh_pub_line: impl AsRef<str>,
+        principal: Principal,
+    ) -> Self {
+        if let Some(norm) = normalize_ssh_pub_key(openssh_pub_line.as_ref()) {
+            self.ssh_authorized_keys.insert(norm, principal);
+        }
+        self
+    }
+
+    /// Control whether unknown SSH keys are granted anonymous read-only `public` access.
+    pub fn with_allow_anonymous_ssh_read(mut self, allow: bool) -> Self {
+        self.allow_anonymous_ssh_read = allow;
+        self
+    }
+}
+
+fn normalize_ssh_pub_key(line: &str) -> Option<String> {
+    let mut parts = line.split_whitespace();
+    let kind = parts.next()?;
+    let b64 = parts.next()?;
+    Some(format!("{kind} {b64}"))
 }
 
 /// Summary metadata for a hosted repository.
@@ -189,7 +243,7 @@ impl RepoHandle {
     }
 
     /// Open or initialize a repository handle backed by either embedded `LocalStore` or
-    /// distributed `TieredObjectStore`.
+    /// distributed `TieredObjectStore` (optionally with live PostgreSQL metadata).
     pub fn open_with_backend(
         owner: String,
         name: String,
@@ -197,11 +251,32 @@ impl RepoHandle {
         default_acl: Option<String>,
         blob_backend: Option<&BlobBackendConfig>,
     ) -> Result<Self> {
+        Self::open_with_backends(owner, name, root_dir, default_acl, blob_backend, None)
+    }
+
+    /// Open or initialize a repository handle with optional tiered object store AND optional
+    /// live PostgreSQL metadata backend.
+    pub fn open_with_backends(
+        owner: String,
+        name: String,
+        root_dir: PathBuf,
+        default_acl: Option<String>,
+        blob_backend: Option<&BlobBackendConfig>,
+        postgres_config: Option<&PostgresConfig>,
+    ) -> Result<Self> {
         fs::create_dir_all(&root_dir)?;
-        let store: Arc<dyn ObjectStore> = match blob_backend {
-            Some(cfg) => {
-                let meta: Arc<dyn MetadataBackend> =
-                    Arc::new(SqlMetadataBackend::open_sqlite(root_dir.join("metadata.sqlite"))?);
+        let store: Arc<dyn ObjectStore> = match (blob_backend, postgres_config) {
+            (Some(cfg), pg_opt) => {
+                let meta: Arc<dyn MetadataBackend> = match pg_opt {
+                    Some(pg_cfg) => {
+                        let schema = postgres_repo_schema(&owner, &name, &pg_cfg.schema);
+                        let scoped = pg_cfg.clone().with_schema(schema);
+                        Arc::new(SqlMetadataBackend::connect_postgres(scoped)?)
+                    }
+                    None => Arc::new(SqlMetadataBackend::open_sqlite(
+                        root_dir.join("metadata.sqlite"),
+                    )?),
+                };
                 let repo_cfg = match cfg {
                     BlobBackendConfig::LocalFileSystem { root } => {
                         BlobBackendConfig::LocalFileSystem {
@@ -216,7 +291,21 @@ impl RepoHandle {
                     CacheConfig::default(),
                 )?)
             }
-            None => Arc::new(LocalStore::open(&root_dir)?),
+            (None, Some(pg_cfg)) => {
+                let schema = postgres_repo_schema(&owner, &name, &pg_cfg.schema);
+                let scoped = pg_cfg.clone().with_schema(schema);
+                let meta: Arc<dyn MetadataBackend> =
+                    Arc::new(SqlMetadataBackend::connect_postgres(scoped)?);
+                let local_cas = BlobBackendConfig::LocalFileSystem {
+                    root: root_dir.join("cas"),
+                };
+                Arc::new(TieredObjectStore::from_config(
+                    &local_cas,
+                    meta,
+                    CacheConfig::default(),
+                )?)
+            }
+            (None, None) => Arc::new(LocalStore::open(&root_dir)?),
         };
         let context = Arc::new(ContextStore::open(root_dir.join("context.sqlite"))?);
         let outbox = Arc::new(WebhookOutbox::open(root_dir.join("outbox.sqlite"))?);
@@ -594,12 +683,25 @@ impl AppState {
                 return Some(p);
             }
         }
+        if let Some(ref oidc) = self.config.oidc_verifier {
+            let now = chrono::Utc::now().timestamp();
+            if let Ok(p) = oidc.verify_to_principal(token, now) {
+                return Some(p);
+            }
+        }
         None
     }
 
-    /// Returns `true` if at least one bearer token or signing secret is configured on this server.
+    /// Resolve an OpenSSH public key (`<type> <base64>`) to a registered [`Principal`].
+    pub fn resolve_ssh_key(&self, openssh_pub_line: &str) -> Option<Principal> {
+        let norm = normalize_ssh_pub_key(openssh_pub_line)?;
+        self.config.ssh_authorized_keys.get(&norm).cloned()
+    }
+
+    /// Returns `true` if at least one bearer token, signing secret, or OIDC verifier is configured.
     pub fn has_configured_tokens(&self) -> bool {
         self.config.token_signing_secret.is_some()
+            || self.config.oidc_verifier.is_some()
             || self.tokens.read().map(|g| !g.is_empty()).unwrap_or(false)
     }
 
@@ -736,13 +838,14 @@ impl AppState {
         }
 
         let dir = self.repo_dir(owner, name);
-        let existed = dir.join("metadata.sqlite").exists();
-        let handle = Arc::new(RepoHandle::open_with_backend(
+        let existed = dir.join("metadata.sqlite").exists() || dir.join("context.sqlite").exists();
+        let handle = Arc::new(RepoHandle::open_with_backends(
             owner.to_string(),
             name.to_string(),
             dir,
             self.config.default_acl.clone(),
             self.config.blob_backend.as_ref(),
+            self.config.postgres_config.as_ref(),
         )?);
         handle.set_conflict_resolver(self.config.conflict_resolver.clone());
         crate::outbox::spawn_startup_replay(
@@ -777,7 +880,7 @@ impl AppState {
         }
 
         let dir = self.repo_dir(owner, name);
-        if !dir.join("metadata.sqlite").exists() {
+        if !dir.join("metadata.sqlite").exists() && !dir.join("context.sqlite").exists() {
             return Ok(None);
         }
 
@@ -789,12 +892,13 @@ impl AppState {
             return Ok(Some(Arc::clone(handle)));
         }
 
-        let handle = Arc::new(RepoHandle::open_with_backend(
+        let handle = Arc::new(RepoHandle::open_with_backends(
             owner.to_string(),
             name.to_string(),
             dir,
             self.config.default_acl.clone(),
             self.config.blob_backend.as_ref(),
+            self.config.postgres_config.as_ref(),
         )?);
         handle.set_conflict_resolver(self.config.conflict_resolver.clone());
         crate::outbox::spawn_startup_replay(
@@ -942,4 +1046,26 @@ fn read_committed_acl(store: &dyn ObjectStore) -> Result<Option<String>> {
     let text = String::from_utf8(bytes)
         .map_err(|e| GitxError::Crypto(format!(".gitxacl is not valid UTF-8: {e}")))?;
     Ok(Some(text))
+}
+
+fn postgres_repo_schema(owner: &str, name: &str, base_schema: &str) -> String {
+    let prefix = if base_schema.is_empty() || base_schema == "public" {
+        "gitx".to_string()
+    } else {
+        base_schema.to_string()
+    };
+    let clean = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let suffix = gitx_core::ObjectHash::of_bytes(format!("{owner}/{name}").as_bytes()).short();
+    let raw = format!("{prefix}_{}_{}_{}", clean(owner), clean(name), suffix);
+    raw.chars().take(60).collect()
 }

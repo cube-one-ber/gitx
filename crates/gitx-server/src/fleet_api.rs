@@ -126,7 +126,11 @@ pub async fn download_fleet_bundle(
     Ok(Json(record))
 }
 
-fn fleet_record_path(repo_root: &std::path::Path, principal_id: &str, machine: Option<&str>) -> PathBuf {
+fn fleet_record_path(
+    repo_root: &std::path::Path,
+    principal_id: &str,
+    machine: Option<&str>,
+) -> PathBuf {
     let user_key = gitx_core::ObjectHash::of_bytes(principal_id.as_bytes()).to_hex();
     let file_name = match machine.map(str::trim).filter(|m| !m.is_empty()) {
         Some(m) => {

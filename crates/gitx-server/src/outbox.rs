@@ -101,8 +101,8 @@ impl WebhookOutbox {
         let created_str = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
         let prev_hex = previous_head.map(|h| h.to_hex());
         let new_hex = new_head.to_hex();
-        let payload_json = serde_json::to_string(payload)
-            .map_err(|e| GitxError::Serialization(e.to_string()))?;
+        let payload_json =
+            serde_json::to_string(payload).map_err(|e| GitxError::Serialization(e.to_string()))?;
 
         let conn = self
             .conn
@@ -136,7 +136,9 @@ impl WebhookOutbox {
                 params![land_seq as i64],
                 decode_outbox_row,
             )
-            .map_err(|e| GitxError::Storage(format!("failed to read inserted outbox event: {e}")))?;
+            .map_err(|e| {
+                GitxError::Storage(format!("failed to read inserted outbox event: {e}"))
+            })?;
         Ok(event)
     }
 
@@ -172,8 +174,8 @@ impl WebhookOutbox {
         let created_str = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
         let prev_hex = previous_head.map(|h| h.to_hex());
         let new_hex = new_head.to_hex();
-        let payload_json = serde_json::to_string(payload)
-            .map_err(|e| GitxError::Serialization(e.to_string()))?;
+        let payload_json =
+            serde_json::to_string(payload).map_err(|e| GitxError::Serialization(e.to_string()))?;
 
         let conn = self
             .conn
@@ -340,12 +342,15 @@ impl WebhookOutbox {
                 )
                 .map_err(|e| GitxError::Storage(format!("failed to prepare outbox query: {e}")))?;
             let rows = stmt
-                .query_map(params![before as i64, limit.max(1) as i64], decode_outbox_row)
+                .query_map(
+                    params![before as i64, limit.max(1) as i64],
+                    decode_outbox_row,
+                )
                 .map_err(|e| GitxError::Storage(format!("failed to query outbox: {e}")))?;
             for r in rows {
-                events.push(
-                    r.map_err(|e| GitxError::Storage(format!("failed to decode outbox row: {e}")))?,
-                );
+                events.push(r.map_err(|e| {
+                    GitxError::Storage(format!("failed to decode outbox row: {e}"))
+                })?);
             }
         } else {
             let mut stmt = conn
@@ -361,9 +366,9 @@ impl WebhookOutbox {
                 .query_map(params![limit.max(1) as i64], decode_outbox_row)
                 .map_err(|e| GitxError::Storage(format!("failed to query outbox: {e}")))?;
             for r in rows {
-                events.push(
-                    r.map_err(|e| GitxError::Storage(format!("failed to decode outbox row: {e}")))?,
-                );
+                events.push(r.map_err(|e| {
+                    GitxError::Storage(format!("failed to decode outbox row: {e}"))
+                })?);
             }
         }
         Ok(events)
@@ -393,7 +398,9 @@ impl WebhookOutbox {
                  ORDER BY event_id ASC
                  LIMIT ?2",
             )
-            .map_err(|e| GitxError::Storage(format!("failed to prepare pending outbox query: {e}")))?;
+            .map_err(|e| {
+                GitxError::Storage(format!("failed to prepare pending outbox query: {e}"))
+            })?;
         let rows = stmt
             .query_map(
                 params![after_event_id as i64, limit.max(1) as i64],

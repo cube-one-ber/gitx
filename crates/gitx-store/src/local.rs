@@ -1,6 +1,4 @@
-use crate::store::{
-    LandRecord, ObjectStore, safe_lz4_decompress, sort_revisions_oldest_first,
-};
+use crate::store::{LandRecord, ObjectStore, safe_lz4_decompress, sort_revisions_oldest_first};
 use chrono::{DateTime, SecondsFormat, Utc};
 use gitx_core::{
     ChangeId, ChangeSet, GitxError, ObjectHash, OpId, OpLogEntry, Result, Stack, WorkspaceRef,
@@ -179,10 +177,7 @@ fn row_to_land_record(row: &rusqlite::Row<'_>) -> Result<LandRecord> {
     let ts_str: String = row.get(5).map_err(sqlite_err)?;
     let reverted_by: Option<i64> = row.get(6).map_err(sqlite_err)?;
 
-    let previous_head = prev_str
-        .as_deref()
-        .map(ObjectHash::from_str)
-        .transpose()?;
+    let previous_head = prev_str.as_deref().map(ObjectHash::from_str).transpose()?;
     let new_head = ObjectHash::from_str(&new_str)?;
     let landed_changes: Vec<ChangeId> = bincode::deserialize(&changes_blob).map_err(ser_err)?;
     let timestamp = DateTime::parse_from_rfc3339(&ts_str)
@@ -233,7 +228,12 @@ impl ObjectStore for LocalStore {
         conn.execute(
             "INSERT OR IGNORE INTO changesets (id, change_id, created_at_ns, payload)
              VALUES (?1, ?2, ?3, ?4)",
-            params![cs.id.to_hex(), cs.change_id.to_string(), created_at_ns, payload],
+            params![
+                cs.id.to_hex(),
+                cs.change_id.to_string(),
+                created_at_ns,
+                payload
+            ],
         )
         .map_err(sqlite_err)?;
         Ok(cs.id)

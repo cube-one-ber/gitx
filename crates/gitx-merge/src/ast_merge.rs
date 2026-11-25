@@ -126,7 +126,12 @@ fn normalize_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn collect_rust_symbols(node: Node<'_>, source: &str, in_type_body: bool, out: &mut Vec<AstSymbol>) {
+fn collect_rust_symbols(
+    node: Node<'_>,
+    source: &str,
+    in_type_body: bool,
+    out: &mut Vec<AstSymbol>,
+) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if !child.is_named() {
@@ -1198,21 +1203,33 @@ fn merge_documents(
                     if o.text == t.text {
                         pieces.push(MergedPiece {
                             key: b_item.key.clone(),
-                            leading_ws: preferred_ws(&o.leading_ws, &t.leading_ws, &b_item.leading_ws),
+                            leading_ws: preferred_ws(
+                                &o.leading_ws,
+                                &t.leading_ws,
+                                &b_item.leading_ws,
+                            ),
                             text: o.text.clone(),
                             ends_with_conflict_marker: false,
                         });
                     } else if o.text == b_item.text {
                         pieces.push(MergedPiece {
                             key: b_item.key.clone(),
-                            leading_ws: preferred_ws(&t.leading_ws, &o.leading_ws, &b_item.leading_ws),
+                            leading_ws: preferred_ws(
+                                &t.leading_ws,
+                                &o.leading_ws,
+                                &b_item.leading_ws,
+                            ),
                             text: t.text.clone(),
                             ends_with_conflict_marker: false,
                         });
                     } else if t.text == b_item.text {
                         pieces.push(MergedPiece {
                             key: b_item.key.clone(),
-                            leading_ws: preferred_ws(&o.leading_ws, &t.leading_ws, &b_item.leading_ws),
+                            leading_ws: preferred_ws(
+                                &o.leading_ws,
+                                &t.leading_ws,
+                                &b_item.leading_ws,
+                            ),
                             text: o.text.clone(),
                             ends_with_conflict_marker: false,
                         });
@@ -1222,7 +1239,11 @@ fn merge_documents(
                         conflict_hunks += hunks;
                         pieces.push(MergedPiece {
                             key: b_item.key.clone(),
-                            leading_ws: preferred_ws(&o.leading_ws, &t.leading_ws, &b_item.leading_ws),
+                            leading_ws: preferred_ws(
+                                &o.leading_ws,
+                                &t.leading_ws,
+                                &b_item.leading_ws,
+                            ),
                             text: merged_text,
                             ends_with_conflict_marker: ends_marker,
                         });
@@ -1291,9 +1312,7 @@ fn merge_documents(
         } else if piece.leading_ws.contains('\n') {
             out.push_str(&piece.leading_ws);
         } else {
-            let same_import_group = prev_key
-                .as_ref()
-                .is_some_and(ItemKey::is_import_like)
+            let same_import_group = prev_key.as_ref().is_some_and(ItemKey::is_import_like)
                 && piece.key.is_import_like();
             if same_import_group {
                 out.push('\n');

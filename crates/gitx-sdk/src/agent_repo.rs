@@ -149,7 +149,13 @@ impl AgentRepo {
     pub fn in_memory(author: Identity, principal: Principal) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
         let context = ContextStore::in_memory()?;
-        Self::from_parts(store, context, AclPolicy::default_secure(), author, principal)
+        Self::from_parts(
+            store,
+            context,
+            AclPolicy::default_secure(),
+            author,
+            principal,
+        )
     }
 
     #[cfg(feature = "local")]
@@ -294,9 +300,10 @@ impl AgentRepo {
         }
 
         let (base_cs, vfs) = if let Some(existing_vfs) = self.workspaces.get(base_ref) {
-            let ws_ref = self.store.get_workspace(base_ref)?.ok_or_else(|| {
-                GitxError::NotFound(format!("workspace ref '{base_ref}'"))
-            })?;
+            let ws_ref = self
+                .store
+                .get_workspace(base_ref)?
+                .ok_or_else(|| GitxError::NotFound(format!("workspace ref '{base_ref}'")))?;
             let cs = self.store.get_changeset(ws_ref.head_changeset)?;
             if !self.acl.can_read_changeset(&self.principal, &cs) {
                 return Err(GitxError::AccessDenied {
@@ -334,7 +341,10 @@ impl AgentRepo {
             OpKind::WorkspaceCreate {
                 name: name.to_string(),
             },
-            format!("Create in-memory workspace '{name}' at {}", base_cs.id.short()),
+            format!(
+                "Create in-memory workspace '{name}' at {}",
+                base_cs.id.short()
+            ),
         )?;
 
         Ok(ws_ref)
@@ -542,7 +552,8 @@ impl AgentRepo {
         let old_combined = self.build_authorized_combined_tree(&parent_cs)?;
 
         let vfs = self.workspace_vfs(workspace)?;
-        let mut scanned = vfs.snapshot_by_domain(self.store.as_ref(), |p| self.acl.domain_for_path(p))?;
+        let mut scanned =
+            vfs.snapshot_by_domain(self.store.as_ref(), |p| self.acl.domain_for_path(p))?;
 
         let mut secret_warnings = Vec::new();
         let mut new_domain_trees = BTreeMap::new();
@@ -643,7 +654,9 @@ impl AgentRepo {
         if let Some(&parent_pub_hash) = parent_cs.domain_trees.get(&DomainId::public())
             && !new_domain_trees.contains_key(&DomainId::public())
             && !self.store.get_tree(parent_pub_hash)?.entries.is_empty()
-            && !self.acl.can_write_domain(&self.principal, &DomainId::public())
+            && !self
+                .acl
+                .can_write_domain(&self.principal, &DomainId::public())
         {
             return Err(GitxError::AccessDenied {
                 domain: DomainId::public().to_string(),
@@ -943,9 +956,10 @@ impl AgentRepo {
         let after_agent = self.store.get_tree(target_cp.tree_hash)?;
         let before_agent = match target_cp.parent_checkpoint {
             Some(parent_id) => {
-                let parent_cp = self.context.get_checkpoint(parent_id)?.ok_or_else(|| {
-                    GitxError::NotFound(format!("parent checkpoint {parent_id}"))
-                })?;
+                let parent_cp = self
+                    .context
+                    .get_checkpoint(parent_id)?
+                    .ok_or_else(|| GitxError::NotFound(format!("parent checkpoint {parent_id}")))?;
                 self.store.get_tree(parent_cp.tree_hash)?
             }
             None => {
@@ -1185,7 +1199,9 @@ impl AgentRepo {
         let mut out = String::new();
         for path in all_paths {
             let old_bytes = match old_tree.entries.get(&path) {
-                Some(EntryKind::File { blob_hash, .. }) => self.store.read_blob_bytes(*blob_hash)?,
+                Some(EntryKind::File { blob_hash, .. }) => {
+                    self.store.read_blob_bytes(*blob_hash)?
+                }
                 _ => Vec::new(),
             };
             let new_bytes = match vfs.read_slice(&path) {
@@ -1226,7 +1242,9 @@ impl AgentRepo {
             }
 
             let old_bytes = match old_tree.entries.get(&entry.path) {
-                Some(EntryKind::File { blob_hash, .. }) => self.store.read_blob_bytes(*blob_hash)?,
+                Some(EntryKind::File { blob_hash, .. }) => {
+                    self.store.read_blob_bytes(*blob_hash)?
+                }
                 _ => Vec::new(),
             };
 
@@ -1353,11 +1371,7 @@ impl AgentRepo {
         Ok(false)
     }
 
-    fn find_common_ancestor(
-        &self,
-        a: ObjectHash,
-        b: ObjectHash,
-    ) -> Result<Option<ObjectHash>> {
+    fn find_common_ancestor(&self, a: ObjectHash, b: ObjectHash) -> Result<Option<ObjectHash>> {
         let mut ancestors_a = HashSet::new();
         let mut qa = VecDeque::new();
         qa.push_back(a);

@@ -2,7 +2,7 @@ use crate::auth::{
     AuthenticatedPrincipal, can_administer_acl, can_publish_embargo, can_write_domain_effective,
     effective_allowed_domains,
 };
-use crate::derived::DerivedStats;
+use crate::derived::{DerivedStats, IndexedSymbol};
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::{OutboxEvent, spawn_webhook_dispatch};
 use crate::state::{AppState, RepoHandle, RepoInfo};
@@ -322,10 +322,7 @@ pub async fn commit(
     }
     let parent_hash = if let Some(ref parent_str) = req.parent {
         Some(resolve_hash_or_bookmark_visible(
-            &repo,
-            &policy,
-            &principal,
-            parent_str,
+            &repo, &policy, &principal, parent_str,
         )?)
     } else if let Some(h) = current_target_head {
         Some(h)
@@ -891,9 +888,7 @@ pub async fn land(
                     .merge_base(repo.store.as_ref(), target_head, incoming_cs.id)?
             }
             .or_else(|| incoming_cs.parents.first().copied());
-            let base_cs = lca_hash
-                .map(|h| repo.store.get_changeset(h))
-                .transpose()?;
+            let base_cs = lca_hash.map(|h| repo.store.get_changeset(h)).transpose()?;
 
             let mut all_domains: BTreeSet<DomainId> = BTreeSet::new();
             if let Some(ref b) = base_cs {
@@ -906,8 +901,10 @@ pub async fn land(
             let mut all_conflicts: Vec<String> = Vec::new();
 
             for dom in all_domains {
-                let base_tree = load_domain_tree_or_empty(repo.store.as_ref(), base_cs.as_ref(), &dom)?;
-                let ours_tree = load_domain_tree_or_empty(repo.store.as_ref(), Some(&target_cs), &dom)?;
+                let base_tree =
+                    load_domain_tree_or_empty(repo.store.as_ref(), base_cs.as_ref(), &dom)?;
+                let ours_tree =
+                    load_domain_tree_or_empty(repo.store.as_ref(), Some(&target_cs), &dom)?;
                 let theirs_tree =
                     load_domain_tree_or_empty(repo.store.as_ref(), Some(&incoming_cs), &dom)?;
 
@@ -1160,7 +1157,8 @@ pub async fn revert_land(
     let prev_cs = repo.store.get_changeset(previous_head)?;
     // Block un-reverting an auto-reverted or unverified `EmbargoState::Published` changeset
     // (which would bypass `can_publish_embargo` and `post_land_cmd` and disclose the embargo).
-    if repo.is_unlive_published_changeset(&prev_cs)? || repo.is_unlive_published_changeset(&new_cs)?
+    if repo.is_unlive_published_changeset(&prev_cs)?
+        || repo.is_unlive_published_changeset(&new_cs)?
     {
         return Err(ApiError::conflict(format!(
             "land_seq {land_seq} references an unverified or reverted embargo publication and cannot be reverted"
@@ -1382,7 +1380,8 @@ pub async fn get_tree(
         .map(DomainId::new)
         .transpose()?;
 
-    let Some(cs) = resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())? else {
+    let Some(cs) = resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
+    else {
         if let Some(ref dom) = domain_filter
             && !policy.can_read_domain(&principal, dom)
         {
@@ -1511,8 +1510,7 @@ pub async fn get_diff(
     let repo = get_existing_repo(&state, &owner, &name)?;
     let policy = repo.acl_snapshot()?;
 
-    let Some(to_cs) =
-        resolve_visible_changeset(&repo, &policy, &principal, query.to.as_deref())?
+    let Some(to_cs) = resolve_visible_changeset(&repo, &policy, &principal, query.to.as_deref())?
     else {
         return Ok(Json(DiffResponse {
             from: None,
@@ -1523,9 +1521,7 @@ pub async fn get_diff(
     };
 
     let from_cs = match query.from.as_deref().filter(|s| !s.is_empty()) {
-        Some(from_rev) => {
-            resolve_visible_changeset(&repo, &policy, &principal, Some(from_rev))?
-        }
+        Some(from_rev) => resolve_visible_changeset(&repo, &policy, &principal, Some(from_rev))?,
         None => first_visible_parent(&repo, &policy, &principal, &to_cs)?,
     };
 
@@ -1631,8 +1627,7 @@ pub async fn grep(
     let repo = get_existing_repo(&state, &owner, &name)?;
     let policy = repo.acl_snapshot()?;
 
-    let Some(cs) =
-        resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
+    let Some(cs) = resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
     else {
         return Ok(Json(GrepResponse {
             query: query.q,
@@ -1900,9 +1895,7 @@ pub async fn blame(
 
         for op in diff.ops() {
             match *op {
-                DiffOp::Equal {
-                    old_index, len, ..
-                } => {
+                DiffOp::Equal { old_index, len, .. } => {
                     for offset in 0..len {
                         let attr = prev_attrs
                             .get(old_index + offset)
@@ -2024,7 +2017,11 @@ pub async fn log_history(
     }
 
     // Order newest first.
-    visible.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+    visible.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
     visible.truncate(limit);
 
     let visible_head = visible.first().map(|c| c.id.to_hex());
@@ -2089,8 +2086,7 @@ pub async fn why(
     let repo = get_existing_repo(&state, &owner, &name)?;
     let policy = repo.acl_snapshot()?;
 
-    let Some(cs) =
-        resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
+    let Some(cs) = resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
     else {
         return Ok(Json(WhyResponse {
             path: norm_path,
@@ -2129,7 +2125,7 @@ pub async fn why(
 // Embargo Publication
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PublishEmbargoRequest {
     #[serde(default)]
     pub target: Option<String>,
@@ -2292,9 +2288,7 @@ pub async fn publish_embargo(
             let findings = scan_content(path, &bytes);
             if !findings.is_empty() {
                 return Err(ApiError::secret_rejected(
-                    format!(
-                        "cannot publish embargo '{advisory}': secret detected in '{path}'"
-                    ),
+                    format!("cannot publish embargo '{advisory}': secret detected in '{path}'"),
                     findings,
                 ));
             }
@@ -2327,12 +2321,9 @@ pub async fn publish_embargo(
         key_fingerprint: principal.fingerprint.clone(),
     };
 
-    let description = req.message.unwrap_or_else(|| {
-        format!(
-            "Publish advisory {}: {}",
-            advisory, embargo_cs.description
-        )
-    });
+    let description = req
+        .message
+        .unwrap_or_else(|| format!("Publish advisory {}: {}", advisory, embargo_cs.description));
 
     let published_cs = ChangeSetBuilder::new(embargo_cs.author.clone())
         .change_id(embargo_cs.change_id)
@@ -2646,6 +2637,252 @@ pub(crate) fn read_blob_authorized(
     )))
 }
 
+// ---------------------------------------------------------------------------
+// Zero-Clone Server-Side Rebase & Derived AST Symbol Query
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RebaseRequest {
+    pub changeset_id: String,
+    pub onto: String,
+    #[serde(default)]
+    pub update_bookmark: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebaseResponse {
+    pub changeset_id: String,
+    pub change_id: String,
+    pub onto: String,
+    pub has_conflicts: bool,
+    pub conflicts: Vec<String>,
+    pub updated_bookmark: Option<String>,
+}
+
+/// `POST /v1/repos/{owner}/{name}/rebase`
+///
+/// Zero-clone server-side 3-way semantic rebase of `changeset_id` onto `onto`.
+/// Records first-class algebraic conflicts inside the resulting `ChangeSet` without blocking.
+pub async fn rebase_changeset(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<RebaseRequest>,
+) -> ApiResult<Json<RebaseResponse>> {
+    if principal.is_anonymous {
+        return Err(ApiError::forbidden(
+            "anonymous callers are not permitted to rebase changesets",
+        ));
+    }
+
+    let repo = get_existing_repo(&state, &owner, &name)?;
+    let policy = repo.acl_snapshot()?;
+
+    let _bm_guard = match req
+        .update_bookmark
+        .as_deref()
+        .filter(|b| !b.trim().is_empty())
+    {
+        Some(bm) => Some(repo.try_write_target(bm)?),
+        None => None,
+    };
+
+    let src_hash = resolve_hash_or_bookmark_visible(&repo, &policy, &principal, &req.changeset_id)?;
+    let onto_hash = resolve_hash_or_bookmark_visible(&repo, &policy, &principal, &req.onto)?;
+
+    let src_cs = repo.store.get_changeset(src_hash)?;
+    let onto_cs = repo.store.get_changeset(onto_hash)?;
+
+    if !repo.can_read_changeset_live(&policy, &principal, &src_cs)
+        || !repo.can_read_changeset_live(&policy, &principal, &onto_cs)
+    {
+        return Err(ApiError::forbidden(format!(
+            "principal '{}' cannot read source or target changeset for rebase",
+            principal.id
+        )));
+    }
+    if repo.is_unlive_published_changeset(&src_cs)?
+        || repo.is_unlive_published_changeset(&onto_cs)?
+    {
+        return Err(ApiError::conflict(
+            "cannot rebase onto or from an unverified or reverted embargo publication",
+        ));
+    }
+
+    let old_base_cs = src_cs
+        .parents
+        .first()
+        .copied()
+        .map(|h| repo.store.get_changeset(h))
+        .transpose()?;
+
+    verify_changeset_write_permissions(
+        repo.store.as_ref(),
+        &policy,
+        &principal,
+        &src_cs,
+        old_base_cs.as_ref(),
+    )?;
+
+    let mut all_domains: BTreeSet<DomainId> = BTreeSet::new();
+    if let Some(ref b) = old_base_cs {
+        all_domains.extend(b.domain_trees.keys().cloned());
+    }
+    all_domains.extend(src_cs.domain_trees.keys().cloned());
+    all_domains.extend(onto_cs.domain_trees.keys().cloned());
+
+    let mut merged_domain_trees = BTreeMap::new();
+    let mut conflict_paths = Vec::new();
+    let store_ref = repo.store.as_ref();
+
+    for dom in all_domains {
+        let base_tree = load_domain_tree_or_empty(store_ref, old_base_cs.as_ref(), &dom)?;
+        let ours_tree = load_domain_tree_or_empty(store_ref, Some(&onto_cs), &dom)?;
+        let theirs_tree = load_domain_tree_or_empty(store_ref, Some(&src_cs), &dom)?;
+
+        let merge_res = merge_domain_trees(
+            &base_tree,
+            &ours_tree,
+            &theirs_tree,
+            |h| store_ref.read_blob_bytes(h),
+            |bytes| {
+                let blob = store_ref.put_blob_bytes(bytes)?;
+                Ok((blob.manifest_hash(), blob.total_size))
+            },
+        )?;
+        for cp in merge_res.conflict_paths {
+            conflict_paths.push(format!("{dom}:{cp}"));
+        }
+        if dom.is_public() || !merge_res.tree.entries.is_empty() {
+            let tree_hash = store_ref.put_tree(&merge_res.tree)?;
+            merged_domain_trees.insert(dom, tree_hash);
+        }
+    }
+
+    let has_conflicts = !conflict_paths.is_empty();
+    let public_parents = compute_public_parents(store_ref, &[onto_cs.id]);
+    let rebased = ChangeSetBuilder::new(src_cs.author.clone())
+        .change_id(src_cs.change_id)
+        .previous_revision(Some(src_cs.id))
+        .parents(vec![onto_cs.id])
+        .public_parents(public_parents)
+        .domain_trees(merged_domain_trees)
+        .committer(src_cs.committer.clone())
+        .visibility(src_cs.visibility.clone())
+        .has_conflicts(has_conflicts)
+        .description(src_cs.description.clone())
+        .build();
+
+    store_ref.put_changeset(&rebased)?;
+
+    let updated_bookmark = if let Some(ref bm) = req.update_bookmark
+        && !bm.trim().is_empty()
+    {
+        if has_conflicts && bm == "master" {
+            return Err(ApiError::conflict(format!(
+                "rebased changeset {} has unresolved conflicts; refusing to advance 'master'",
+                rebased.id
+            )));
+        }
+        let current = store_ref.get_bookmark(bm)?;
+        store_ref.cas_bookmark(bm, current, rebased.id)?;
+        Some(bm.clone())
+    } else {
+        None
+    };
+
+    Ok(Json(RebaseResponse {
+        changeset_id: rebased.id.to_hex(),
+        change_id: rebased.change_id.to_string(),
+        onto: onto_cs.id.to_hex(),
+        has_conflicts,
+        conflicts: conflict_paths,
+        updated_bookmark,
+    }))
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SymbolsQuery {
+    #[serde(default)]
+    pub rev: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolsResponse {
+    pub rev: Option<String>,
+    pub symbols: Vec<IndexedSymbol>,
+}
+
+/// `GET /v1/repos/{owner}/{name}/symbols?rev=...&path=...`
+///
+/// Zero-clone server-side Tree-sitter AST symbol listing backed by the domain-partitioned
+/// [`crate::derived::SymbolIndex`] cache.
+pub async fn get_symbols(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<SymbolsQuery>,
+) -> ApiResult<Json<SymbolsResponse>> {
+    let repo = get_existing_repo(&state, &owner, &name)?;
+    let policy = repo.acl_snapshot()?;
+
+    let Some(cs) = resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
+    else {
+        return Ok(Json(SymbolsResponse {
+            rev: None,
+            symbols: Vec::new(),
+        }));
+    };
+
+    let path_filter = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize_repo_path)
+        .transpose()?;
+
+    let filtered = policy.filter_domain_trees(&principal, &cs);
+    let ordered = ordered_domain_entries(&filtered, &cs.visibility.primary_domain);
+    let mut symbols = Vec::new();
+
+    for (dom, tree_hash) in ordered {
+        let cached = {
+            let derived = repo
+                .derived
+                .read()
+                .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+            derived
+                .symbols
+                .try_query_cached(tree_hash, dom, path_filter.as_deref())
+        };
+
+        let entries = match cached {
+            Some(hit) => hit,
+            None => {
+                let mut derived = repo
+                    .derived
+                    .write()
+                    .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+                derived.symbols.query_or_build(
+                    repo.store.as_ref(),
+                    tree_hash,
+                    dom,
+                    path_filter.as_deref(),
+                )?
+            }
+        };
+        symbols.extend(entries);
+    }
+
+    Ok(Json(SymbolsResponse {
+        rev: Some(cs.id.to_hex()),
+        symbols,
+    }))
+}
+
 pub(crate) fn get_existing_repo(
     state: &AppState,
     owner: &str,
@@ -2661,7 +2898,9 @@ fn normalize_repo_path(raw: &str) -> ApiResult<String> {
     let trimmed = replaced.trim_start_matches("./").trim_start_matches('/');
     if trimmed.is_empty()
         || trimmed.contains('\0')
-        || trimmed.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        || trimmed
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
     {
         return Err(ApiError::bad_request(format!(
             "invalid repository file path '{raw}'"
@@ -2810,8 +3049,7 @@ pub(crate) fn verify_changeset_write_permissions(
         }
     }
 
-    if acl_file_changed(store, baseline_cs, incoming_cs)?
-        && !can_administer_acl(policy, principal)
+    if acl_file_changed(store, baseline_cs, incoming_cs)? && !can_administer_acl(policy, principal)
     {
         return Err(ApiError::forbidden(format!(
             "principal '{}' is not authorized to modify .gitxacl",
@@ -2956,8 +3194,7 @@ fn ordered_domain_entries<'a>(
     filtered: &'a BTreeMap<DomainId, ObjectHash>,
     primary_domain: &DomainId,
 ) -> Vec<(&'a DomainId, ObjectHash)> {
-    let mut entries: Vec<(&DomainId, ObjectHash)> =
-        filtered.iter().map(|(d, &h)| (d, h)).collect();
+    let mut entries: Vec<(&DomainId, ObjectHash)> = filtered.iter().map(|(d, &h)| (d, h)).collect();
     entries.sort_by(|(a, _), (b, _)| {
         let rank = |d: &DomainId| -> u8 {
             if d.is_public() {

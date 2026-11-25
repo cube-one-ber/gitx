@@ -156,10 +156,34 @@ describe("GitxServerClient (against live `gitx serve`)", () => {
       const logRes = await client.log("acme", "platform", { limit: 10 });
       assert.equal(logRes.commits.length, 2);
 
-      // 5. Derived stats reflect trigram + path_history indexing
+      // 4b. Derived AST SymbolIndex query via client.symbols()
+      const symRes = await client.symbols("acme", "platform");
+      assert.ok(symRes.symbols.some((s) => s.name === "greet"));
+      assert.ok(symRes.symbols.some((s) => s.name === "farewell"));
+
+      // 4c. Server-side zero-clone Rebase via client.rebase()
+      const featureOnC1 = await client.commit("acme", "platform", {
+        message: "Add helper on c1",
+        author_name: "Alice",
+        author_email: "alice@acme.dev",
+        parent: c1.changeset_id,
+        update_target: false,
+        files: { "src/extra.ts": "export const EXTRA = 42;\n" },
+      });
+      const rebaseRes = await client.rebase("acme", "platform", {
+        changeset_id: featureOnC1.changeset_id,
+        onto: "master",
+        update_bookmark: "feat-rebased",
+      });
+      assert.equal(rebaseRes.has_conflicts, false);
+      assert.equal(rebaseRes.onto, c2.changeset_id);
+      assert.equal(rebaseRes.updated_bookmark, "feat-rebased");
+
+      // 5. Derived stats reflect trigram + path_history + symbol indexing
       const stats = await client.derivedStats("acme", "platform");
       assert.ok(stats.trigram_indexed_trees >= 1);
       assert.ok(stats.path_history_entries >= 1);
+      assert.ok(stats.symbol_indexed_trees >= 1);
 
       // 6. Durable recordContext + why query
       await client.recordContext("acme", "platform", {

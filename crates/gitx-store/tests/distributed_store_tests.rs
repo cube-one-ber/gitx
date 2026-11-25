@@ -46,7 +46,10 @@ fn verify_full_object_store_workflow(store: &TieredObjectStore) {
     for chunk in &manifest.chunks {
         assert!(store.has_chunk(chunk.hash).unwrap());
     }
-    assert_eq!(store.read_blob_bytes(manifest.manifest_hash()).unwrap(), large);
+    assert_eq!(
+        store.read_blob_bytes(manifest.manifest_hash()).unwrap(),
+        large
+    );
 
     // 2. DomainTree & ChangeSet revision ordering
     let mut tree = DomainTree::new(DomainId::public());
@@ -130,7 +133,12 @@ fn verify_full_object_store_workflow(store: &TieredObjectStore) {
 
     // Stale CAS must fail without mutating bookmark
     let stale_err = store
-        .record_land("main", Some(rev1.id), ObjectHash::of_bytes(b"stale"), vec![])
+        .record_land(
+            "main",
+            Some(rev1.id),
+            ObjectHash::of_bytes(b"stale"),
+            vec![],
+        )
         .unwrap_err();
     assert!(matches!(stale_err, GitxError::Merge(_)));
     assert_eq!(store.get_bookmark("main").unwrap(), Some(rev2.id));
@@ -218,8 +226,8 @@ fn tiered_store_over_local_filesystem_persists_across_reopen() {
 
     let payload = pseudo_random_bytes(192 * 1024, 0x1337_C0DE);
     let (manifest_hash, cs_id, land_seq) = {
-        let store = TieredObjectStore::local_fs(&blob_dir, &db_path, CacheConfig::default())
-            .unwrap();
+        let store =
+            TieredObjectStore::local_fs(&blob_dir, &db_path, CacheConfig::default()).unwrap();
         let blob = store.put_blob_bytes(&payload).unwrap();
 
         let mut tree = DomainTree::new(DomainId::public());
@@ -315,10 +323,7 @@ fn s3_r2_and_gcs_config_builders_and_validation() {
     // GCS config validation
     let gcs_cfg = GcsConfig::new("gitx-gcs-bucket").with_prefix("cas-v1");
     assert!(gcs_cfg.validate().is_ok());
-    assert_eq!(
-        BlobBackendConfig::Gcs(gcs_cfg).key_prefix(),
-        Some("cas-v1")
-    );
+    assert_eq!(BlobBackendConfig::Gcs(gcs_cfg).key_prefix(), Some("cas-v1"));
     assert!(GcsConfig::new("  ").validate().is_err());
 }
 
@@ -460,4 +465,59 @@ fn local_store_rejects_oversized_lz4_header_and_enforces_atomic_revert() {
     assert_eq!(store.get_bookmark("master").unwrap(), Some(cs1.id));
     // Double-reverting l2 fails
     assert!(store.revert_land(l2.land_seq).is_err());
+}
+
+#[test]
+fn live_postgres_driver_validates_redacts_and_handles_unreachable_endpoint_safely() {
+    // SQLite backend reports is_live_postgres() == false.
+    let sqlite_meta = SqlMetadataBackend::in_memory_sqlite().unwrap();
+    assert!(!sqlite_meta.is_live_postgres());
+
+    // Invalid URL rejects before connecting and redacts password.
+    let err = match SqlMetadataBackend::connect_postgres_url(
+        "mysql://user:TopSecretPgPass42@127.0.0.1:5432/gitx",
+    ) {
+        Ok(_) => panic!("expected invalid postgres URL to fail"),
+        Err(e) => e,
+    };
+    assert!(!err.to_string().contains("TopSecretPgPass42"));
+
+    // Valid Postgres URL pointing to an unbound local port returns clean storage error
+    // without panicking (both outside and inside an active Tokio runtime).
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unused_port = closed_listener.local_addr().unwrap().port();
+    drop(closed_listener);
+
+    let unreachable_url =
+        format!("postgres://gitx:TopSecretPgPass42@127.0.0.1:{unused_port}/gitx_test");
+    let conn_err = match SqlMetadataBackend::connect_postgres_url(&unreachable_url) {
+        Ok(_) => panic!("expected unreachable postgres to fail"),
+        Err(e) => e,
+    };
+    assert!(!conn_err.to_string().contains("TopSecretPgPass42"));
+
+    // Verify connecting from inside a Tokio runtime does not panic ("cannot start runtime from within a runtime").
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt_err = rt.block_on(async {
+        match SqlMetadataBackend::connect_postgres_url(&unreachable_url) {
+            Ok(_) => panic!("expected unreachable postgres to fail inside tokio"),
+            Err(e) => e,
+        }
+    });
+    assert!(!rt_err.to_string().contains("TopSecretPgPass42"));
+
+    // Optional live PostgreSQL end-to-end suite when `GITX_TEST_POSTGRES_URL` is configured.
+    if let Ok(live_url) = std::env::var("GITX_TEST_POSTGRES_URL") {
+        let cfg =
+            PostgresConfig::new(live_url).with_schema(format!("gitx_test_{}", std::process::id()));
+        let pg_meta = SqlMetadataBackend::connect_postgres(cfg).expect("connect live postgres");
+        assert!(pg_meta.is_live_postgres());
+        let store = TieredObjectStore::from_config(
+            &BlobBackendConfig::InMemory,
+            Arc::new(pg_meta),
+            CacheConfig::default(),
+        )
+        .unwrap();
+        verify_full_object_store_workflow(&store);
+    }
 }

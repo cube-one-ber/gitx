@@ -21,7 +21,10 @@ import type {
   ServerLandRequest,
   ServerLandResponse,
   ServerLogResponse,
+  ServerRebaseRequest,
+  ServerRebaseResponse,
   ServerRecordContextRequest,
+  ServerSymbolsResponse,
   ServerWhyResponse,
   TreeResponse,
 } from "./types.ts";
@@ -309,6 +312,30 @@ export class GitxServerClient {
       "POST",
       `/v1/repos/${encodeSegment(owner)}/${encodeSegment(name)}/land`,
       { body: req },
+    );
+  }
+
+  async rebase(
+    owner: string,
+    name: string,
+    req: ServerRebaseRequest,
+  ): Promise<ServerRebaseResponse> {
+    return this.request<ServerRebaseResponse>(
+      "POST",
+      `/v1/repos/${encodeSegment(owner)}/${encodeSegment(name)}/rebase`,
+      { body: req },
+    );
+  }
+
+  async symbols(
+    owner: string,
+    name: string,
+    query?: { rev?: string; path?: string },
+  ): Promise<ServerSymbolsResponse> {
+    return this.request<ServerSymbolsResponse>(
+      "GET",
+      `/v1/repos/${encodeSegment(owner)}/${encodeSegment(name)}/symbols`,
+      { query },
     );
   }
 

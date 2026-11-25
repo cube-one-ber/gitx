@@ -193,8 +193,7 @@ fn build_multi_domain_store() -> (MemoryStore, BTreeMap<String, ObjectHash>) {
     );
     let pub_tree_embargo_hash = store.put_tree(&pub_tree_embargo).unwrap();
 
-    let embargo_vis =
-        VisibilityPolicy::embargoed("cve-2026-1", vec![team_security], None).unwrap();
+    let embargo_vis = VisibilityPolicy::embargoed("cve-2026-1", vec![team_security], None).unwrap();
     let cs2 = ChangeSetBuilder::new(alice.clone())
         .parents(vec![cs1_id])
         .domain_tree(public_dom.clone(), pub_tree_embargo_hash)
@@ -222,7 +221,10 @@ fn build_multi_domain_store() -> (MemoryStore, BTreeMap<String, ObjectHash>) {
         "CONFLICTED.txt",
         EntryKind::Conflict {
             term: ConflictTerm {
-                adds: vec![Some(main_v1.manifest_hash()), Some(main_sec.manifest_hash())],
+                adds: vec![
+                    Some(main_v1.manifest_hash()),
+                    Some(main_sec.manifest_hash()),
+                ],
                 removes: vec![None],
             },
             mode: FileMode::Regular,
@@ -279,7 +281,10 @@ fn export_public_only_passes_strict_fsck_and_strips_private_and_embargo() {
     assert!(files.contains(&"foo/child.txt"));
     assert!(files.contains(&"foo0.txt"));
 
-    assert!(!files.contains(&".env"), "secret .env leaked into public export!");
+    assert!(
+        !files.contains(&".env"),
+        "secret .env leaked into public export!"
+    );
     assert!(
         !files.contains(&"packages/private/algo.rs"),
         "team:core file leaked into public export!"
@@ -623,4 +628,89 @@ fn smart_http_helpers_serve_real_git_clone_with_acl_filtering() {
         let _ = std::net::TcpStream::connect(addr);
     }
     let _ = server.join();
+}
+
+#[test]
+fn gix_pure_rust_importer_reads_packed_repo_symlinks_executables_and_binary_blobs() {
+    let temp = TempDir::new().unwrap();
+    let git_dir = temp.path().join("packed-git");
+    fs::create_dir_all(&git_dir).unwrap();
+
+    run_git(&git_dir, &["init", "-b", "main"]);
+    run_git(&git_dir, &["config", "user.name", "Theo"]);
+    run_git(&git_dir, &["config", "user.email", "theo@t3.gg"]);
+
+    // Commit 1: regular file, executable script, symlink, and binary blob
+    fs::create_dir_all(git_dir.join("bin")).unwrap();
+    fs::write(git_dir.join("README.md"), "# Packed Repo\n").unwrap();
+    let script_path = git_dir.join("bin/run.sh");
+    fs::write(&script_path, "#!/bin/sh\necho ok\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("README.md", git_dir.join("LINK.md")).unwrap();
+    }
+    let bin_bytes: Vec<u8> = vec![0x00, 0xFF, 0x10, 0x20, 0xDE, 0xAD, 0xBE, 0xEF];
+    fs::write(git_dir.join("asset.bin"), &bin_bytes).unwrap();
+
+    run_git(&git_dir, &["add", "."]);
+    run_git(&git_dir, &["commit", "-m", "Commit 1 with mixed modes"]);
+
+    // Commit 2: modify README to trigger delta compression when packed
+    fs::write(git_dir.join("README.md"), "# Packed Repo\nLine 2\n").unwrap();
+    run_git(&git_dir, &["add", "README.md"]);
+    run_git(&git_dir, &["commit", "-m", "Commit 2 delta"]);
+
+    // Pack ALL loose objects into a packfile and prune loose objects so the importer MUST
+    // resolve commits, trees, and blobs directly from `.git/objects/pack/*.pack` via `gix`!
+    run_git(&git_dir, &["gc", "--aggressive", "--prune=now"]);
+
+    let store = MemoryStore::new();
+    let report = import_from_git_repo(&git_dir, &store, DomainId::public())
+        .expect("gix import from packed repo");
+    assert_eq!(report.imported_commits, 2);
+    assert_eq!(report.branch, "main");
+
+    let main_cs_id = store.get_bookmark("main").unwrap().expect("main bookmark");
+    let main_cs = store.get_changeset(main_cs_id).unwrap();
+    assert_eq!(main_cs.description.trim(), "Commit 2 delta");
+    assert_eq!(main_cs.parents.len(), 1);
+
+    let tree_hash = main_cs.domain_trees[&DomainId::public()];
+    let tree = store.get_tree(tree_hash).unwrap();
+
+    let readme_blob = match tree.entries.get("README.md").expect("README.md") {
+        EntryKind::File {
+            blob_hash, mode, ..
+        } => {
+            assert_eq!(*mode, FileMode::Regular);
+            store.read_blob_bytes(*blob_hash).unwrap()
+        }
+        other => panic!("unexpected README entry: {other:?}"),
+    };
+    assert_eq!(readme_blob, b"# Packed Repo\nLine 2\n");
+
+    let bin_read = match tree.entries.get("asset.bin").expect("asset.bin") {
+        EntryKind::File { blob_hash, .. } => store.read_blob_bytes(*blob_hash).unwrap(),
+        other => panic!("unexpected binary entry: {other:?}"),
+    };
+    assert_eq!(bin_read, bin_bytes);
+
+    #[cfg(unix)]
+    {
+        match tree.entries.get("bin/run.sh").expect("bin/run.sh") {
+            EntryKind::File { mode, .. } => assert_eq!(*mode, FileMode::Executable),
+            other => panic!("unexpected script entry: {other:?}"),
+        }
+        match tree.entries.get("LINK.md").expect("LINK.md") {
+            EntryKind::File {
+                blob_hash, mode, ..
+            } => {
+                assert_eq!(*mode, FileMode::Symlink);
+                assert_eq!(store.read_blob_bytes(*blob_hash).unwrap(), b"README.md");
+            }
+            other => panic!("unexpected symlink entry: {other:?}"),
+        }
+    }
 }

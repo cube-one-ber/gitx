@@ -326,7 +326,10 @@ fn sqlite_wal_checkpoint_and_record_persistence_across_reopen() {
     // Reopen from disk and verify everything persisted cleanly.
     let reopened = ContextStore::open(&db_path).expect("reopen store");
 
-    let fetched = reopened.get_checkpoint(cp2.id).unwrap().expect("cp2 exists");
+    let fetched = reopened
+        .get_checkpoint(cp2.id)
+        .unwrap()
+        .expect("cp2 exists");
     assert_eq!(fetched, cp2);
     assert_eq!(fetched.parent_checkpoint, Some(cp1.id));
 
@@ -446,4 +449,73 @@ pub fn beta() -> i32 {
     assert_eq!(why_hits.len(), 1);
     assert_eq!(why_hits[0].record, rec);
     assert_eq!(why_hits[0].relocated_lines, (92, 93));
+}
+
+#[test]
+fn tree_sitter_ast_anchor_extracts_rust_and_ts_symbols_and_relocates_across_refactors() {
+    let ts_src = "\
+export class InvoiceEngine {
+  async calculateTax(amount: number): Promise<number> {
+    const rate = 0.08;
+    return amount * rate;
+  }
+
+  async renderPdf(amount: number): Promise<number> {
+    const rate = 0.08;
+    return amount * rate;
+  }
+}
+";
+    // Line 8..=9 is inside `renderPdf` (not `calculateTax`, which has identical body lines).
+    let ts_anchor = CodeAnchor::from_file_lines("src/invoice.ts", ts_src, 8, 9);
+    let sym = ts_anchor
+        .symbol
+        .as_deref()
+        .expect("expected AST symbol for TS method");
+    assert!(
+        sym.contains("renderPdf"),
+        "expected Tree-sitter symbol containing 'renderPdf', got '{sym}'"
+    );
+
+    // Move `renderPdf` below extra helper methods; relocation should still find `renderPdf`!
+    let ts_refactored = "\
+export class InvoiceEngine {
+  async calculateTax(amount: number): Promise<number> {
+    const rate = 0.08;
+    return amount * rate;
+  }
+
+  async estimateFee(amount: number): Promise<number> {
+    const rate = 0.08;
+    return amount * rate;
+  }
+
+  async renderPdf(amount: number): Promise<number> {
+    const rate = 0.08;
+    return amount * rate;
+  }
+}
+";
+    assert_eq!(relocate_anchor(&ts_anchor, ts_refactored), Some((13, 14)));
+
+    // Rust impl method AST anchoring.
+    let rs_src = "\
+pub struct Billing;
+
+impl Billing {
+    pub fn charge_card(cents: u64) -> u64 {
+        let fee = 30;
+        cents + fee
+    }
+}
+";
+    let rs_anchor = CodeAnchor::from_file_lines("src/billing.rs", rs_src, 5, 6);
+    let rs_sym = rs_anchor
+        .symbol
+        .as_deref()
+        .expect("expected AST symbol for Rust impl method");
+    assert!(
+        rs_sym.contains("charge_card"),
+        "expected Tree-sitter symbol containing 'charge_card', got '{rs_sym}'"
+    );
 }

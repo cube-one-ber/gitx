@@ -219,7 +219,9 @@ impl MergeQueue {
         };
         let status_json = serde_json::to_string(&entry.status)
             .map_err(|e| ApiError::internal(format!("failed to serialize queue status: {e}")))?;
-        let ts = entry.enqueued_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let ts = entry
+            .enqueued_at
+            .to_rfc3339_opts(SecondsFormat::Nanos, true);
         let conn = db
             .lock()
             .map_err(|_| ApiError::internal("merge queue sqlite mutex poisoned"))?;
@@ -303,7 +305,11 @@ impl MergeQueue {
     }
 
     /// Snapshot all entries for `target`, optionally filtering to only pending entries.
-    pub fn entries_for_target(&self, target: &str, pending_only: bool) -> ApiResult<Vec<QueueEntry>> {
+    pub fn entries_for_target(
+        &self,
+        target: &str,
+        pending_only: bool,
+    ) -> ApiResult<Vec<QueueEntry>> {
         let guard = self
             .entries
             .read()
@@ -710,31 +716,31 @@ pub async fn drain_queue(
         }
 
         // Determine merge base for 3-way semantic merge of `incoming_cs` onto `acc_trees`.
-        let base_cs: Option<ChangeSet> =
-            if let Some(first_parent) = incoming_cs.parents.first().copied()
-                && let Some(stacked_base) = landed_cs_map.get(&first_parent)
-            {
-                Some(stacked_base.clone())
-            } else if let Some(head_hash) = initial_head {
-                let lca = {
-                    let mut derived = repo
-                        .derived
-                        .write()
-                        .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
-                    derived
-                        .commit_graph
-                        .merge_base(repo.store.as_ref(), head_hash, incoming_cs.id)?
-                }
-                .or_else(|| incoming_cs.parents.first().copied());
-                lca.map(|h| repo.store.get_changeset(h)).transpose()?
-            } else {
-                incoming_cs
-                    .parents
-                    .first()
-                    .copied()
-                    .map(|h| repo.store.get_changeset(h))
-                    .transpose()?
-            };
+        let base_cs: Option<ChangeSet> = if let Some(first_parent) =
+            incoming_cs.parents.first().copied()
+            && let Some(stacked_base) = landed_cs_map.get(&first_parent)
+        {
+            Some(stacked_base.clone())
+        } else if let Some(head_hash) = initial_head {
+            let lca = {
+                let mut derived = repo
+                    .derived
+                    .write()
+                    .map_err(|_| ApiError::internal("derived index rwlock poisoned"))?;
+                derived
+                    .commit_graph
+                    .merge_base(repo.store.as_ref(), head_hash, incoming_cs.id)?
+            }
+            .or_else(|| incoming_cs.parents.first().copied());
+            lca.map(|h| repo.store.get_changeset(h)).transpose()?
+        } else {
+            incoming_cs
+                .parents
+                .first()
+                .copied()
+                .map(|h| repo.store.get_changeset(h))
+                .transpose()?
+        };
 
         let mut all_domains: BTreeSet<DomainId> = BTreeSet::new();
         if let Some(ref b) = base_cs {
@@ -960,7 +966,8 @@ pub async fn drain_queue(
         )));
     }
 
-    let landed_change_ids: Vec<ChangeId> = staged_landed.iter().map(|(_, cs)| cs.change_id).collect();
+    let landed_change_ids: Vec<ChangeId> =
+        staged_landed.iter().map(|(_, cs)| cs.change_id).collect();
 
     // Mark `final_head` as awaiting verification so concurrent `GET /outbox` reconciliation never
     // backfills a premature `"land"` row before `post_land_cmd` finishes.

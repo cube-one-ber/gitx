@@ -10,10 +10,7 @@ pub enum MergeOutcome {
     /// Merged cleanly with no conflicts.
     Clean(Vec<u8>),
     /// Merge produced one or more conflicts, materialized with diff3 markers.
-    Conflict {
-        materialized: Vec<u8>,
-        hunks: usize,
-    },
+    Conflict { materialized: Vec<u8>, hunks: usize },
 }
 
 impl MergeOutcome {

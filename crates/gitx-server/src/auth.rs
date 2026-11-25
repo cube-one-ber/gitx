@@ -224,9 +224,7 @@ pub fn effective_allowed_domains(
                     unreadable_active_embargoes.insert(cs.visibility.primary_domain.clone());
                 }
             }
-            Some(EmbargoState::Published { .. })
-                if policy.can_read_changeset(principal, cs) =>
-            {
+            Some(EmbargoState::Published { .. }) if policy.can_read_changeset(principal, cs) => {
                 readable_embargoes.insert(cs.visibility.primary_domain.clone());
             }
             Some(EmbargoState::Published { .. }) | None => {}

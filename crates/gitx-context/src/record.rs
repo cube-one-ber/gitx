@@ -1,4 +1,4 @@
-use crate::anchor::{compute_hunk_fingerprint, extract_symbol_hint};
+use crate::anchor::{compute_hunk_fingerprint, extract_symbol_hint_for_path};
 use chrono::{DateTime, Utc};
 use gitx_core::{Actor, ChangeId, DomainId, GitxError, Identity, ObjectHash, Result};
 use serde::{Deserialize, Serialize};
@@ -111,12 +111,13 @@ impl CodeAnchor {
             &[]
         };
 
+        let path_str = path.into();
         let hunk_fingerprint = compute_hunk_fingerprint(slice);
         let snippet = slice.join("\n");
-        let symbol = extract_symbol_hint(file_content, line_start);
+        let symbol = extract_symbol_hint_for_path(&path_str, file_content, line_start);
 
         Self {
-            path: path.into(),
+            path: path_str,
             line_start,
             line_end,
             symbol,

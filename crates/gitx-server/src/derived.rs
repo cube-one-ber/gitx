@@ -42,6 +42,14 @@ pub struct DerivedStats {
     pub path_history_entries: usize,
     pub path_history_cache_hits: u64,
     pub path_history_cache_misses: u64,
+    #[serde(default)]
+    pub symbol_indexed_trees: usize,
+    #[serde(default)]
+    pub symbol_total_symbols: usize,
+    #[serde(default)]
+    pub symbol_cache_hits: u64,
+    #[serde(default)]
+    pub symbol_cache_misses: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +246,10 @@ impl TrigramIndex {
         Ok(())
     }
 
-    fn stats_filtered(&self, allowed: Option<&BTreeSet<DomainId>>) -> (usize, Vec<String>, usize, u64, u64) {
+    fn stats_filtered(
+        &self,
+        allowed: Option<&BTreeSet<DomainId>>,
+    ) -> (usize, Vec<String>, usize, u64, u64) {
         let mut tree_count = 0usize;
         let mut domains = BTreeSet::new();
         let mut total_postings = 0usize;
@@ -447,7 +458,10 @@ impl CommitGraphIndex {
                         return Ok(true);
                     }
                     if !visited.contains(&parent)
-                        && self.nodes.get(&parent).is_some_and(|p| p.depth >= anc_depth)
+                        && self
+                            .nodes
+                            .get(&parent)
+                            .is_some_and(|p| p.depth >= anc_depth)
                     {
                         queue.push_back(parent);
                     }
@@ -572,7 +586,12 @@ impl PathHistoryIndex {
     }
 
     /// Return cached touching commits for `(path, domain)` if `head` matches the cached tip.
-    pub fn get_cached(&self, head: ObjectHash, path: &str, domain: &DomainId) -> Option<Vec<ObjectHash>> {
+    pub fn get_cached(
+        &self,
+        head: ObjectHash,
+        path: &str,
+        domain: &DomainId,
+    ) -> Option<Vec<ObjectHash>> {
         let key = (path.to_string(), domain.clone());
         if self.tips.get(&key).copied() != Some(head) {
             return None;
@@ -707,6 +726,150 @@ fn lookup_path_blob(
 }
 
 // ---------------------------------------------------------------------------
+// 4. SymbolIndex — strictly partitioned by (tree_hash, DomainId)
+// ---------------------------------------------------------------------------
+
+/// A symbol extracted and cached by [`SymbolIndex`] for a `(tree_hash, domain)` tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedSymbol {
+    pub path: String,
+    pub domain: String,
+    pub name: String,
+    pub kind: String,
+    pub line_start: u32,
+    pub line_end: u32,
+}
+
+/// Domain-partitioned Tree-sitter AST symbol index keyed strictly by `(tree_hash, DomainId)`.
+#[derive(Debug, Default)]
+pub struct SymbolIndex {
+    trees: HashMap<(ObjectHash, DomainId), Vec<IndexedSymbol>>,
+    domain_hits: HashMap<DomainId, AtomicU64>,
+    domain_misses: HashMap<DomainId, AtomicU64>,
+}
+
+impl SymbolIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn try_query_cached(
+        &self,
+        tree_hash: ObjectHash,
+        domain: &DomainId,
+        path_filter: Option<&str>,
+    ) -> Option<Vec<IndexedSymbol>> {
+        let entries = self.trees.get(&(tree_hash, domain.clone()))?;
+        if let Some(counter) = self.domain_hits.get(domain) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(filter_indexed_symbols(entries, path_filter))
+    }
+
+    pub fn query_or_build(
+        &mut self,
+        store: &dyn ObjectStore,
+        tree_hash: ObjectHash,
+        domain: &DomainId,
+        path_filter: Option<&str>,
+    ) -> Result<Vec<IndexedSymbol>> {
+        let key = (tree_hash, domain.clone());
+        if let Some(entries) = self.trees.get(&key) {
+            self.domain_hits
+                .entry(domain.clone())
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(filter_indexed_symbols(entries, path_filter));
+        }
+
+        let tree = store.get_tree(tree_hash)?;
+        if &tree.domain != domain {
+            return Err(GitxError::AccessDenied {
+                domain: domain.to_string(),
+                reason: format!(
+                    "domain tree {tree_hash} belongs to '{}' rather than '{domain}'",
+                    tree.domain
+                ),
+            });
+        }
+
+        let mut built = Vec::new();
+        for (path, entry) in &tree.entries {
+            if let EntryKind::File { blob_hash, .. } = entry {
+                let bytes = store.read_blob_bytes(*blob_hash)?;
+                if let Ok(source) = std::str::from_utf8(&bytes) {
+                    for sym in gitx_merge::extract_ast_symbols(path, source) {
+                        built.push(IndexedSymbol {
+                            path: path.clone(),
+                            domain: domain.to_string(),
+                            name: sym.name,
+                            kind: sym.kind,
+                            line_start: sym.line_start,
+                            line_end: sym.line_end,
+                        });
+                    }
+                }
+            }
+        }
+
+        let filtered = filter_indexed_symbols(&built, path_filter);
+        if self.trees.len() >= MAX_CACHED_TRIGRAM_TREES
+            && let Some(evict_key) = self.trees.keys().next().cloned()
+        {
+            self.trees.remove(&evict_key);
+        }
+        self.trees.insert(key, built);
+        self.domain_hits
+            .entry(domain.clone())
+            .or_insert_with(|| AtomicU64::new(0));
+        self.domain_misses
+            .entry(domain.clone())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(filtered)
+    }
+
+    fn stats_filtered(&self, allowed: Option<&BTreeSet<DomainId>>) -> (usize, usize, u64, u64) {
+        let mut tree_count = 0usize;
+        let mut total_symbols = 0usize;
+        for ((_, dom), syms) in &self.trees {
+            if allowed.is_some_and(|set| !set.contains(dom)) {
+                continue;
+            }
+            tree_count += 1;
+            total_symbols += syms.len();
+        }
+        let mut hits = 0u64;
+        for (dom, c) in &self.domain_hits {
+            if allowed.is_none_or(|set| set.contains(dom)) {
+                hits += c.load(Ordering::Relaxed);
+            }
+        }
+        let mut misses = 0u64;
+        for (dom, c) in &self.domain_misses {
+            if allowed.is_none_or(|set| set.contains(dom)) {
+                misses += c.load(Ordering::Relaxed);
+            }
+        }
+        (tree_count, total_symbols, hits, misses)
+    }
+}
+
+fn filter_indexed_symbols(
+    entries: &[IndexedSymbol],
+    path_filter: Option<&str>,
+) -> Vec<IndexedSymbol> {
+    match path_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(target) => entries
+            .iter()
+            .filter(|s| s.path == target)
+            .cloned()
+            .collect(),
+        None => entries.to_vec(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unified DerivedIndex attached to RepoHandle
 // ---------------------------------------------------------------------------
 
@@ -716,6 +879,7 @@ pub struct DerivedIndex {
     pub trigram: TrigramIndex,
     pub commit_graph: CommitGraphIndex,
     pub path_history: PathHistoryIndex,
+    pub symbols: SymbolIndex,
 }
 
 impl DerivedIndex {
@@ -745,6 +909,8 @@ impl DerivedIndex {
             self.commit_graph.stats_filtered(allowed);
         let (path_history_entries, path_history_cache_hits, path_history_cache_misses) =
             self.path_history.stats_filtered(allowed);
+        let (symbol_indexed_trees, symbol_total_symbols, symbol_cache_hits, symbol_cache_misses) =
+            self.symbols.stats_filtered(allowed);
 
         DerivedStats {
             trigram_indexed_trees,
@@ -758,6 +924,10 @@ impl DerivedIndex {
             path_history_entries,
             path_history_cache_hits,
             path_history_cache_misses,
+            symbol_indexed_trees,
+            symbol_total_symbols,
+            symbol_cache_hits,
+            symbol_cache_misses,
         }
     }
 }
@@ -834,11 +1004,18 @@ mod tests {
         let pub_dom = DomainId::public();
         let core_dom = DomainId::team("core").unwrap();
 
-        let pub_tree = make_tree(&store, pub_dom.clone(), &[("src/lib.rs", "pub fn hello_world() {}\n")]);
+        let pub_tree = make_tree(
+            &store,
+            pub_dom.clone(),
+            &[("src/lib.rs", "pub fn hello_world() {}\n")],
+        );
         let core_tree = make_tree(
             &store,
             core_dom.clone(),
-            &[("packages/private/secret.rs", "pub const KEY: &str = \"CORE_SECRET_ALPHA\";\n")],
+            &[(
+                "packages/private/secret.rs",
+                "pub const KEY: &str = \"CORE_SECRET_ALPHA\";\n",
+            )],
         );
 
         let mut idx = DerivedIndex::new();
@@ -866,9 +1043,9 @@ mod tests {
         assert!(pub_res.is_empty());
 
         // Attempting to index a core_dom tree under public is rejected by domain check
-        let cross_err = idx
-            .trigram
-            .query_or_build(&store, core_tree, &pub_dom, "CORE_SECRET_ALPHA");
+        let cross_err =
+            idx.trigram
+                .query_or_build(&store, core_tree, &pub_dom, "CORE_SECRET_ALPHA");
         assert!(cross_err.is_err());
 
         // ACL-filtered stats for public-only caller must not expose team:core

@@ -71,8 +71,9 @@ fn build_wrap_aad(
     let domain_bytes = domain.as_str().as_bytes();
     let path_bytes = path.as_bytes();
     let fp_bytes = recipient_fingerprint.as_bytes();
-    let mut aad =
-        Vec::with_capacity(20 + 4 + domain_bytes.len() + 4 + path_bytes.len() + 4 + fp_bytes.len() + 8);
+    let mut aad = Vec::with_capacity(
+        20 + 4 + domain_bytes.len() + 4 + path_bytes.len() + 4 + fp_bytes.len() + 8,
+    );
     aad.extend_from_slice(b"gitx:secret-wrap:v1\0");
     aad.extend_from_slice(&(domain_bytes.len() as u32).to_be_bytes());
     aad.extend_from_slice(domain_bytes);

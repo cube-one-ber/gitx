@@ -5,9 +5,7 @@ use gitx_core::{
     ChangeSetBuilder, DomainId, DomainTree, EmbargoState, EntryKind, FileMode, OpKind,
     VisibilityPolicy,
 };
-use gitx_crypto::{
-    PublicKeyBundle, UserKeyPair, decrypt_secret, encrypt_secret, rotate_secret,
-};
+use gitx_crypto::{PublicKeyBundle, UserKeyPair, decrypt_secret, encrypt_secret, rotate_secret};
 use gitx_store::ObjectStore;
 use gitx_vfs::normalize_rel_path;
 use std::env;
@@ -160,8 +158,8 @@ pub fn cmd_secret_grant(name: String, pubkey_json: String) -> Result<()> {
         pubkey_json
     };
 
-    let bundle: PublicKeyBundle = serde_json::from_str(&raw_json)
-        .context("failed to parse PublicKeyBundle JSON")?;
+    let bundle: PublicKeyBundle =
+        serde_json::from_str(&raw_json).context("failed to parse PublicKeyBundle JSON")?;
     let fp = bundle.fingerprint();
 
     let mut keyring = repo.load_keyring()?;
@@ -172,11 +170,7 @@ pub fn cmd_secret_grant(name: String, pubkey_json: String) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_secret_rotate(
-    path: String,
-    domain_raw: String,
-    drop: Option<String>,
-) -> Result<()> {
+pub fn cmd_secret_rotate(path: String, domain_raw: String, drop: Option<String>) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
     let domain = DomainId::new(&domain_raw)?;
     let norm_path = normalize_rel_path(&path)?;
@@ -444,7 +438,10 @@ pub fn cmd_embargo_publish(advisory: String) -> Result<()> {
         OpKind::EmbargoPublish {
             advisory_id: advisory.clone(),
         },
-        format!("Published embargo '{advisory}' -> {}", published_cs.id.short()),
+        format!(
+            "Published embargo '{advisory}' -> {}",
+            published_cs.id.short()
+        ),
     )?;
 
     println!(
@@ -460,6 +457,7 @@ pub fn cmd_secret_import_ssh(
     private_path: Option<std::path::PathBuf>,
     pub_path: Option<std::path::PathBuf>,
     name: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
     let mut keyring = repo.load_keyring()?;
@@ -489,8 +487,11 @@ pub fn cmd_secret_import_ssh(
     let key_path = match private_path {
         Some(p) => p,
         None => {
-            let home = env::var("HOME").context("HOME environment variable not set; pass --path")?;
-            std::path::PathBuf::from(home).join(".ssh").join("id_ed25519")
+            let home =
+                env::var("HOME").context("HOME environment variable not set; pass --path")?;
+            std::path::PathBuf::from(home)
+                .join(".ssh")
+                .join("id_ed25519")
         }
     };
 
@@ -500,7 +501,14 @@ pub fn cmd_secret_import_ssh(
             key_path.display()
         )
     })?;
-    let kp = UserKeyPair::from_openssh_ed25519(&pem, name.clone())?;
+    let effective_pass = passphrase
+        .or_else(|| env::var("GITX_SSH_PASSPHRASE").ok())
+        .filter(|s| !s.is_empty());
+    let kp = UserKeyPair::from_openssh_ed25519_with_passphrase(
+        &pem,
+        effective_pass.as_deref(),
+        name.clone(),
+    )?;
     let fp = kp.fingerprint();
     let label = name
         .or_else(|| kp.label().map(ToString::to_string))
@@ -545,7 +553,10 @@ pub fn cmd_secret_revoke(target: String) -> Result<()> {
 
     let recipients: Vec<PublicKeyBundle> = keyring.recipients.values().cloned().collect();
     if recipients.is_empty() {
-        bail!("cannot revoke '{}': zero remaining recipients in keyring", target);
+        bail!(
+            "cannot revoke '{}': zero remaining recipients in keyring",
+            target
+        );
     }
 
     let cur = repo.current_changeset()?;

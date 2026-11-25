@@ -284,7 +284,8 @@ impl<'a> GitSshSession<'a> {
             }
             GitSshService::ReceivePack => {
                 let Some(ref target_domain) = self.write_domain else {
-                    let err_pkt = encode_pkt_line(b"ERR write access denied for this SSH session\n");
+                    let err_pkt =
+                        encode_pkt_line(b"ERR write access denied for this SSH session\n");
                     let _ = output.write_all(&err_pkt);
                     let _ = output.write_all(&encode_flush_pkt());
                     let _ = output.flush();
@@ -499,10 +500,9 @@ where
     }
 
     let mut child = cmd.spawn()?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GitxError::GitBridge(format!("failed to open stdin for git {subcommand}")))?;
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        GitxError::GitBridge(format!("failed to open stdin for git {subcommand}"))
+    })?;
     let mut child_stdout = child.stdout.take().ok_or_else(|| {
         GitxError::GitBridge(format!("failed to open stdout for git {subcommand}"))
     })?;
@@ -698,10 +698,9 @@ where
     }
 
     let mut child = cmd.spawn()?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GitxError::GitBridge("failed to open stdin for git receive-pack".to_string()))?;
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        GitxError::GitBridge("failed to open stdin for git receive-pack".to_string())
+    })?;
     let mut child_stdout = child.stdout.take().ok_or_else(|| {
         GitxError::GitBridge("failed to open stdout for git receive-pack".to_string())
     })?;
@@ -1050,9 +1049,7 @@ fn import_received_refs_internal(
             return true;
         }
         match principal {
-            Some(p) => {
-                p.roles.iter().any(|r| r == "admin") || policy.can_write_domain(p, dom)
-            }
+            Some(p) => p.roles.iter().any(|r| r == "admin") || policy.can_write_domain(p, dom),
             None => false,
         }
     };
@@ -1143,9 +1140,8 @@ fn import_received_refs_internal(
             let meta = std::str::from_utf8(&record[..tab_pos]).map_err(|e| {
                 GitxError::GitBridge(format!("invalid ls-tree metadata UTF-8: {e}"))
             })?;
-            let path = std::str::from_utf8(&record[tab_pos + 1..]).map_err(|e| {
-                GitxError::GitBridge(format!("invalid ls-tree path UTF-8: {e}"))
-            })?;
+            let path = std::str::from_utf8(&record[tab_pos + 1..])
+                .map_err(|e| GitxError::GitBridge(format!("invalid ls-tree path UTF-8: {e}")))?;
             let mut parts = meta.split_whitespace();
             let mode_str = parts.next().unwrap_or("100644");
             let obj_type = parts.next().unwrap_or("");

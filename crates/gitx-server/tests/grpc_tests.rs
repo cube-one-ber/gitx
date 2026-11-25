@@ -149,6 +149,7 @@ async fn grpc_end_to_end_zero_clone_and_merge_queue_workflow() {
                 embargo_advisory: None,
                 embargo_allowed_teams: vec![],
                 context_prompt: Some("Create alpha helper".to_string()),
+                secret_envelopes: vec![],
             },
             CORE_TOKEN,
         ))
@@ -181,6 +182,7 @@ async fn grpc_end_to_end_zero_clone_and_merge_queue_workflow() {
                 embargo_advisory: None,
                 embargo_allowed_teams: vec![],
                 context_prompt: None,
+                secret_envelopes: vec![],
             },
             CORE_TOKEN,
         ))
@@ -373,6 +375,7 @@ async fn grpc_end_to_end_zero_clone_and_merge_queue_workflow() {
                 embargo_advisory: None,
                 embargo_allowed_teams: vec![],
                 context_prompt: None,
+                secret_envelopes: vec![],
             },
             CORE_TOKEN,
         ))
@@ -401,6 +404,7 @@ async fn grpc_end_to_end_zero_clone_and_merge_queue_workflow() {
                 embargo_advisory: None,
                 embargo_allowed_teams: vec![],
                 context_prompt: None,
+                secret_envelopes: vec![],
             },
             CORE_TOKEN,
         ))
@@ -510,6 +514,7 @@ async fn grpc_enforces_bearer_auth_and_strict_acl_isolation() {
                 embargo_advisory: None,
                 embargo_allowed_teams: vec![],
                 context_prompt: None,
+                secret_envelopes: vec![],
             },
             CORE_TOKEN,
         ))
@@ -526,8 +531,9 @@ async fn grpc_enforces_bearer_auth_and_strict_acl_isolation() {
                 files: vec![
                     FileWrite {
                         path: "packages/private/billing.rs".to_string(),
-                        content: b"pub const SECRET_CORE_FORMULA: &str = \"CORE_ONLY_SECRET_999\";\n"
-                            .to_vec(),
+                        content:
+                            b"pub const SECRET_CORE_FORMULA: &str = \"CORE_ONLY_SECRET_999\";\n"
+                                .to_vec(),
                     },
                     FileWrite {
                         path: ".env".to_string(),
@@ -546,6 +552,7 @@ async fn grpc_enforces_bearer_auth_and_strict_acl_isolation() {
                 embargo_advisory: None,
                 embargo_allowed_teams: vec![],
                 context_prompt: None,
+                secret_envelopes: vec![],
             },
             CORE_TOKEN,
         ))
@@ -706,6 +713,7 @@ async fn grpc_enforces_bearer_auth_and_strict_acl_isolation() {
                 embargo_advisory: None,
                 embargo_allowed_teams: vec![],
                 context_prompt: None,
+                secret_envelopes: vec![],
             },
             PUBLIC_TOKEN,
         ))
@@ -725,4 +733,288 @@ async fn grpc_enforces_bearer_auth_and_strict_acl_isolation() {
         .await
         .unwrap_err();
     assert_eq!(anon_land.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn grpc_parity_log_why_symbols_rebase_embargo_fleet_and_secret_envelopes() {
+    use gitx_core::DomainId;
+    use gitx_crypto::{UserKeyPair, encrypt_secret};
+    use gitx_proto::{
+        DownloadFleetBundleRequest, LogRequest, PublishEmbargoRequest, RebaseRequest,
+        SecretEnvelopeEntry, SymbolsRequest, UploadFleetBundleRequest, WhyRequest,
+    };
+
+    let acl = "\
+.env -> secret:dev
+[domain secret:dev]
+read = team:core
+write = team:core
+";
+    let srv = GrpcTestServer::start(Some(acl)).await;
+    let mut client = srv.client().await;
+
+    let alice_kp = UserKeyPair::generate_with_label("alice");
+    let env_obj = encrypt_secret(
+        &DomainId::secret("dev").unwrap(),
+        ".env",
+        1,
+        b"GRPC_SECRET=super_hidden\n",
+        &[alice_kp.public_bundle()],
+    )
+    .unwrap();
+
+    // 1. Commit with context_prompt AND encrypted secret_envelope via gRPC!
+    let c1 = client
+        .commit(with_bearer(
+            CommitRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                files: vec![FileWrite {
+                    path: "src/engine.rs".to_string(),
+                    content: b"pub fn run_engine() -> u32 {\n    42\n}\n".to_vec(),
+                }],
+                delete_files: vec![],
+                message: "Initial engine + encrypted .env".to_string(),
+                author_name: "Alice".to_string(),
+                author_email: "alice@acme.dev".to_string(),
+                actor_agent: None,
+                target: None,
+                parent: None,
+                update_target: Some(true),
+                visibility_domain: None,
+                embargo_advisory: None,
+                embargo_allowed_teams: vec![],
+                context_prompt: Some("Implement deterministic engine entrypoint".to_string()),
+                secret_envelopes: vec![SecretEnvelopeEntry {
+                    domain: "secret:dev".to_string(),
+                    path: ".env".to_string(),
+                    envelope_json: serde_json::to_string(&env_obj).unwrap(),
+                }],
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(c1.domains_written.contains(&"secret:dev".to_string()));
+
+    // 2. Log RPC
+    let log = client
+        .log(with_bearer(
+            LogRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                rev: None,
+                limit: Some(10),
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(log.commits.len(), 1);
+    assert_eq!(log.commits[0].changeset_id, c1.changeset_id);
+
+    // 3. Why RPC
+    let why = client
+        .why(with_bearer(
+            WhyRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                path: "src/engine.rs".to_string(),
+                line: Some(1),
+                rev: None,
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(why.matches_json.contains("deterministic engine entrypoint"));
+
+    // 4. Symbols RPC
+    let syms = client
+        .symbols(with_bearer(
+            SymbolsRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                rev: None,
+                path: None,
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(syms.symbols.iter().any(|s| s.name == "run_engine"));
+
+    // 5. Rebase RPC
+    let master_adv = client
+        .commit(with_bearer(
+            CommitRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                files: vec![FileWrite {
+                    path: "src/engine.rs".to_string(),
+                    content: b"pub fn run_engine() -> u32 {\n    42\n}\npub fn master_fn() {}\n"
+                        .to_vec(),
+                }],
+                delete_files: vec![],
+                message: "Add master_fn".to_string(),
+                author_name: "Alice".to_string(),
+                author_email: "alice@acme.dev".to_string(),
+                actor_agent: None,
+                target: None,
+                parent: None,
+                update_target: Some(true),
+                visibility_domain: None,
+                embargo_advisory: None,
+                embargo_allowed_teams: vec![],
+                context_prompt: None,
+                secret_envelopes: vec![],
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let feat = client
+        .commit(with_bearer(
+            CommitRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                files: vec![FileWrite {
+                    path: "src/engine.rs".to_string(),
+                    content: b"pub fn run_engine() -> u32 {\n    42\n}\npub fn feat_fn() {}\n"
+                        .to_vec(),
+                }],
+                delete_files: vec![],
+                message: "Add feat_fn".to_string(),
+                author_name: "Alice".to_string(),
+                author_email: "alice@acme.dev".to_string(),
+                actor_agent: None,
+                target: None,
+                parent: Some(c1.changeset_id.clone()),
+                update_target: Some(false),
+                visibility_domain: None,
+                embargo_advisory: None,
+                embargo_allowed_teams: vec![],
+                context_prompt: None,
+                secret_envelopes: vec![],
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let rebased = client
+        .rebase(with_bearer(
+            RebaseRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                changeset_id: feat.changeset_id,
+                onto: "master".to_string(),
+                update_bookmark: Some("feat-grpc".to_string()),
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!rebased.has_conflicts);
+    assert_eq!(rebased.onto, master_adv.changeset_id);
+
+    // 6. Embargo commit + PublishEmbargo RPC
+    let _embargo = client
+        .commit(with_bearer(
+            CommitRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                files: vec![FileWrite {
+                    path: "src/patch.rs".to_string(),
+                    content: b"pub fn cve_fix() -> bool { true }\n".to_vec(),
+                }],
+                delete_files: vec![],
+                message: "CVE-2026-9999 fix".to_string(),
+                author_name: "Alice".to_string(),
+                author_email: "alice@acme.dev".to_string(),
+                actor_agent: None,
+                target: None,
+                parent: None,
+                update_target: Some(false),
+                visibility_domain: None,
+                embargo_advisory: Some("CVE-2026-9999".to_string()),
+                embargo_allowed_teams: vec!["security".to_string()],
+                context_prompt: None,
+                secret_envelopes: vec![],
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let published = client
+        .publish_embargo(with_bearer(
+            PublishEmbargoRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                advisory: "CVE-2026-9999".to_string(),
+                target: Some("master".to_string()),
+                message: Some("Publish CVE-2026-9999".to_string()),
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(published.advisory, "CVE-2026-9999");
+    assert!(published.land_seq >= 1);
+
+    // 7. UploadFleetBundle + DownloadFleetBundle RPC (scoped per principal!)
+    let enc_bundle = r#"{"format_version":1,"machine_id":"box-a","file_count":1,"envelope":{"domain":"secret:fleet","key_epoch":1}}"#;
+    let uploaded = client
+        .upload_fleet_bundle(with_bearer(
+            UploadFleetBundleRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                bundle_json: enc_bundle.to_string(),
+                machine: Some("box-a".to_string()),
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(uploaded.principal_id, "alice");
+
+    // Different principal cannot read Alice's fleet bundle.
+    let other_err = client
+        .download_fleet_bundle(with_bearer(
+            DownloadFleetBundleRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                machine: None,
+            },
+            PUBLIC_TOKEN,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(other_err.code(), Code::NotFound);
+
+    let downloaded = client
+        .download_fleet_bundle(with_bearer(
+            DownloadFleetBundleRequest {
+                owner: "acme".to_string(),
+                name: "parity".to_string(),
+                machine: None,
+            },
+            CORE_TOKEN,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(downloaded.bundle_json, enc_bundle);
 }

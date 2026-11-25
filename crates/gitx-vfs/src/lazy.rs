@@ -147,7 +147,12 @@ impl LazyWorkspace {
         let prefix = format!("{norm}/");
 
         let mut results = BTreeSet::new();
-        for key in self.base_tree.entries.range(prefix.clone()..).map(|(k, _)| k) {
+        for key in self
+            .base_tree
+            .entries
+            .range(prefix.clone()..)
+            .map(|(k, _)| k)
+        {
             if !key.starts_with(&prefix) {
                 break;
             }

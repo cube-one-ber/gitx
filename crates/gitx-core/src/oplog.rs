@@ -41,21 +41,59 @@ pub struct WorkspaceRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
     Init,
-    Snapshot { workspace: String },
-    NewChange { change_id: ChangeId },
-    Describe { change_id: ChangeId },
-    Split { source: ChangeId, created: ChangeId },
-    Squash { from: ChangeId, into: ChangeId },
-    Rebase { moved: Vec<ChangeId> },
-    StackSync { restacked: usize, pruned: usize },
-    Land { target: String, land_seq: u64, changes: Vec<ChangeId> },
-    Revert { land_seq: u64 },
-    WorkspaceCreate { name: String },
-    WorkspaceRemove { name: String },
-    SecretUpdate { domain: String, path: String, key_epoch: u64 },
-    EmbargoPublish { advisory_id: String },
-    Undo { target_op: OpId },
-    AgentCheckpoint { session_id: String, prompt_hash: ObjectHash },
+    Snapshot {
+        workspace: String,
+    },
+    NewChange {
+        change_id: ChangeId,
+    },
+    Describe {
+        change_id: ChangeId,
+    },
+    Split {
+        source: ChangeId,
+        created: ChangeId,
+    },
+    Squash {
+        from: ChangeId,
+        into: ChangeId,
+    },
+    Rebase {
+        moved: Vec<ChangeId>,
+    },
+    StackSync {
+        restacked: usize,
+        pruned: usize,
+    },
+    Land {
+        target: String,
+        land_seq: u64,
+        changes: Vec<ChangeId>,
+    },
+    Revert {
+        land_seq: u64,
+    },
+    WorkspaceCreate {
+        name: String,
+    },
+    WorkspaceRemove {
+        name: String,
+    },
+    SecretUpdate {
+        domain: String,
+        path: String,
+        key_epoch: u64,
+    },
+    EmbargoPublish {
+        advisory_id: String,
+    },
+    Undo {
+        target_op: OpId,
+    },
+    AgentCheckpoint {
+        session_id: String,
+        prompt_hash: ObjectHash,
+    },
 }
 
 /// Immutable Operation Log entry enabling `gitx undo` across every repo mutation.

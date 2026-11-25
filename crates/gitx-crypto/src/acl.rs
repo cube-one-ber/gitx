@@ -165,7 +165,9 @@ impl PathRule {
         let pattern = pattern.into();
         let trimmed = pattern.trim();
         if trimmed.is_empty() {
-            return Err(GitxError::Crypto("empty glob pattern in .gitxacl".to_string()));
+            return Err(GitxError::Crypto(
+                "empty glob pattern in .gitxacl".to_string(),
+            ));
         }
         // Patterns without a path separator match the filename at any depth
         // (matching `.gitignore` conventions: `.env`, `.env.*`, `*.pem`, `*.key`).
@@ -258,14 +260,11 @@ impl AclPolicy {
             // Section header: [domain <id>] or [domain "<id>"]
             if line.starts_with('[') && line.ends_with(']') {
                 let inner = line[1..line.len() - 1].trim();
-                let dom_raw = inner
-                    .strip_prefix("domain")
-                    .map(str::trim)
-                    .ok_or_else(|| {
-                        GitxError::Crypto(format!(
-                            ".gitxacl:{line_no}: unsupported section header '{line}'"
-                        ))
-                    })?;
+                let dom_raw = inner.strip_prefix("domain").map(str::trim).ok_or_else(|| {
+                    GitxError::Crypto(format!(
+                        ".gitxacl:{line_no}: unsupported section header '{line}'"
+                    ))
+                })?;
                 let dom_unquoted = dom_raw.trim_matches('"').trim_matches('\'');
                 let domain = DomainId::new(dom_unquoted)?;
                 current_domain = Some(domain);
@@ -613,9 +612,10 @@ fn parse_subject_list(raw: &str, line_no: usize) -> Result<Vec<SubjectMatcher>> 
         if trimmed.is_empty() {
             continue;
         }
-        out.push(SubjectMatcher::parse(trimmed).map_err(|e| {
-            GitxError::Crypto(format!(".gitxacl:{line_no}: {e}"))
-        })?);
+        out.push(
+            SubjectMatcher::parse(trimmed)
+                .map_err(|e| GitxError::Crypto(format!(".gitxacl:{line_no}: {e}")))?,
+        );
     }
     if out.is_empty() {
         return Err(GitxError::Crypto(format!(

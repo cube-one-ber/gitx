@@ -48,10 +48,34 @@ fn four_parallel_agents_semantic_merge_why_and_checkpoint_undo() {
 
     // Fork 4 parallel in-memory workspaces off `master`.
     let agent_specs = [
-        ("agent-1", "src/auth.rs", "auth-pkg", "^2.0.0", "Add OAuth2 login middleware"),
-        ("agent-2", "src/billing.rs", "stripe-sdk", "^3.1.0", "Implement invoice billing service"),
-        ("agent-3", "src/metrics.rs", "otel-core", "^0.24.0", "Add OpenTelemetry metrics exporter"),
-        ("agent-4", "src/search.rs", "tantivy-js", "^1.4.0", "Build full-text search index"),
+        (
+            "agent-1",
+            "src/auth.rs",
+            "auth-pkg",
+            "^2.0.0",
+            "Add OAuth2 login middleware",
+        ),
+        (
+            "agent-2",
+            "src/billing.rs",
+            "stripe-sdk",
+            "^3.1.0",
+            "Implement invoice billing service",
+        ),
+        (
+            "agent-3",
+            "src/metrics.rs",
+            "otel-core",
+            "^0.24.0",
+            "Add OpenTelemetry metrics exporter",
+        ),
+        (
+            "agent-4",
+            "src/search.rs",
+            "tantivy-js",
+            "^1.4.0",
+            "Build full-text search index",
+        ),
     ];
 
     for (ws_name, _, _, _, _) in &agent_specs {
@@ -62,11 +86,13 @@ fn four_parallel_agents_semantic_merge_why_and_checkpoint_undo() {
     assert_eq!(workspaces.len(), 5); // default + 4 agents
 
     // All 4 agents concurrently edit disjoint source files AND add distinct keys to shared package.json.
-    for (idx, (ws_name, file_path, dep_name, dep_ver, prompt_text)) in agent_specs.iter().enumerate() {
-        let code = format!(
-            "pub fn feature_{idx}() -> &'static str {{\n    \"{dep_name}\"\n}}\n"
-        );
-        let w1 = repo.write_file(ws_name, file_path, code.as_bytes()).unwrap();
+    for (idx, (ws_name, file_path, dep_name, dep_ver, prompt_text)) in
+        agent_specs.iter().enumerate()
+    {
+        let code = format!("pub fn feature_{idx}() -> &'static str {{\n    \"{dep_name}\"\n}}\n");
+        let w1 = repo
+            .write_file(ws_name, file_path, code.as_bytes())
+            .unwrap();
         assert!(w1.is_empty());
 
         let mut pkg: Value =
@@ -177,7 +203,11 @@ fn four_parallel_agents_semantic_merge_why_and_checkpoint_undo() {
     let collab_agent = AgentIdentity::new("antigravity", "gpt-5", "collab-sess");
 
     let cp_before = repo
-        .save_checkpoint("collab", collab_agent.clone(), "Baseline before agent refactor")
+        .save_checkpoint(
+            "collab",
+            collab_agent.clone(),
+            "Baseline before agent refactor",
+        )
         .unwrap();
 
     // Agent modifies `alpha()` and adds a temporary helper file.
@@ -226,8 +256,7 @@ fn acl_enforcement_secret_scanner_and_open_local_persistence() {
 
     // Open local repo and verify zero-trust secret warnings + ACL denial on secret:dev.
     {
-        let mut repo =
-            AgentRepo::open_local(dir.path(), dev_author(), dev_principal()).unwrap();
+        let mut repo = AgentRepo::open_local(dir.path(), dev_author(), dev_principal()).unwrap();
 
         // Writing to `.env` routes to `secret:dev`, which is deny-by-default unless granted.
         let err = repo
@@ -265,7 +294,9 @@ fn acl_enforcement_secret_scanner_and_open_local_persistence() {
     // Reopen from disk and verify persisted changeset + context record survive restart.
     let reopened = AgentRepo::open_local(dir.path(), dev_author(), dev_principal()).unwrap();
     assert_eq!(
-        reopened.read_file_string("default", "src/config.rs").unwrap(),
+        reopened
+            .read_file_string("default", "src/config.rs")
+            .unwrap(),
         "pub const PORT: u16 = 8080;\n"
     );
     let why_hits = reopened.why("master", "src/config.rs", 1).unwrap();
@@ -536,10 +567,7 @@ fn full_mcp_json_rpc_stdio_session() {
 
     // Check tools/list exposes all 13 required tools
     let tools = by_id(2)["result"]["tools"].as_array().unwrap();
-    let tool_names: Vec<&str> = tools
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for expected in [
         "gitx_list_files",
         "gitx_read_file",
@@ -565,7 +593,12 @@ fn full_mcp_json_rpc_stdio_session() {
     assert_eq!(tool_json(5)["files"], json!(["src/lib.rs"]));
     assert!(tool_json(6)["content"].as_str().unwrap().contains("hello"));
     assert_eq!(tool_json(7)["matches"].as_array().unwrap().len(), 1);
-    assert!(tool_json(8)["diff"].as_str().unwrap().contains("+pub fn greet()"));
+    assert!(
+        tool_json(8)["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+pub fn greet()")
+    );
 
     // Check commit, land, why
     assert!(tool_json(9)["context_record_id"].is_string());
@@ -580,8 +613,14 @@ fn full_mcp_json_rpc_stdio_session() {
         .repo()
         .read_file_string("mcp-ws", "src/lib.rs")
         .unwrap();
-    assert!(final_src.contains("\"hello\""), "agent edit should be undone: {final_src}");
-    assert!(final_src.contains("99"), "human edit should be preserved: {final_src}");
+    assert!(
+        final_src.contains("\"hello\""),
+        "agent edit should be undone: {final_src}"
+    );
+    assert!(
+        final_src.contains("99"),
+        "human edit should be preserved: {final_src}"
+    );
 
     // Check secret scan
     let scan_payload = tool_json(16);

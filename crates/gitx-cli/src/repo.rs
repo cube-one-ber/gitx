@@ -9,7 +9,7 @@ use gitx_crypto::{
     AclPolicy, PublicKeyBundle, SecretAuditLog, SecretEnvelope, SecretFinding, SecretKeyBundle,
     UserKeyPair, decrypt_secret, encrypt_secret, scan_content,
 };
-use gitx_git_bridge::import_from_git_repo;
+use gitx_git_bridge::{export_to_git_repo, import_from_git_repo};
 use gitx_merge::{materialize_conflict, merge_domain_trees};
 use gitx_store::{LocalStore, ObjectStore};
 use gitx_vfs::{CowWorkspace, WorkspaceBackend, WorkspaceBackendKind};
@@ -35,6 +35,8 @@ pub struct RepoConfig {
     pub author: Identity,
     pub default_branch: String,
     pub active_workspace: String,
+    #[serde(default)]
+    pub colocated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,10 +132,12 @@ impl Repo {
             key_fingerprint: Some(key_fingerprint.clone()),
         };
 
+        let is_colocated = colocate && root.join(".git").exists();
         let config = RepoConfig {
             author: author.clone(),
             default_branch: "master".to_string(),
             active_workspace: "default".to_string(),
+            colocated: is_colocated,
         };
         save_json_file(&gitx_dir.join("config.json"), &config)?;
 
@@ -211,13 +215,8 @@ impl Repo {
             domain_trees.insert(domain, hash);
         }
         for (domain, entries) in raw_secrets {
-            let tree = self.encrypt_secret_domain_entries(
-                &domain,
-                &entries,
-                None,
-                &keypair,
-                &recipients,
-            )?;
+            let tree =
+                self.encrypt_secret_domain_entries(&domain, &entries, None, &keypair, &recipients)?;
             let hash = self.store.put_tree(&tree)?;
             domain_trees.insert(domain, hash);
         }
@@ -368,7 +367,12 @@ impl Repo {
     pub fn active_workspace_ref(&self) -> Result<WorkspaceRef> {
         self.store
             .get_workspace(&self.config.active_workspace)?
-            .ok_or_else(|| anyhow!("active workspace '{}' not found", self.config.active_workspace))
+            .ok_or_else(|| {
+                anyhow!(
+                    "active workspace '{}' not found",
+                    self.config.active_workspace
+                )
+            })
     }
 
     pub fn current_changeset(&self) -> Result<ChangeSet> {
@@ -596,8 +600,7 @@ impl Repo {
         // Start by preserving existing encrypted secrets not present on disk.
         if let Some(existing_tree) = existing {
             for (path, kind) in &existing_tree.entries {
-                if !scanned.contains_key(path)
-                    && matches!(kind, EntryKind::EncryptedSecret { .. })
+                if !scanned.contains_key(path) && matches!(kind, EntryKind::EncryptedSecret { .. })
                 {
                     out.insert(path.clone(), kind.clone());
                 }
@@ -659,8 +662,7 @@ impl Repo {
                 continue;
             };
             let disk_bytes = self.store.read_blob_bytes(*blob_hash)?;
-            let materialized =
-                materialize_conflict(term, path, |h| self.store.read_blob_bytes(h))?;
+            let materialized = materialize_conflict(term, path, |h| self.store.read_blob_bytes(h))?;
             if disk_bytes == materialized {
                 scanned.insert(
                     path.clone(),
@@ -746,7 +748,33 @@ impl Repo {
             change_heads,
         };
         self.store.append_op(&entry)?;
+        self.sync_colocated_git_if_enabled();
         Ok(entry)
+    }
+
+    /// When initialized with `--colocate`, continuously keep the colocated `.git` directory
+    /// synchronized with the `public` domain projection of GitX bookmarks (never exporting
+    /// private domains, encrypted `.env` secrets, or active embargoes).
+    pub fn sync_colocated_git_if_enabled(&self) {
+        if !self.config.colocated {
+            return;
+        }
+        let git_dir = self.root.join(".git");
+        if !git_dir.is_dir() {
+            return;
+        }
+        let Ok(bookmarks) = self.store.list_bookmarks() else {
+            return;
+        };
+        if bookmarks.is_empty() {
+            return;
+        }
+        let _ = export_to_git_repo(
+            self.store.as_ref(),
+            &git_dir,
+            &[DomainId::public()],
+            &bookmarks,
+        );
     }
 
     fn collect_change_heads(&self) -> Result<BTreeMap<ChangeId, ObjectHash>> {
@@ -822,11 +850,7 @@ impl Repo {
     }
 
     /// Find the nearest common ancestor of two ChangeSets in the parent DAG.
-    pub fn find_common_ancestor(
-        &self,
-        a: ObjectHash,
-        b: ObjectHash,
-    ) -> Result<Option<ObjectHash>> {
+    pub fn find_common_ancestor(&self, a: ObjectHash, b: ObjectHash) -> Result<Option<ObjectHash>> {
         let mut ancestors_a = HashSet::new();
         let mut q = VecDeque::new();
         q.push_back(a);
@@ -971,8 +995,8 @@ pub fn save_secret_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()>
 }
 
 pub fn load_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 

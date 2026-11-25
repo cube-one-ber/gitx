@@ -34,7 +34,10 @@ pub fn ed25519_public_to_x25519(ed25519_public: &[u8; 32]) -> Result<[u8; 32]> {
 /// Derive a [`UserKeyPair`] deterministically from a 32-byte Ed25519 private seed using the
 /// RFC 8032 / `age` SHA-512 clamping derivation so its X25519 public key matches
 /// [`ed25519_public_to_x25519`].
-pub fn user_keypair_from_ed25519_seed(seed: [u8; 32], label: Option<String>) -> Result<UserKeyPair> {
+pub fn user_keypair_from_ed25519_seed(
+    seed: [u8; 32],
+    label: Option<String>,
+) -> Result<UserKeyPair> {
     let mut seed_zero = Zeroizing::new(seed);
     let digest_raw: [u8; 64] = Sha512::digest(*seed_zero).into();
     let digest = Zeroizing::new(digest_raw);
@@ -125,99 +128,67 @@ pub fn format_openssh_ed25519_pub(ed25519_public: &[u8; 32], label: Option<&str>
 
 /// Parse an unencrypted OpenSSH Ed25519 private key (`-----BEGIN OPENSSH PRIVATE KEY-----`)
 /// into a [`UserKeyPair`].
-pub fn parse_openssh_ed25519_private(pem: &str, label_override: Option<String>) -> Result<UserKeyPair> {
-    let b64: String = pem
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
-        .collect();
-    if b64.is_empty() {
+pub fn parse_openssh_ed25519_private(
+    pem: &str,
+    label_override: Option<String>,
+) -> Result<UserKeyPair> {
+    parse_openssh_ed25519_private_with_passphrase(pem, None, label_override)
+}
+
+/// Parse an unencrypted or passphrase-protected OpenSSH Ed25519 private key
+/// (`-----BEGIN OPENSSH PRIVATE KEY-----`, supporting bcrypt + AES-CTR/CBC/GCM and
+/// `chacha20-poly1305@openssh.com`) into a [`UserKeyPair`].
+pub fn parse_openssh_ed25519_private_with_passphrase(
+    pem: &str,
+    passphrase: Option<&str>,
+    label_override: Option<String>,
+) -> Result<UserKeyPair> {
+    let trimmed = pem.trim();
+    if trimmed.is_empty() {
         return Err(GitxError::Crypto("empty OpenSSH private key PEM".into()));
     }
 
-    let raw = Zeroizing::new(
-        BASE64_STANDARD
-            .decode(&b64)
-            .map_err(|e| GitxError::Crypto(format!("invalid base64 in OpenSSH private key: {e}")))?,
-    );
-    if !raw.starts_with(OPENSSH_KEY_MAGIC) {
-        return Err(GitxError::Crypto(
-            "invalid OpenSSH private key: missing 'openssh-key-v1' header".into(),
-        ));
-    }
+    let parsed = ssh_key::PrivateKey::from_openssh(trimmed)
+        .map_err(|e| GitxError::Crypto(format!("invalid OpenSSH private key: {e}")))?;
 
-    let mut cursor = SshReader::new(&raw[OPENSSH_KEY_MAGIC.len()..]);
-    let ciphername = cursor.read_string_utf8()?;
-    let kdfname = cursor.read_string_utf8()?;
-    let _kdfoptions = cursor.read_bytes()?;
+    let decrypted = if parsed.is_encrypted() {
+        let Some(pass) = passphrase else {
+            return Err(GitxError::Crypto(format!(
+                "OpenSSH private key is passphrase-protected (cipher='{}', kdf='{}'); provide --passphrase or set GITX_SSH_PASSPHRASE",
+                parsed.cipher(),
+                parsed.kdf().algorithm()
+            )));
+        };
+        parsed
+            .decrypt(pass.as_bytes())
+            .map_err(|e| GitxError::Crypto(format!("failed to decrypt OpenSSH private key: {e}")))?
+    } else {
+        parsed
+    };
 
-    if ciphername != "none" || kdfname != "none" {
+    let comment = decrypted.comment().trim().to_string();
+    let Some(ed_kp) = decrypted.key_data().ed25519() else {
         return Err(GitxError::Crypto(format!(
-            "passphrase-encrypted OpenSSH keys (cipher='{ciphername}', kdf='{kdfname}') are not yet supported; decrypt or use an unencrypted key"
+            "unsupported OpenSSH private key type '{}': expected '{SSH_ED25519_TYPE}'",
+            decrypted.algorithm()
         )));
-    }
+    };
 
-    let num_keys = cursor.read_u32()?;
-    if num_keys != 1 {
-        return Err(GitxError::Crypto(format!(
-            "expected exactly 1 key in OpenSSH private key file, found {num_keys}"
-        )));
-    }
-
-    let _pub_blob = cursor.read_bytes()?;
-    let priv_section = cursor.read_bytes()?;
-
-    let mut pcur = SshReader::new(priv_section);
-    let check1 = pcur.read_u32()?;
-    let check2 = pcur.read_u32()?;
-    if check1 != check2 {
-        return Err(GitxError::Crypto(
-            "OpenSSH private key checkint mismatch (corrupted or encrypted key)".into(),
-        ));
-    }
-
-    let key_type = pcur.read_string_utf8()?;
-    if key_type != SSH_ED25519_TYPE {
-        return Err(GitxError::Crypto(format!(
-            "unsupported OpenSSH private key type '{key_type}': expected '{SSH_ED25519_TYPE}'"
-        )));
-    }
-
-    let pub_bytes = pcur.read_bytes()?;
-    let priv_bytes = pcur.read_bytes()?;
-    let comment = pcur.read_string_utf8()?;
-
-    if pub_bytes.len() != 32 || priv_bytes.len() != 64 {
-        return Err(GitxError::Crypto(format!(
-            "invalid Ed25519 key lengths (pub={}, priv={}; expected 32, 64)",
-            pub_bytes.len(),
-            priv_bytes.len()
-        )));
-    }
-    if &priv_bytes[32..64] != pub_bytes {
-        return Err(GitxError::Crypto(
-            "OpenSSH Ed25519 private key public-half mismatch".into(),
-        ));
-    }
-
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&priv_bytes[..32]);
+    let seed: [u8; 32] = ed_kp.private.to_bytes();
+    let pub_bytes: [u8; 32] = ed_kp.public.0;
 
     // Sanity check that derived public key matches embedded OpenSSH public key.
     let signing = SigningKey::from_bytes(&seed);
-    if signing.verifying_key().as_bytes() != pub_bytes {
+    if signing.verifying_key().as_bytes() != &pub_bytes {
         return Err(GitxError::Crypto(
             "OpenSSH Ed25519 seed does not match embedded public key".into(),
         ));
     }
 
-    let effective_label = label_override.or_else(|| {
-        let c = comment.trim();
-        if c.is_empty() {
-            None
-        } else {
-            Some(c.to_string())
-        }
+    let effective_label = label_override.or(if comment.is_empty() {
+        None
+    } else {
+        Some(comment)
     });
 
     let kp = user_keypair_from_ed25519_seed(seed, effective_label)?;
@@ -234,6 +205,30 @@ pub fn parse_openssh_ed25519_private(pem: &str, label_override: Option<String>) 
     }
 
     Ok(kp)
+}
+
+/// Format an Ed25519 32-byte seed into a passphrase-encrypted OpenSSH private key PEM string
+/// (bcrypt KDF + AES-256-CTR).
+pub fn encode_openssh_ed25519_private_encrypted(
+    seed: &[u8; 32],
+    comment: &str,
+    passphrase: &str,
+) -> Result<String> {
+    let signing = SigningKey::from_bytes(seed);
+    let pub_bytes = signing.verifying_key().to_bytes();
+    let kp = ssh_key::private::Ed25519Keypair {
+        public: ssh_key::public::Ed25519PublicKey(pub_bytes),
+        private: ssh_key::private::Ed25519PrivateKey::from_bytes(seed),
+    };
+    let priv_key = ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(kp), comment)
+        .map_err(|e| GitxError::Crypto(format!("failed to construct OpenSSH private key: {e}")))?;
+    let encrypted = priv_key
+        .encrypt(&mut rand::rngs::OsRng, passphrase.as_bytes())
+        .map_err(|e| GitxError::Crypto(format!("failed to encrypt OpenSSH private key: {e}")))?;
+    let pem = encrypted
+        .to_openssh(ssh_key::LineEnding::LF)
+        .map_err(|e| GitxError::Crypto(format!("failed to encode encrypted OpenSSH key: {e}")))?;
+    Ok(pem.to_string())
 }
 
 /// Format an Ed25519 32-byte seed into a standard unencrypted OpenSSH private key PEM string.
@@ -298,6 +293,15 @@ impl UserKeyPair {
     /// Import an unencrypted OpenSSH Ed25519 private key (`~/.ssh/id_ed25519`).
     pub fn from_openssh_ed25519(pem: &str, label: Option<String>) -> Result<Self> {
         parse_openssh_ed25519_private(pem, label)
+    }
+
+    /// Import an unencrypted or passphrase-protected OpenSSH Ed25519 private key (`~/.ssh/id_ed25519`).
+    pub fn from_openssh_ed25519_with_passphrase(
+        pem: &str,
+        passphrase: Option<&str>,
+        label: Option<String>,
+    ) -> Result<Self> {
+        parse_openssh_ed25519_private_with_passphrase(pem, passphrase, label)
     }
 
     /// Construct a [`UserKeyPair`] deterministically from a 32-byte Ed25519 seed.

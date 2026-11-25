@@ -184,7 +184,10 @@ impl PostgresConfig {
                 "invalid postgres URL '{redacted}': missing database name"
             ))
         })?;
-        let host_part = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+        let host_part = authority
+            .rsplit_once('@')
+            .map(|(_, h)| h)
+            .unwrap_or(authority);
         if host_part.trim().is_empty() {
             return Err(GitxError::Storage(format!(
                 "invalid postgres URL '{redacted}': missing host"
@@ -456,8 +459,7 @@ pub mod pg_queries {
     pub const SELECT_LATEST_OPLOG: &str = "SELECT payload FROM oplog ORDER BY seq DESC LIMIT 1";
     pub const LIST_OPLOG: &str = "SELECT payload FROM oplog ORDER BY seq DESC LIMIT $1";
 
-    pub const LOCK_BOOKMARK_FOR_CAS: &str =
-        "SELECT hash FROM bookmarks WHERE name = $1 FOR UPDATE";
+    pub const LOCK_BOOKMARK_FOR_CAS: &str = "SELECT hash FROM bookmarks WHERE name = $1 FOR UPDATE";
     pub const INSERT_LAND_RETURNING: &str = "INSERT INTO lands (target, previous_head, new_head, landed_changes, timestamp, reverted_by) \
          VALUES ($1, $2, $3, $4, $5, NULL) RETURNING land_seq";
     pub const SELECT_LAND: &str = "SELECT land_seq, target, previous_head, new_head, landed_changes, timestamp, reverted_by \
@@ -489,10 +491,12 @@ enum SqlEngine {
     PostgresConfigured {
         config: PostgresConfig,
     },
+    #[cfg(feature = "distributed")]
+    PostgresLive(crate::postgres::LivePostgresClient),
 }
 
-/// SQL-backed metadata backend supporting local/in-memory SQLite execution and validated
-/// PostgreSQL configuration, schema DDL, and versioned SQL migrations.
+/// SQL-backed metadata backend supporting local/in-memory SQLite execution and live
+/// PostgreSQL (`tokio-postgres`) execution, schema DDL, and versioned SQL migrations.
 pub struct SqlMetadataBackend {
     engine: SqlEngine,
 }
@@ -528,9 +532,8 @@ impl SqlMetadataBackend {
         })
     }
 
-    /// Configure a PostgreSQL metadata backend from [`PostgresConfig`].
-    ///
-    /// Validates the connection URI, pool bounds, and schema identifier upfront.
+    /// Configure a PostgreSQL metadata backend from [`PostgresConfig`] without opening a live
+    /// network socket (useful for offline config validation and DDL generation).
     pub fn from_postgres_config(config: PostgresConfig) -> Result<Self> {
         config.validate()?;
         Ok(Self {
@@ -538,11 +541,41 @@ impl SqlMetadataBackend {
         })
     }
 
+    /// Connect to a live PostgreSQL database, initialize the configured schema, and apply
+    /// [`POSTGRES_MIGRATIONS`] transactionally via `tokio-postgres`.
+    #[cfg(feature = "distributed")]
+    pub fn connect_postgres(config: PostgresConfig) -> Result<Self> {
+        let live = crate::postgres::LivePostgresClient::connect(config)?;
+        Ok(Self {
+            engine: SqlEngine::PostgresLive(live),
+        })
+    }
+
+    /// Convenience constructor connecting directly to a `postgres://` / `postgresql://` URI.
+    #[cfg(feature = "distributed")]
+    pub fn connect_postgres_url(url: impl Into<String>) -> Result<Self> {
+        Self::connect_postgres(PostgresConfig::new(url))
+    }
+
     /// Returns the SQL dialect configured for this backend.
     pub fn dialect(&self) -> SqlDialect {
         match &self.engine {
             SqlEngine::Sqlite { .. } => SqlDialect::Sqlite,
             SqlEngine::PostgresConfigured { .. } => SqlDialect::Postgres,
+            #[cfg(feature = "distributed")]
+            SqlEngine::PostgresLive(_) => SqlDialect::Postgres,
+        }
+    }
+
+    /// Returns `true` if backed by an active live PostgreSQL connection.
+    pub fn is_live_postgres(&self) -> bool {
+        #[cfg(feature = "distributed")]
+        {
+            matches!(self.engine, SqlEngine::PostgresLive(_))
+        }
+        #[cfg(not(feature = "distributed"))]
+        {
+            false
         }
     }
 
@@ -551,6 +584,8 @@ impl SqlMetadataBackend {
         match &self.engine {
             SqlEngine::Sqlite { path, .. } => path.as_deref(),
             SqlEngine::PostgresConfigured { .. } => None,
+            #[cfg(feature = "distributed")]
+            SqlEngine::PostgresLive(_) => None,
         }
     }
 
@@ -558,6 +593,8 @@ impl SqlMetadataBackend {
     pub fn postgres_config(&self) -> Option<&PostgresConfig> {
         match &self.engine {
             SqlEngine::PostgresConfigured { config } => Some(config),
+            #[cfg(feature = "distributed")]
+            SqlEngine::PostgresLive(pg) => Some(pg.config()),
             SqlEngine::Sqlite { .. } => None,
         }
     }
@@ -575,11 +612,17 @@ impl SqlMetadataBackend {
         match &self.engine {
             SqlEngine::Sqlite { .. } => Ok(sqlite_schema_ddl()),
             SqlEngine::PostgresConfigured { config } => config.scoped_schema_ddl(),
+            #[cfg(feature = "distributed")]
+            SqlEngine::PostgresLive(pg) => pg.config().scoped_schema_ddl(),
         }
     }
 
     /// Returns the list of applied migration versions recorded in `gitx_schema_migrations`.
     pub fn applied_migrations(&self) -> Result<Vec<u32>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.applied_migrations();
+        }
         let conn = self.lock_sqlite()?;
         let mut stmt = conn
             .prepare("SELECT version FROM gitx_schema_migrations ORDER BY version ASC")
@@ -600,9 +643,14 @@ impl SqlMetadataBackend {
                 .lock()
                 .map_err(|_| GitxError::Storage("sqlite metadata mutex poisoned".to_string())),
             SqlEngine::PostgresConfigured { config } => Err(GitxError::Storage(format!(
-                "postgres backend configured for '{}' (schema '{}') requires an active PostgreSQL connection pool; use SQLite for local/embedded execution",
-                config.url, config.schema
+                "postgres backend configured for '{}' (schema '{}') is not connected; call SqlMetadataBackend::connect_postgres(config) to open a live connection",
+                redact_url_credentials(&config.url),
+                config.schema
             ))),
+            #[cfg(feature = "distributed")]
+            SqlEngine::PostgresLive(_) => Err(GitxError::Storage(
+                "internal error: lock_sqlite called on live postgres backend".to_string(),
+            )),
         }
     }
 }
@@ -686,10 +734,7 @@ fn row_to_land_record(row: &rusqlite::Row<'_>) -> Result<LandRecord> {
     let ts_str: String = row.get(5).map_err(sqlite_err)?;
     let reverted_by: Option<i64> = row.get(6).map_err(sqlite_err)?;
 
-    let previous_head = prev_str
-        .as_deref()
-        .map(ObjectHash::from_str)
-        .transpose()?;
+    let previous_head = prev_str.as_deref().map(ObjectHash::from_str).transpose()?;
     let new_head = ObjectHash::from_str(&new_str)?;
     let landed_changes: Vec<ChangeId> = bincode::deserialize(&changes_blob).map_err(ser_err)?;
     let timestamp = DateTime::parse_from_rfc3339(&ts_str)
@@ -709,6 +754,10 @@ fn row_to_land_record(row: &rusqlite::Row<'_>) -> Result<LandRecord> {
 
 impl MetadataBackend for SqlMetadataBackend {
     fn put_changeset(&self, cs: &ChangeSet) -> Result<ObjectHash> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.put_changeset(cs);
+        }
         let payload = bincode::serialize(cs).map_err(ser_err)?;
         let created_at_ns = cs
             .created_at
@@ -719,13 +768,22 @@ impl MetadataBackend for SqlMetadataBackend {
         conn.execute(
             "INSERT OR IGNORE INTO changesets (id, change_id, created_at_ns, payload)
              VALUES (?1, ?2, ?3, ?4)",
-            params![cs.id.to_hex(), cs.change_id.to_string(), created_at_ns, payload],
+            params![
+                cs.id.to_hex(),
+                cs.change_id.to_string(),
+                created_at_ns,
+                payload
+            ],
         )
         .map_err(sqlite_err)?;
         Ok(cs.id)
     }
 
     fn get_changeset(&self, id: ObjectHash) -> Result<ChangeSet> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.get_changeset(id);
+        }
         let conn = self.lock_sqlite()?;
         let payload: Option<Vec<u8>> = conn
             .query_row(
@@ -741,6 +799,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn list_changesets(&self) -> Result<Vec<ChangeSet>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.list_changesets();
+        }
         let conn = self.lock_sqlite()?;
         let mut stmt = conn
             .prepare("SELECT payload FROM changesets ORDER BY seq ASC")
@@ -758,6 +820,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn get_revisions_for_change(&self, change_id: ChangeId) -> Result<Vec<ChangeSet>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.get_revisions_for_change(change_id);
+        }
         let conn = self.lock_sqlite()?;
         let mut stmt = conn
             .prepare("SELECT seq, payload FROM changesets WHERE change_id = ?1 ORDER BY seq ASC")
@@ -780,6 +846,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn delete_changeset(&self, id: ObjectHash) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.delete_changeset(id);
+        }
         let conn = self.lock_sqlite()?;
         conn.execute("DELETE FROM changesets WHERE id = ?1", params![id.to_hex()])
             .map_err(sqlite_err)?;
@@ -787,6 +857,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn put_stack(&self, stack: &Stack) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.put_stack(stack);
+        }
         let payload = bincode::serialize(stack).map_err(ser_err)?;
         let conn = self.lock_sqlite()?;
         conn.execute(
@@ -798,6 +872,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn get_stack(&self, name: &str) -> Result<Stack> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.get_stack(name);
+        }
         let conn = self.lock_sqlite()?;
         let payload: Option<Vec<u8>> = conn
             .query_row(
@@ -813,6 +891,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn list_stacks(&self) -> Result<Vec<Stack>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.list_stacks();
+        }
         let conn = self.lock_sqlite()?;
         let mut stmt = conn
             .prepare("SELECT payload FROM stacks ORDER BY name ASC")
@@ -830,6 +912,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn delete_stack(&self, name: &str) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.delete_stack(name);
+        }
         let conn = self.lock_sqlite()?;
         conn.execute("DELETE FROM stacks WHERE name = ?1", params![name])
             .map_err(sqlite_err)?;
@@ -837,6 +923,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn append_op(&self, op: &OpLogEntry) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.append_op(op);
+        }
         let payload = bincode::serialize(op).map_err(ser_err)?;
         let conn = self.lock_sqlite()?;
         conn.execute(
@@ -848,6 +938,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn get_op(&self, id: OpId) -> Result<OpLogEntry> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.get_op(id);
+        }
         let conn = self.lock_sqlite()?;
         let payload: Option<Vec<u8>> = conn
             .query_row(
@@ -863,6 +957,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn latest_op(&self) -> Result<Option<OpLogEntry>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.latest_op();
+        }
         let conn = self.lock_sqlite()?;
         let payload: Option<Vec<u8>> = conn
             .query_row(
@@ -879,6 +977,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn list_ops(&self, limit: usize) -> Result<Vec<OpLogEntry>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.list_ops(limit);
+        }
         let conn = self.lock_sqlite()?;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = conn
@@ -903,6 +1005,10 @@ impl MetadataBackend for SqlMetadataBackend {
         new_head: ObjectHash,
         changes: Vec<ChangeId>,
     ) -> Result<LandRecord> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.record_land(target, expected_previous, new_head, changes);
+        }
         let mut conn = self.lock_sqlite()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -963,6 +1069,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn get_land(&self, land_seq: u64) -> Result<LandRecord> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.get_land(land_seq);
+        }
         let conn = self.lock_sqlite()?;
         let mut stmt = conn
             .prepare(
@@ -979,6 +1089,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn list_lands(&self, target: &str, limit: usize) -> Result<Vec<LandRecord>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.list_lands(target, limit);
+        }
         let conn = self.lock_sqlite()?;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = conn
@@ -997,6 +1111,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn list_all_lands(&self, after_land_seq: u64, limit: usize) -> Result<Vec<LandRecord>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.list_all_lands(after_land_seq, limit);
+        }
         let conn = self.lock_sqlite()?;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = conn
@@ -1017,6 +1135,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn mark_reverted(&self, land_seq: u64, reverted_by: u64) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.mark_reverted(land_seq, reverted_by);
+        }
         let mut conn = self.lock_sqlite()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1053,6 +1175,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn revert_land(&self, land_seq: u64) -> Result<LandRecord> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.revert_land(land_seq);
+        }
         let mut conn = self.lock_sqlite()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1144,6 +1270,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn get_bookmark(&self, name: &str) -> Result<Option<ObjectHash>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.get_bookmark(name);
+        }
         let conn = self.lock_sqlite()?;
         let hash_str: Option<String> = conn
             .query_row(
@@ -1158,6 +1288,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn set_bookmark(&self, name: &str, hash: ObjectHash) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.set_bookmark(name, hash);
+        }
         let conn = self.lock_sqlite()?;
         conn.execute(
             "INSERT OR REPLACE INTO bookmarks (name, hash) VALUES (?1, ?2)",
@@ -1173,6 +1307,10 @@ impl MetadataBackend for SqlMetadataBackend {
         expected: Option<ObjectHash>,
         new_hash: ObjectHash,
     ) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.cas_bookmark(name, expected, new_hash);
+        }
         let mut conn = self.lock_sqlite()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1204,6 +1342,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn cas_bookmarks(&self, updates: &[(String, Option<ObjectHash>, ObjectHash)]) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.cas_bookmarks(updates);
+        }
         if updates.is_empty() {
             return Ok(());
         }
@@ -1242,6 +1384,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn list_bookmarks(&self) -> Result<BTreeMap<String, ObjectHash>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.list_bookmarks();
+        }
         let conn = self.lock_sqlite()?;
         let mut stmt = conn
             .prepare("SELECT name, hash FROM bookmarks ORDER BY name ASC")
@@ -1263,6 +1409,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn put_workspace(&self, ws: &WorkspaceRef) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.put_workspace(ws);
+        }
         let payload = bincode::serialize(ws).map_err(ser_err)?;
         let conn = self.lock_sqlite()?;
         conn.execute(
@@ -1274,6 +1424,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn get_workspace(&self, name: &str) -> Result<Option<WorkspaceRef>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.get_workspace(name);
+        }
         let conn = self.lock_sqlite()?;
         let payload: Option<Vec<u8>> = conn
             .query_row(
@@ -1290,6 +1444,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn list_workspaces(&self) -> Result<BTreeMap<String, WorkspaceRef>> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.list_workspaces();
+        }
         let conn = self.lock_sqlite()?;
         let mut stmt = conn
             .prepare("SELECT name, payload FROM workspaces ORDER BY name ASC")
@@ -1312,6 +1470,10 @@ impl MetadataBackend for SqlMetadataBackend {
     }
 
     fn remove_workspace(&self, name: &str) -> Result<()> {
+        #[cfg(feature = "distributed")]
+        if let SqlEngine::PostgresLive(ref pg) = self.engine {
+            return pg.remove_workspace(name);
+        }
         let conn = self.lock_sqlite()?;
         conn.execute("DELETE FROM workspaces WHERE name = ?1", params![name])
             .map_err(sqlite_err)?;

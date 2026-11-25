@@ -272,7 +272,10 @@ pub async fn receive_pack(
     .await
     .map_err(|e| ApiError::internal(format!("git receive-pack task join error: {e}")))??;
 
-    Ok(build_git_response(RECEIVE_PACK_RESULT_CONTENT_TYPE, payload))
+    Ok(build_git_response(
+        RECEIVE_PACK_RESULT_CONTENT_TYPE,
+        payload,
+    ))
 }
 
 /// `POST /{owner}/{name}.git/git-upload-pack`
@@ -319,10 +322,7 @@ pub async fn upload_pack(
     .await
     .map_err(|e| ApiError::internal(format!("git upload-pack task join error: {e}")))??;
 
-    Ok(build_git_response(
-        UPLOAD_PACK_RESULT_CONTENT_TYPE,
-        payload,
-    ))
+    Ok(build_git_response(UPLOAD_PACK_RESULT_CONTENT_TYPE, payload))
 }
 
 fn strip_git_suffix(raw: &str) -> &str {

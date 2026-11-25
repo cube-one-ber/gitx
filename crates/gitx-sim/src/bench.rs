@@ -288,7 +288,11 @@ async fn bench_workspace_fanout(
         fs::write(&full, content.as_bytes())?;
     }
     run_git(&git_repo_dir, &["add", "."]).await?;
-    run_git(&git_repo_dir, &["commit", "--quiet", "-m", "initial 250-file repo"]).await?;
+    run_git(
+        &git_repo_dir,
+        &["commit", "--quiet", "-m", "initial 250-file repo"],
+    )
+    .await?;
 
     let git_wt_root = tmp.path().join("git-worktrees");
     fs::create_dir_all(&git_wt_root)?;
@@ -392,7 +396,8 @@ async fn bench_workspace_fanout(
 
 async fn bench_multi_agent_same_file_merge(agent_count: usize) -> Result<MergeBenchResult> {
     let agents = agent_count.max(2);
-    let base_src = "//! Shared service entrypoints.\n\npub fn base_service() -> usize {\n    0\n}\n";
+    let base_src =
+        "//! Shared service entrypoints.\n\npub fn base_service() -> usize {\n    0\n}\n";
     let agent_versions: Vec<String> = (0..agents)
         .map(|i| format!("{base_src}\npub fn agent_{i}_handler() -> usize {{ {i} }}\n"))
         .collect();

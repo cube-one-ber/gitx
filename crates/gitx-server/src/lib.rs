@@ -9,14 +9,15 @@ pub mod git_http;
 pub mod grpc;
 pub mod outbox;
 pub mod queue;
+pub mod ssh_server;
 pub mod state;
 
 pub use api::{
     ActorAgentInput, BlameLine, BlameResponse, CommitRequest, CommitResponse, CreateRepoRequest,
     CreateRepoResponse, DiffFileEntry, DiffResponse, GrepMatch, GrepResponse, HealthResponse,
     LandRequest, LandResponse, ListReposResponse, LogEntry, LogResponse, OutboxResponse,
-    PublishEmbargoRequest, PublishEmbargoResponse, RevertResponse, TreeFileEntry, TreeResponse,
-    TreeSecretEntry, WhyResponse,
+    PublishEmbargoRequest, PublishEmbargoResponse, RebaseRequest, RebaseResponse, RevertResponse,
+    SymbolsQuery, SymbolsResponse, TreeFileEntry, TreeResponse, TreeSecretEntry, WhyResponse,
 };
 pub use auth::{
     AuthenticatedPrincipal, HEADER_FINGERPRINT, HEADER_ROLES, HEADER_TEAMS, HEADER_USER,
@@ -24,8 +25,8 @@ pub use auth::{
     extract_principal_from_grpc_metadata, extract_principal_from_http,
 };
 pub use derived::{
-    CommitGraphIndex, CommitGraphNode, DerivedIndex, DerivedStats, PathHistoryIndex, TrigramIndex,
-    TrigramSearchIndex,
+    CommitGraphIndex, CommitGraphNode, DerivedIndex, DerivedStats, IndexedSymbol, PathHistoryIndex,
+    SymbolIndex, TrigramIndex, TrigramSearchIndex,
 };
 pub use error::{ApiError, ApiResult};
 pub use fleet_api::{FleetSyncRecord, FleetUploadRequest};
@@ -35,6 +36,7 @@ pub use queue::{
     ConflictResolverFn, DrainRequest, DrainResponse, EnqueueRequest, EnqueueResponse, MergeQueue,
     QueueEntry, QueueListQuery, QueueListResponse, QueueStatus, command_conflict_resolver,
 };
+pub use ssh_server::{serve_ssh, serve_ssh_addr};
 pub use state::{AppState, RepoHandle, RepoInfo, ServerConfig};
 
 use axum::Router;
@@ -58,6 +60,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/repos/{owner}/{name}", post(api::create_repo))
         // Zero-clone server-side operations
         .route("/v1/repos/{owner}/{name}/commit", post(api::commit))
+        .route(
+            "/v1/repos/{owner}/{name}/rebase",
+            post(api::rebase_changeset),
+        )
         .route("/v1/repos/{owner}/{name}/land", post(api::land))
         .route(
             "/v1/repos/{owner}/{name}/revert/{land_seq}",
@@ -69,12 +75,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/repos/{owner}/{name}/blame", get(api::blame))
         .route("/v1/repos/{owner}/{name}/log", get(api::log_history))
         .route("/v1/repos/{owner}/{name}/why", get(api::why))
+        .route("/v1/repos/{owner}/{name}/symbols", get(api::get_symbols))
         .route(
             "/v1/repos/{owner}/{name}/embargo/{advisory}/publish",
             post(api::publish_embargo),
         )
         // Derived data engine observability
-        .route("/v1/repos/{owner}/{name}/derived/stats", get(api::derived_stats))
+        .route(
+            "/v1/repos/{owner}/{name}/derived/stats",
+            get(api::derived_stats),
+        )
         // Durable webhook outbox inspection
         .route("/v1/repos/{owner}/{name}/outbox", get(api::list_outbox))
         // Live cross-machine encrypted Fleet Sync ("Dropbox for Devs")

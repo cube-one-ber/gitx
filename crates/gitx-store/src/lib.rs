@@ -3,6 +3,8 @@ pub mod local;
 pub mod memory;
 #[cfg(feature = "local")]
 pub mod metadata;
+#[cfg(feature = "distributed")]
+pub mod postgres;
 pub mod store;
 #[cfg(feature = "distributed")]
 pub mod tiered;

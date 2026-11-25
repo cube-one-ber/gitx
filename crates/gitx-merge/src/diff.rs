@@ -175,10 +175,10 @@ where
             envelope_hash,
             key_epoch,
             ..
-        }) => Ok(format!(
-            "[encrypted secret: epoch={key_epoch}, envelope={envelope_hash}]\n"
-        )
-        .into_bytes()),
+        }) => Ok(
+            format!("[encrypted secret: epoch={key_epoch}, envelope={envelope_hash}]\n")
+                .into_bytes(),
+        ),
         Some(EntryKind::Conflict { term, .. }) => materialize_conflict(term, path, read_blob),
     }
 }

@@ -202,10 +202,29 @@ pub fn relocate_anchor(anchor: &CodeAnchor, new_file_content: &str) -> Option<(u
 fn symbol_matches(anchor: &CodeAnchor, new_file_content: &str, line_1based: u32) -> bool {
     match &anchor.symbol {
         Some(expected) => {
-            extract_symbol_hint(new_file_content, line_1based).as_deref() == Some(expected.as_str())
+            extract_symbol_hint_for_path(&anchor.path, new_file_content, line_1based).as_deref()
+                == Some(expected.as_str())
         }
         None => false,
     }
+}
+
+/// Extract the enclosing symbol for `path` at `line_1based`, preferring Tree-sitter AST
+/// extraction (Rust/TS/TSX/JS/Python) when the `ast` feature is enabled and falling back to
+/// [`extract_symbol_hint`] for unsupported file types or pure-WASM builds.
+pub fn extract_symbol_hint_for_path(
+    path: &str,
+    file_content: &str,
+    line_1based: u32,
+) -> Option<String> {
+    #[cfg(feature = "ast")]
+    {
+        if let Some(sym) = gitx_merge::symbol_at_line(path, file_content, line_1based) {
+            return Some(sym.name);
+        }
+    }
+    let _ = path;
+    extract_symbol_hint(file_content, line_1based)
 }
 
 /// Scan upward from `line_1based` to find the nearest enclosing symbol declaration.
@@ -311,11 +330,7 @@ fn extract_ident(rest: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
         .collect();
-    if ident.is_empty() {
-        None
-    } else {
-        Some(ident)
-    }
+    if ident.is_empty() { None } else { Some(ident) }
 }
 
 #[cfg(test)]

@@ -1,9 +1,7 @@
 use crate::repo::Repo;
 use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
-use gitx_core::{
-    ChangeSetBuilder, DomainId, OpKind, Stack, StackState, VisibilityPolicy,
-};
+use gitx_core::{ChangeSetBuilder, DomainId, OpKind, Stack, StackState, VisibilityPolicy};
 use gitx_store::ObjectStore;
 use std::env;
 
@@ -114,7 +112,8 @@ pub fn cmd_stack_sync() -> Result<()> {
 
             let (merged_trees, conflicts) =
                 repo.merge_changeset_trees(old_base.as_ref(), &latest_cs, &current_base)?;
-            let has_conflicts = !conflicts.is_empty() || repo.trees_have_conflicts(&merged_trees)?;
+            let has_conflicts =
+                !conflicts.is_empty() || repo.trees_have_conflicts(&merged_trees)?;
 
             let restacked_cs = ChangeSetBuilder::new(latest_cs.author.clone())
                 .change_id(latest_cs.change_id)
@@ -277,7 +276,10 @@ pub fn cmd_land(target: String) -> Result<()> {
     Ok(())
 }
 
-fn promote_if_reveal_on_land(repo: &Repo, cs: &gitx_core::ChangeSet) -> Result<gitx_core::ChangeSet> {
+fn promote_if_reveal_on_land(
+    repo: &Repo,
+    cs: &gitx_core::ChangeSet,
+) -> Result<gitx_core::ChangeSet> {
     if !cs.visibility.reveal_on_land || cs.visibility.primary_domain.is_public() {
         return Ok(cs.clone());
     }
@@ -314,17 +316,14 @@ pub fn cmd_revert(land_seq: u64) -> Result<()> {
     if let Some(reverter) = land.reverted_by {
         bail!("land_seq {land_seq} was already reverted by land_seq {reverter}");
     }
-    let prev_head = land.previous_head.ok_or_else(|| {
-        anyhow!("land_seq {land_seq} has no previous_head to restore")
-    })?;
+    let prev_head = land
+        .previous_head
+        .ok_or_else(|| anyhow!("land_seq {land_seq} has no previous_head to restore"))?;
 
     let current_head = repo.store.get_bookmark(&land.target)?;
-    let revert_record = repo.store.record_land(
-        &land.target,
-        current_head,
-        prev_head,
-        Vec::new(),
-    )?;
+    let revert_record =
+        repo.store
+            .record_land(&land.target, current_head, prev_head, Vec::new())?;
     repo.store.mark_reverted(land_seq, revert_record.land_seq)?;
 
     let prev_cs = repo.store.get_changeset(prev_head)?;
@@ -423,7 +422,10 @@ pub fn cmd_undo() -> Result<()> {
         format!("Undo to '{}'", target_op.summary),
     )?;
 
-    println!("Undid '{}' -> restored '{}'", latest.summary, target_op.summary);
+    println!(
+        "Undid '{}' -> restored '{}'",
+        latest.summary, target_op.summary
+    );
     Ok(())
 }
 
@@ -480,7 +482,10 @@ pub fn cmd_squash(message: Option<String>) -> Result<()> {
     let cur = snap.changeset;
 
     let Some(&parent_hash) = cur.parents.first() else {
-        bail!("cannot squash root ChangeSet {} (no parent)", cur.change_id.short());
+        bail!(
+            "cannot squash root ChangeSet {} (no parent)",
+            cur.change_id.short()
+        );
     };
     let parent = repo.store.get_changeset(parent_hash)?;
 
@@ -548,7 +553,12 @@ pub fn cmd_squash(message: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_split(paths: Vec<String>, message: Option<String>) -> Result<()> {
+pub fn cmd_split(
+    paths: Vec<String>,
+    hunks: Vec<String>,
+    patch: bool,
+    message: Option<String>,
+) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
     let snap = repo.snapshot_working_copy()?;
     let cur = snap.changeset;
@@ -562,8 +572,32 @@ pub fn cmd_split(paths: Vec<String>, message: Option<String>) -> Result<()> {
                 .collect::<Vec<_>>()
         })
         .collect();
-    if selected.is_empty() {
-        bail!("specify at least one path via --paths <path1,path2>");
+
+    // Parse `--hunks <path>:<1,3>` into `path -> BTreeSet<1-based hunk index>`.
+    let mut hunk_specs: std::collections::BTreeMap<String, std::collections::BTreeSet<usize>> =
+        std::collections::BTreeMap::new();
+    for raw in hunks {
+        let Some((raw_path, idx_list)) = raw.rsplit_once(':') else {
+            bail!("invalid --hunks '{raw}': expected '<path>:<1,2,...>'");
+        };
+        let norm = raw_path.trim().trim_start_matches("./").to_string();
+        if norm.is_empty() {
+            bail!("empty path in --hunks '{raw}'");
+        }
+        let set = hunk_specs.entry(norm).or_default();
+        for tok in idx_list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let n: usize = tok
+                .parse()
+                .map_err(|e| anyhow!("invalid hunk index '{tok}' in '{raw}': {e}"))?;
+            if n == 0 {
+                bail!("hunk indices are 1-based (got 0 in '{raw}')");
+            }
+            set.insert(n);
+        }
+    }
+
+    if selected.is_empty() && hunk_specs.is_empty() && !patch {
+        bail!("specify --paths <path1,path2>, --hunks <path:1,2>, or -p/--patch");
     }
 
     let parent_cs = match cur.parents.first() {
@@ -580,23 +614,159 @@ pub fn cmd_split(paths: Vec<String>, message: Option<String>) -> Result<()> {
 
     let mut first_domain_trees = std::collections::BTreeMap::new();
     let mut moved_any = false;
+    let mut moved_summary: Vec<String> = Vec::new();
+    let mut interactive_all = false;
+    let mut interactive_done = false;
 
     for dom in &all_domains {
         let mut first_tree = repo.get_domain_tree_or_empty(parent_cs.as_ref(), dom)?;
         let cur_tree = repo.get_domain_tree_or_empty(Some(&cur), dom)?;
 
+        // 1. Whole-file path splits (`--paths`)
         for path in &selected {
             match cur_tree.entries.get(path) {
                 Some(entry) => {
                     if first_tree.entries.get(path) != Some(entry) {
                         first_tree.insert(path.clone(), entry.clone());
                         moved_any = true;
+                        moved_summary.push(path.clone());
                     }
                 }
                 None => {
                     if first_tree.entries.remove(path).is_some() {
                         moved_any = true;
+                        moved_summary.push(path.clone());
                     }
+                }
+            }
+        }
+
+        // 2. Hunk-level splits (`--hunks` or interactive `-p/--patch`)
+        if !dom.is_secret() && (!hunk_specs.is_empty() || patch) {
+            let mut candidate_paths: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            if patch {
+                candidate_paths.extend(first_tree.entries.keys().cloned());
+                candidate_paths.extend(cur_tree.entries.keys().cloned());
+            } else {
+                candidate_paths.extend(hunk_specs.keys().cloned());
+            }
+
+            for path in candidate_paths {
+                if selected.contains(&path) || interactive_done {
+                    continue;
+                }
+                let base_entry = first_tree.entries.get(&path);
+                let cur_entry = cur_tree.entries.get(&path);
+                if base_entry == cur_entry {
+                    continue;
+                }
+
+                let base_bytes = match base_entry {
+                    Some(gitx_core::EntryKind::File { blob_hash, .. }) => {
+                        repo.store.read_blob_bytes(*blob_hash)?
+                    }
+                    None => Vec::new(),
+                    _ => continue,
+                };
+                let (cur_bytes, cur_mode) = match cur_entry {
+                    Some(gitx_core::EntryKind::File {
+                        blob_hash, mode, ..
+                    }) => (repo.store.read_blob_bytes(*blob_hash)?, *mode),
+                    None => (Vec::new(), gitx_core::FileMode::Regular),
+                    _ => continue,
+                };
+
+                let (Ok(base_str), Ok(cur_str)) = (
+                    std::str::from_utf8(&base_bytes),
+                    std::str::from_utf8(&cur_bytes),
+                ) else {
+                    continue;
+                };
+
+                let diff = similar::TextDiff::from_lines(base_str, cur_str);
+                let groups = diff.grouped_ops(3);
+                if groups.is_empty() {
+                    continue;
+                }
+
+                let mut chosen_groups: std::collections::BTreeSet<usize> =
+                    std::collections::BTreeSet::new();
+                if let Some(explicit) = hunk_specs.get(&path) {
+                    for &idx1 in explicit {
+                        if idx1 >= 1 && idx1 <= groups.len() {
+                            chosen_groups.insert(idx1 - 1);
+                        }
+                    }
+                } else if patch {
+                    for (g_idx, group) in groups.iter().enumerate() {
+                        if interactive_done {
+                            break;
+                        }
+                        if interactive_all {
+                            chosen_groups.insert(g_idx);
+                            continue;
+                        }
+                        println!("--- {path} (hunk {}/{}) ---", g_idx + 1, groups.len());
+                        for op in group {
+                            for change in diff.iter_changes(op) {
+                                let sign = match change.tag() {
+                                    similar::ChangeTag::Delete => "-",
+                                    similar::ChangeTag::Insert => "+",
+                                    similar::ChangeTag::Equal => " ",
+                                };
+                                print!("{sign}{change}");
+                            }
+                        }
+                        eprint!("Include this hunk in base ChangeSet? [y,n,a,d,q]: ");
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                        let mut answer = String::new();
+                        let read_n = std::io::stdin().read_line(&mut answer)?;
+                        if read_n == 0 {
+                            interactive_done = true;
+                            break;
+                        }
+                        match answer.trim().to_ascii_lowercase().as_str() {
+                            "y" | "yes" => {
+                                chosen_groups.insert(g_idx);
+                            }
+                            "a" | "all" => {
+                                interactive_all = true;
+                                chosen_groups.insert(g_idx);
+                            }
+                            "d" | "done" => {
+                                interactive_done = true;
+                            }
+                            "q" | "quit" => {
+                                bail!("split aborted by user");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if chosen_groups.is_empty() {
+                    continue;
+                }
+
+                let partial =
+                    apply_selected_diff_groups(base_str, cur_str, &groups, &chosen_groups);
+                if partial.as_bytes() != base_bytes.as_slice() {
+                    if partial.is_empty() && cur_entry.is_none() {
+                        first_tree.entries.remove(&path);
+                    } else {
+                        let blob = repo.store.put_blob_bytes(partial.as_bytes())?;
+                        first_tree.insert(
+                            path.clone(),
+                            gitx_core::EntryKind::File {
+                                blob_hash: blob.manifest_hash(),
+                                mode: cur_mode,
+                                size: blob.total_size,
+                            },
+                        );
+                    }
+                    moved_any = true;
+                    moved_summary.push(format!("{path} ({} hunk(s))", chosen_groups.len()));
                 }
             }
         }
@@ -609,24 +779,18 @@ pub fn cmd_split(paths: Vec<String>, message: Option<String>) -> Result<()> {
 
     if !moved_any {
         bail!(
-            "none of the selected paths ({}) differ from parent in {}",
-            selected.into_iter().collect::<Vec<_>>().join(", "),
+            "no selected paths or hunks differ from parent in {}",
             cur.change_id.short()
         );
     }
 
-    let first_desc = message
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| {
-            if cur.description.trim().is_empty() {
-                format!(
-                    "Split ({})",
-                    selected.iter().cloned().collect::<Vec<_>>().join(", ")
-                )
-            } else {
-                cur.description.clone()
-            }
-        });
+    let first_desc = message.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| {
+        if cur.description.trim().is_empty() {
+            format!("Split ({})", moved_summary.join(", "))
+        } else {
+            cur.description.clone()
+        }
+    });
 
     let first_has_conflicts = repo.trees_have_conflicts(&first_domain_trees)?;
     let first_cs = ChangeSetBuilder::new(cur.author.clone())
@@ -680,6 +844,94 @@ pub fn cmd_split(paths: Vec<String>, message: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Reconstructs a file containing `base_str` plus ONLY the diff hunk groups in `selected_groups`.
+fn apply_selected_diff_groups(
+    base_str: &str,
+    cur_str: &str,
+    groups: &[Vec<similar::DiffOp>],
+    selected_groups: &std::collections::BTreeSet<usize>,
+) -> String {
+    let diff = similar::TextDiff::from_lines(base_str, cur_str);
+    let old_lines = diff.old_slices();
+    let new_lines = diff.new_slices();
+
+    let mut out = String::with_capacity(base_str.len().max(cur_str.len()));
+    let mut base_pos = 0usize;
+
+    for (g_idx, group) in groups.iter().enumerate() {
+        if !selected_groups.contains(&g_idx) {
+            continue;
+        }
+        for op in group {
+            match *op {
+                similar::DiffOp::Equal { old_index, len, .. } => {
+                    if old_index > base_pos {
+                        for line in &old_lines[base_pos..old_index] {
+                            out.push_str(line);
+                        }
+                    }
+                    let start = base_pos.max(old_index);
+                    let end = old_index + len;
+                    if end > start {
+                        for line in &old_lines[start..end] {
+                            out.push_str(line);
+                        }
+                    }
+                    base_pos = base_pos.max(end);
+                }
+                similar::DiffOp::Delete {
+                    old_index, old_len, ..
+                } => {
+                    if old_index > base_pos {
+                        for line in &old_lines[base_pos..old_index] {
+                            out.push_str(line);
+                        }
+                    }
+                    base_pos = base_pos.max(old_index + old_len);
+                }
+                similar::DiffOp::Insert {
+                    old_index,
+                    new_index,
+                    new_len,
+                } => {
+                    if old_index > base_pos {
+                        for line in &old_lines[base_pos..old_index] {
+                            out.push_str(line);
+                        }
+                        base_pos = old_index;
+                    }
+                    for line in &new_lines[new_index..new_index + new_len] {
+                        out.push_str(line);
+                    }
+                }
+                similar::DiffOp::Replace {
+                    old_index,
+                    old_len,
+                    new_index,
+                    new_len,
+                } => {
+                    if old_index > base_pos {
+                        for line in &old_lines[base_pos..old_index] {
+                            out.push_str(line);
+                        }
+                    }
+                    for line in &new_lines[new_index..new_index + new_len] {
+                        out.push_str(line);
+                    }
+                    base_pos = base_pos.max(old_index + old_len);
+                }
+            }
+        }
+    }
+
+    if base_pos < old_lines.len() {
+        for line in &old_lines[base_pos..] {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 pub fn cmd_rebase(onto: String) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
     let snap = repo.snapshot_working_copy()?;
@@ -701,7 +953,8 @@ pub fn cmd_rebase(onto: String) -> Result<()> {
         None => None,
     };
 
-    let (merged_trees, conflicts) = repo.merge_changeset_trees(old_base.as_ref(), &cur, &onto_cs)?;
+    let (merged_trees, conflicts) =
+        repo.merge_changeset_trees(old_base.as_ref(), &cur, &onto_cs)?;
     let has_conflicts = !conflicts.is_empty() || repo.trees_have_conflicts(&merged_trees)?;
 
     let rebased = ChangeSetBuilder::new(cur.author.clone())

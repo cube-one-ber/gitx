@@ -206,10 +206,7 @@ impl LoopbackVfsServer {
     }
 
     pub fn stats(&self) -> LazyStats {
-        self.core
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stats()
+        self.core.lock().unwrap_or_else(|e| e.into_inner()).stats()
     }
 
     pub fn snapshot(&self, domain: DomainId) -> Result<DomainTree> {
@@ -531,8 +528,7 @@ fn unexpected_response(expected: &str, got: &NfsRpcResponse) -> GitxError {
 }
 
 fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
-    let payload =
-        serde_json::to_vec(value).map_err(|e| GitxError::Serialization(e.to_string()))?;
+    let payload = serde_json::to_vec(value).map_err(|e| GitxError::Serialization(e.to_string()))?;
     if payload.len() > MAX_FRAME_BYTES {
         return Err(GitxError::Workspace(format!(
             "RPC frame too large: {} bytes",

@@ -103,10 +103,7 @@ fn e2e_mcp_in_memory_stdio() {
     let tools = responses[1]["result"]["tools"]
         .as_array()
         .expect("tools array");
-    let tool_names: Vec<&str> = tools
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(tool_names.contains(&"gitx_write_file"));
     assert!(tool_names.contains(&"gitx_commit"));
     assert!(tool_names.contains(&"gitx_land"));
@@ -167,7 +164,10 @@ fn e2e_mcp_local_repo_stdio() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
-    gitx_ok(root, &["init", "--name", "McpDev", "--email", "mcp@example.com"]);
+    gitx_ok(
+        root,
+        &["init", "--name", "McpDev", "--email", "mcp@example.com"],
+    );
     fs::write(root.join("README.md"), "# Local Repo\n").unwrap();
     gitx_ok(root, &["describe", "-m", "Add README"]);
     gitx_ok(root, &["land"]);
@@ -197,15 +197,21 @@ fn e2e_mcp_local_repo_stdio() {
         .collect();
     assert_eq!(responses.len(), 5);
 
-    let read_payload: Value =
-        serde_json::from_str(responses[1]["result"]["content"][0]["text"].as_str().unwrap())
-            .unwrap();
+    let read_payload: Value = serde_json::from_str(
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(read_payload["content"], "# Local Repo\n");
 
     assert_eq!(responses[4]["result"]["isError"], false);
-    let land_payload: Value =
-        serde_json::from_str(responses[4]["result"]["content"][0]["text"].as_str().unwrap())
-            .unwrap();
+    let land_payload: Value = serde_json::from_str(
+        responses[4]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(land_payload["land_seq"], 2);
 }
 
@@ -216,7 +222,10 @@ fn e2e_lazy_workspace_o1_mount() {
     let overlay_parent = TempDir::new().unwrap();
     let overlay_dir = overlay_parent.path().join("lazy-agent-overlay");
 
-    gitx_ok(root, &["init", "--name", "LazyDev", "--email", "lazy@example.com"]);
+    gitx_ok(
+        root,
+        &["init", "--name", "LazyDev", "--email", "lazy@example.com"],
+    );
     fs::create_dir_all(root.join("src")).unwrap();
     for i in 0..8 {
         fs::write(
@@ -309,7 +318,10 @@ fn e2e_fleet_encrypted_overlay_export_and_apply() {
             "laptop-a",
         ],
     );
-    assert!(exp_out.contains("encrypted fleet overlay"), "got:\n{exp_out}");
+    assert!(
+        exp_out.contains("encrypted fleet overlay"),
+        "got:\n{exp_out}"
+    );
     assert!(exp_out.contains("2 file(s)"), "got:\n{exp_out}");
     assert!(exp_out.contains("laptop-a"), "got:\n{exp_out}");
 
@@ -407,10 +419,22 @@ pub fn compute_sum(a: i32, b: i32) -> i32 {
 
     // Human-readable output
     let text_out = gitx_ok(root, &["symbols", "src/lib.rs"]);
-    assert!(text_out.contains("struct") && text_out.contains("Engine"), "got:\n{text_out}");
-    assert!(text_out.contains("impl") && text_out.contains("Engine"), "got:\n{text_out}");
-    assert!(text_out.contains("method") && text_out.contains("start"), "got:\n{text_out}");
-    assert!(text_out.contains("fn") && text_out.contains("compute_sum"), "got:\n{text_out}");
+    assert!(
+        text_out.contains("struct") && text_out.contains("Engine"),
+        "got:\n{text_out}"
+    );
+    assert!(
+        text_out.contains("impl") && text_out.contains("Engine"),
+        "got:\n{text_out}"
+    );
+    assert!(
+        text_out.contains("method") && text_out.contains("start"),
+        "got:\n{text_out}"
+    );
+    assert!(
+        text_out.contains("fn") && text_out.contains("compute_sum"),
+        "got:\n{text_out}"
+    );
     assert!(text_out.contains("L1-L3"), "got:\n{text_out}");
 
     // JSON output
@@ -448,9 +472,15 @@ export function bootstrap(): void {}
         .map(|s| (s["kind"].as_str().unwrap(), s["name"].as_str().unwrap()))
         .collect();
     assert!(ts_pairs.contains(&("interface", "User")), "got:\n{ts_json}");
-    assert!(ts_pairs.contains(&("class", "UserService")), "got:\n{ts_json}");
+    assert!(
+        ts_pairs.contains(&("class", "UserService")),
+        "got:\n{ts_json}"
+    );
     assert!(ts_pairs.contains(&("method", "find")), "got:\n{ts_json}");
-    assert!(ts_pairs.contains(&("function", "bootstrap")), "got:\n{ts_json}");
+    assert!(
+        ts_pairs.contains(&("function", "bootstrap")),
+        "got:\n{ts_json}"
+    );
 }
 
 #[test]
@@ -488,12 +518,8 @@ pub fn base_fn() -> i32 {
     );
 
     // 3. Both workspaces concurrently append different Rust functions at the exact same EOF slot.
-    let ws1_lib = format!(
-        "{base_lib}\npub fn alpha_feature() -> i32 {{\n    10\n}}\n"
-    );
-    let ws2_lib = format!(
-        "{base_lib}\npub fn beta_feature() -> i32 {{\n    20\n}}\n"
-    );
+    let ws1_lib = format!("{base_lib}\npub fn alpha_feature() -> i32 {{\n    10\n}}\n");
+    let ws2_lib = format!("{base_lib}\npub fn beta_feature() -> i32 {{\n    20\n}}\n");
     fs::write(ws1_dir.join("src/lib.rs"), ws1_lib).unwrap();
     fs::write(ws2_dir.join("src/lib.rs"), ws2_lib).unwrap();
 
@@ -513,7 +539,10 @@ pub fn base_fn() -> i32 {
         !merged_src.contains("<<<<<<<"),
         "AST merge should produce zero conflict markers:\n{merged_src}"
     );
-    assert!(merged_src.contains("pub fn base_fn()"), "got:\n{merged_src}");
+    assert!(
+        merged_src.contains("pub fn base_fn()"),
+        "got:\n{merged_src}"
+    );
     assert!(
         merged_src.contains("pub fn alpha_feature()"),
         "got:\n{merged_src}"
@@ -547,9 +576,16 @@ fn e2e_ws_mount_and_unmount_loopback() {
     let overlay_dir = overlay_parent.path().join("lazy-mount-overlay");
     let mount_dir = overlay_parent.path().join("vfs-mnt");
 
-    gitx_ok(root, &["init", "--name", "MountDev", "--email", "mount@example.com"]);
+    gitx_ok(
+        root,
+        &["init", "--name", "MountDev", "--email", "mount@example.com"],
+    );
     fs::create_dir_all(root.join("src")).unwrap();
-    fs::write(root.join("src/hello.rs"), "pub fn hi() -> &'static str { \"hi\" }\n").unwrap();
+    fs::write(
+        root.join("src/hello.rs"),
+        "pub fn hi() -> &'static str { \"hi\" }\n",
+    )
+    .unwrap();
     gitx_ok(root, &["describe", "-m", "Seed mount repo"]);
     gitx_ok(root, &["land"]);
 

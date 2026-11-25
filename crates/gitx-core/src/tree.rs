@@ -41,10 +41,7 @@ pub enum EntryKind {
         mode: FileMode,
     },
     /// First-class unresolved conflict recorded directly inside the tree.
-    Conflict {
-        term: ConflictTerm,
-        mode: FileMode,
-    },
+    Conflict { term: ConflictTerm, mode: FileMode },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

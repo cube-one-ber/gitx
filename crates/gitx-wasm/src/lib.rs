@@ -315,8 +315,7 @@ pub fn create_repo_from_json(config_json: &str) -> Result<u32, String> {
     let cfg: RepoConfig = if config_json.trim().is_empty() {
         RepoConfig::default()
     } else {
-        serde_json::from_str(config_json)
-            .map_err(|e| format!("invalid repo config JSON: {e}"))?
+        serde_json::from_str(config_json).map_err(|e| format!("invalid repo config JSON: {e}"))?
     };
 
     let author_name = cfg
@@ -326,7 +325,12 @@ pub fn create_repo_from_json(config_json: &str) -> Result<u32, String> {
     let author_email = cfg
         .author_email
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("{}@gitx.local", author_name.to_lowercase().replace(' ', ".")));
+        .unwrap_or_else(|| {
+            format!(
+                "{}@gitx.local",
+                author_name.to_lowercase().replace(' ', ".")
+            )
+        });
     let author = Identity {
         name: author_name.clone(),
         email: author_email,
@@ -450,10 +454,7 @@ fn dispatch_request(handle: u32, req: &Value) -> InvokeEnvelope {
         "setPrincipal" => op_set_principal(inst, req),
         "mcpCall" => op_mcp_call(inst, req),
         other => {
-            return InvokeEnvelope::err(
-                "unknown_op",
-                format!("unsupported operation '{other}'"),
-            );
+            return InvokeEnvelope::err("unknown_op", format!("unsupported operation '{other}'"));
         }
     };
 
@@ -534,8 +535,8 @@ fn op_write_file(inst: &mut RepoInstance, req: &Value) -> OpResult {
     let ws = workspace_or_default(inst, req).to_string();
     let path = require_str(req, &["path"])?;
     let content = require_str(req, &["content"])?;
-    let is_base64 = req_str(req, &["encoding"])
-        .is_some_and(|enc| enc.eq_ignore_ascii_case("base64"));
+    let is_base64 =
+        req_str(req, &["encoding"]).is_some_and(|enc| enc.eq_ignore_ascii_case("base64"));
 
     let bytes = if is_base64 {
         BASE64_STANDARD.decode(content).map_err(|e| {
@@ -563,8 +564,8 @@ fn op_read_file(inst: &RepoInstance, req: &Value) -> OpResult {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| workspace_or_default(inst, req));
     let path = require_str(req, &["path"])?;
-    let want_base64 = req_str(req, &["encoding"])
-        .is_some_and(|enc| enc.eq_ignore_ascii_case("base64"));
+    let want_base64 =
+        req_str(req, &["encoding"]).is_some_and(|enc| enc.eq_ignore_ascii_case("base64"));
 
     let bytes = inst
         .mcp
@@ -788,7 +789,11 @@ fn op_log(inst: &RepoInstance, req: &Value) -> OpResult {
         }
     }
 
-    visible.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+    visible.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
     visible.truncate(limit);
 
     let rev = visible.first().map(|c| c.id.to_hex());
@@ -855,8 +860,9 @@ fn op_record_context(inst: &RepoInstance, req: &Value) -> OpResult {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| workspace_or_default(inst, req));
 
-    let cs_hash = resolve_start_hash(repo, rev_spec)?
-        .ok_or_else(|| InvokeEnvelope::err("not_found", format!("revision '{rev_spec}' not found")))?;
+    let cs_hash = resolve_start_hash(repo, rev_spec)?.ok_or_else(|| {
+        InvokeEnvelope::err("not_found", format!("revision '{rev_spec}' not found"))
+    })?;
     let cs = repo
         .get_changeset(cs_hash)
         .map_err(InvokeEnvelope::from_gitx_error)?;
@@ -947,10 +953,7 @@ fn op_record_context(inst: &RepoInstance, req: &Value) -> OpResult {
             .unwrap_or(total_lines);
 
         anchors.push(CodeAnchor::from_file_lines(
-            path,
-            &content,
-            line_start,
-            line_end,
+            path, &content, line_start, line_end,
         ));
     }
 
@@ -1037,7 +1040,10 @@ fn op_undo_checkpoint(inst: &mut RepoInstance, req: &Value) -> OpResult {
     let cp_id = match req_str(req, &["checkpointId", "checkpoint_id"]) {
         Some(raw) if !raw.is_empty() => {
             let parsed = Ulid::from_string(raw).map_err(|e| {
-                InvokeEnvelope::err("invalid_request", format!("invalid checkpointId '{raw}': {e}"))
+                InvokeEnvelope::err(
+                    "invalid_request",
+                    format!("invalid checkpointId '{raw}': {e}"),
+                )
             })?;
             Some(parsed)
         }
@@ -1233,7 +1239,8 @@ mod tests {
         let mut resp_ptr: *mut u8 = std::ptr::null_mut();
         let mut resp_len: usize = 0;
         // SAFETY: `req_ptr` is valid for `req.len()` readable bytes; out pointers are stack locals.
-        let ok = unsafe { gitx_invoke_into(handle, req_ptr, req.len(), &mut resp_ptr, &mut resp_len) };
+        let ok =
+            unsafe { gitx_invoke_into(handle, req_ptr, req.len(), &mut resp_ptr, &mut resp_len) };
         // SAFETY: `req_ptr` was allocated with `gitx_alloc(req.len())`.
         unsafe { gitx_dealloc(req_ptr, req.len()) };
 
@@ -1247,7 +1254,10 @@ mod tests {
         // SAFETY: Free the response buffer using the exact `(ptr, len)` returned by `gitx_invoke_into`.
         unsafe { gitx_dealloc(resp_ptr, resp_len) };
 
-        assert_eq!(unpack_ptr_len(pack_ptr_len(0x0012_3456, 4096)), (0x0012_3456, 4096));
+        assert_eq!(
+            unpack_ptr_len(pack_ptr_len(0x0012_3456, 4096)),
+            (0x0012_3456, 4096)
+        );
 
         let parsed: Value = serde_json::from_str(&resp_str).expect("envelope JSON");
         assert_eq!(parsed["ok"], true);
@@ -1306,11 +1316,17 @@ mod tests {
 
         // Two concurrent workspaces edit disjoint keys in shared package.json
         assert_eq!(
-            invoke(handle, json!({"op":"createWorkspace","name":"ws-a","baseRef":"master"}))["ok"],
+            invoke(
+                handle,
+                json!({"op":"createWorkspace","name":"ws-a","baseRef":"master"})
+            )["ok"],
             true
         );
         assert_eq!(
-            invoke(handle, json!({"op":"createWorkspace","name":"ws-b","baseRef":"master"}))["ok"],
+            invoke(
+                handle,
+                json!({"op":"createWorkspace","name":"ws-b","baseRef":"master"})
+            )["ok"],
             true
         );
 
@@ -1349,13 +1365,22 @@ mod tests {
             true
         );
 
-        let la = invoke(handle, json!({"op":"land","workspace":"ws-a","target":"master"}));
+        let la = invoke(
+            handle,
+            json!({"op":"land","workspace":"ws-a","target":"master"}),
+        );
         assert_eq!(la["ok"], true);
-        let lb = invoke(handle, json!({"op":"land","workspace":"ws-b","target":"master"}));
+        let lb = invoke(
+            handle,
+            json!({"op":"land","workspace":"ws-b","target":"master"}),
+        );
         assert_eq!(lb["ok"], true);
         assert_eq!(lb["data"]["autoMerged"], true);
 
-        let merged_pkg = invoke(handle, json!({"op":"readFile","rev":"master","path":"package.json"}));
+        let merged_pkg = invoke(
+            handle,
+            json!({"op":"readFile","rev":"master","path":"package.json"}),
+        );
         assert_eq!(merged_pkg["ok"], true);
         let merged_json: Value =
             serde_json::from_str(merged_pkg["data"]["content"].as_str().unwrap()).unwrap();

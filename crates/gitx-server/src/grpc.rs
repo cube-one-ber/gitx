@@ -2,13 +2,14 @@
 //! full Visibility Domain ACL enforcement matching the HTTP API.
 
 use crate::api::{
-    self, ActorAgentInput, BlameQuery, CommitRequest, DiffQuery, GrepQuery, LandRequest, TreeQuery,
-    read_blob_authorized,
+    self, ActorAgentInput, BlameQuery, CommitRequest, DiffQuery, GrepQuery, LandRequest, LogQuery,
+    PublishEmbargoRequest, RebaseRequest, SymbolsQuery, TreeQuery, WhyQuery, read_blob_authorized,
 };
 use crate::auth::{
     AuthenticatedPrincipal, can_administer_acl, extract_principal_from_grpc_metadata,
 };
 use crate::error::ApiError;
+use crate::fleet_api::{self, FleetQuery, FleetUploadRequest};
 use crate::queue::{self, DrainRequest, EnqueueRequest, QueueEntry, QueueStatus};
 use crate::state::{AppState, RepoInfo};
 use axum::Json;
@@ -23,13 +24,18 @@ use gitx_proto::gitx_service_server::{GitxService, GitxServiceServer};
 use gitx_proto::{
     BlameLine as ProtoBlameLine, BlameRequest, BlameResponse, CommitRequest as ProtoCommitRequest,
     CommitResponse as ProtoCommitResponse, CreateRepoRequest, CreateRepoResponse,
-    DiffFileEntry as ProtoDiffFileEntry, DiffRequest, DiffResponse, DrainMergeQueueRequest,
-    DrainMergeQueueResponse, EnqueueMergeRequest, EnqueueMergeResponse, GetTreeRequest,
-    GetTreeResponse, GrepMatch as ProtoGrepMatch, GrepRequest, GrepResponse, HealthRequest,
-    HealthResponse, LandRequest as ProtoLandRequest, LandResponse as ProtoLandResponse,
-    ListReposRequest, ListReposResponse, QueueEntry as ProtoQueueEntry, ReadBlobRequest,
-    ReadBlobResponse, RepoInfo as ProtoRepoInfo, RevertRequest, RevertResponse,
-    TreeFileEntry as ProtoTreeFileEntry,
+    DiffFileEntry as ProtoDiffFileEntry, DiffRequest, DiffResponse, DownloadFleetBundleRequest,
+    DrainMergeQueueRequest, DrainMergeQueueResponse, EnqueueMergeRequest, EnqueueMergeResponse,
+    FleetSyncRecord as ProtoFleetSyncRecord, GetTreeRequest, GetTreeResponse,
+    GrepMatch as ProtoGrepMatch, GrepRequest, GrepResponse, HealthRequest, HealthResponse,
+    LandRequest as ProtoLandRequest, LandResponse as ProtoLandResponse, ListReposRequest,
+    ListReposResponse, LogEntry as ProtoLogEntry, LogRequest, LogResponse,
+    PublishEmbargoRequest as ProtoPublishEmbargoRequest,
+    PublishEmbargoResponse as ProtoPublishEmbargoResponse, QueueEntry as ProtoQueueEntry,
+    ReadBlobRequest, ReadBlobResponse, RebaseRequest as ProtoRebaseRequest,
+    RebaseResponse as ProtoRebaseResponse, RepoInfo as ProtoRepoInfo, RevertRequest,
+    RevertResponse, SymbolEntry as ProtoSymbolEntry, SymbolsRequest, SymbolsResponse,
+    TreeFileEntry as ProtoTreeFileEntry, UploadFleetBundleRequest, WhyRequest, WhyResponse,
 };
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -97,11 +103,15 @@ fn repo_info_to_proto(info: RepoInfo) -> ProtoRepoInfo {
 fn queue_entry_to_proto(entry: QueueEntry) -> ProtoQueueEntry {
     let (status, land_seq, conflict_paths, rejection_reason) = match entry.status {
         QueueStatus::Pending => ("pending".to_string(), None, Vec::new(), None),
-        QueueStatus::Landed { land_seq } => ("landed".to_string(), Some(land_seq), Vec::new(), None),
+        QueueStatus::Landed { land_seq } => {
+            ("landed".to_string(), Some(land_seq), Vec::new(), None)
+        }
         QueueStatus::Conflicted { conflict_paths } => {
             ("conflicted".to_string(), None, conflict_paths, None)
         }
-        QueueStatus::Rejected { reason } => ("rejected".to_string(), None, Vec::new(), Some(reason)),
+        QueueStatus::Rejected { reason } => {
+            ("rejected".to_string(), None, Vec::new(), Some(reason))
+        }
     };
 
     ProtoQueueEntry {
@@ -110,7 +120,9 @@ fn queue_entry_to_proto(entry: QueueEntry) -> ProtoQueueEntry {
         change_id: entry.change_id,
         target: entry.target,
         submitted_by: entry.submitted_by,
-        enqueued_at: entry.enqueued_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        enqueued_at: entry
+            .enqueued_at
+            .to_rfc3339_opts(SecondsFormat::Nanos, true),
         status,
         land_seq,
         conflict_paths,
@@ -389,6 +401,14 @@ impl GitxService for GitxGrpcService {
             req.author_email
         };
 
+        let mut secret_envelopes: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for env_entry in req.secret_envelopes {
+            secret_envelopes
+                .entry(env_entry.domain)
+                .or_default()
+                .insert(env_entry.path, env_entry.envelope_json);
+        }
+
         let http_req = CommitRequest {
             files,
             delete_files: req.delete_files,
@@ -408,7 +428,7 @@ impl GitxService for GitxGrpcService {
             embargo_advisory: req.embargo_advisory,
             embargo_allowed_teams: req.embargo_allowed_teams,
             context_prompt: req.context_prompt,
-            secret_envelopes: BTreeMap::new(),
+            secret_envelopes,
         };
 
         let Json(resp) = api::commit(
@@ -563,6 +583,224 @@ impl GitxService for GitxGrpcService {
                 .map(queue_entry_to_proto)
                 .collect(),
             resolved_conflicts: resp.resolved_conflicts,
+        }))
+    }
+
+    async fn log(
+        &self,
+        request: Request<LogRequest>,
+    ) -> std::result::Result<Response<LogResponse>, Status> {
+        let principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        let req = request.into_inner();
+        let Json(resp) = api::log_history(
+            State(Arc::clone(&self.state)),
+            AuthenticatedPrincipal(principal),
+            Path((req.owner, req.name)),
+            Query(LogQuery {
+                rev: req.rev,
+                limit: req.limit.map(|l| l as usize),
+            }),
+        )
+        .await
+        .map_err(api_err_to_status)?;
+
+        Ok(Response::new(LogResponse {
+            commits: resp
+                .commits
+                .into_iter()
+                .map(|c| ProtoLogEntry {
+                    changeset_id: c.changeset_id,
+                    change_id: c.change_id,
+                    public_projection_hash: c.public_projection_hash,
+                    parents: c.parents,
+                    author_name: c.author_name,
+                    author_email: c.author_email,
+                    visibility: c.visibility_domain,
+                    timestamp: c.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    message: c.message,
+                    has_conflicts: c.has_conflicts,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn why(
+        &self,
+        request: Request<WhyRequest>,
+    ) -> std::result::Result<Response<WhyResponse>, Status> {
+        let principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        let req = request.into_inner();
+        let Json(resp) = api::why(
+            State(Arc::clone(&self.state)),
+            AuthenticatedPrincipal(principal),
+            Path((req.owner, req.name)),
+            Query(WhyQuery {
+                path: req.path,
+                line: req.line,
+                rev: req.rev,
+            }),
+        )
+        .await
+        .map_err(api_err_to_status)?;
+
+        let matches_json = serde_json::to_string(&resp.matches)
+            .map_err(|e| Status::internal(format!("failed to serialize why matches: {e}")))?;
+
+        Ok(Response::new(WhyResponse {
+            path: resp.path,
+            line: resp.line,
+            rev: resp.rev,
+            matches_json,
+        }))
+    }
+
+    async fn symbols(
+        &self,
+        request: Request<SymbolsRequest>,
+    ) -> std::result::Result<Response<SymbolsResponse>, Status> {
+        let principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        let req = request.into_inner();
+        let Json(resp) = api::get_symbols(
+            State(Arc::clone(&self.state)),
+            AuthenticatedPrincipal(principal),
+            Path((req.owner, req.name)),
+            Query(SymbolsQuery {
+                rev: req.rev,
+                path: req.path,
+            }),
+        )
+        .await
+        .map_err(api_err_to_status)?;
+
+        Ok(Response::new(SymbolsResponse {
+            rev: resp.rev,
+            symbols: resp
+                .symbols
+                .into_iter()
+                .map(|s| ProtoSymbolEntry {
+                    path: s.path,
+                    domain: s.domain,
+                    name: s.name,
+                    kind: s.kind,
+                    line_start: s.line_start,
+                    line_end: s.line_end,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn rebase(
+        &self,
+        request: Request<ProtoRebaseRequest>,
+    ) -> std::result::Result<Response<ProtoRebaseResponse>, Status> {
+        let principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        let req = request.into_inner();
+        let Json(resp) = api::rebase_changeset(
+            State(Arc::clone(&self.state)),
+            AuthenticatedPrincipal(principal),
+            Path((req.owner, req.name)),
+            Json(RebaseRequest {
+                changeset_id: req.changeset_id,
+                onto: req.onto,
+                update_bookmark: req.update_bookmark,
+            }),
+        )
+        .await
+        .map_err(api_err_to_status)?;
+
+        Ok(Response::new(ProtoRebaseResponse {
+            changeset_id: resp.changeset_id,
+            change_id: resp.change_id,
+            onto: resp.onto,
+            has_conflicts: resp.has_conflicts,
+            conflicts: resp.conflicts,
+            updated_bookmark: resp.updated_bookmark,
+        }))
+    }
+
+    async fn publish_embargo(
+        &self,
+        request: Request<ProtoPublishEmbargoRequest>,
+    ) -> std::result::Result<Response<ProtoPublishEmbargoResponse>, Status> {
+        let principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        let req = request.into_inner();
+        let pub_req = PublishEmbargoRequest {
+            target: req.target,
+            message: req.message,
+        };
+        let body = Bytes::from(
+            serde_json::to_vec(&pub_req)
+                .map_err(|e| Status::internal(format!("failed to encode publish request: {e}")))?,
+        );
+        let Json(resp) = api::publish_embargo(
+            State(Arc::clone(&self.state)),
+            AuthenticatedPrincipal(principal),
+            Path((req.owner, req.name, req.advisory)),
+            body,
+        )
+        .await
+        .map_err(api_err_to_status)?;
+
+        Ok(Response::new(ProtoPublishEmbargoResponse {
+            advisory: resp.advisory,
+            published_changeset_id: resp.changeset_id,
+            land_seq: resp.land_seq,
+            target: resp.target,
+        }))
+    }
+
+    async fn upload_fleet_bundle(
+        &self,
+        request: Request<UploadFleetBundleRequest>,
+    ) -> std::result::Result<Response<ProtoFleetSyncRecord>, Status> {
+        let principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        let req = request.into_inner();
+        let Json(rec) = fleet_api::upload_fleet_bundle(
+            State(Arc::clone(&self.state)),
+            AuthenticatedPrincipal(principal),
+            Path((req.owner, req.name)),
+            Json(FleetUploadRequest {
+                bundle_json: req.bundle_json,
+                machine: req.machine,
+            }),
+        )
+        .await
+        .map_err(api_err_to_status)?;
+
+        Ok(Response::new(ProtoFleetSyncRecord {
+            owner: rec.owner,
+            repo: rec.repo,
+            principal_id: rec.principal_id,
+            machine: rec.machine,
+            updated_at: rec.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            bundle_json: rec.bundle_json,
+        }))
+    }
+
+    async fn download_fleet_bundle(
+        &self,
+        request: Request<DownloadFleetBundleRequest>,
+    ) -> std::result::Result<Response<ProtoFleetSyncRecord>, Status> {
+        let principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        let req = request.into_inner();
+        let Json(rec) = fleet_api::download_fleet_bundle(
+            State(Arc::clone(&self.state)),
+            AuthenticatedPrincipal(principal),
+            Path((req.owner, req.name)),
+            Query(FleetQuery {
+                machine: req.machine,
+            }),
+        )
+        .await
+        .map_err(api_err_to_status)?;
+
+        Ok(Response::new(ProtoFleetSyncRecord {
+            owner: rec.owner,
+            repo: rec.repo,
+            principal_id: rec.principal_id,
+            machine: rec.machine,
+            updated_at: rec.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            bundle_json: rec.bundle_json,
         }))
     }
 }

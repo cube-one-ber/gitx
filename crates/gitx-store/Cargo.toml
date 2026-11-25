@@ -7,7 +7,7 @@ license-file.workspace = true
 [features]
 default = ["local", "distributed"]
 local = ["dep:rusqlite"]
-distributed = ["local", "dep:bytes", "dep:object_store", "dep:tokio"]
+distributed = ["local", "dep:bytes", "dep:object_store", "dep:tokio", "dep:tokio-postgres"]
 
 [dependencies]
 bincode.workspace = true
@@ -19,6 +19,7 @@ object_store = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 tokio = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

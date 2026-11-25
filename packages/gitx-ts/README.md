@@ -3,7 +3,7 @@
 Zero-dependency TypeScript SDK for **GitX** providing three composable transports:
 
 1. **`WasmAgentRepo`** (`src/wasm.ts`) — Loads the pure-Rust `gitx_wasm.wasm` binary via Node's `node:wasi` (or a minimal browser WASI shim) for zero-disk, lock-free in-memory workspaces, 3-way semantic merges, ACL enforcement, secret scanning, durable "Why" context, surgical checkpoint undo, and direct MCP JSON-RPC dispatch.
-2. **`GitxServerClient`** (`src/client.ts`) — Typed `fetch`-based HTTP client for `gitx-server` supporting bearer tokens, principal headers, zero-clone commits, ACID transactional landing, O(1) revert, batched merge queues, derived index stats, grep, blame, diff, and `why`.
+2. **`GitxServerClient`** (`src/client.ts`) — Typed `fetch`-based HTTP client for `gitx-server` supporting bearer tokens, principal headers, zero-clone commits, server-side `rebase`, AST `symbols`, ACID transactional landing, O(1) revert, batched merge queues, derived index stats, grep, blame, diff, and `why`.
 3. **`GitxMcpClient`** (`src/mcp.ts`) — Typed JSON-RPC 2.0 stdio client that spawns `gitx mcp --in-memory` (or wraps arbitrary readable/writable streams) and invokes GitX MCP tools.
 
 ## Quick Start

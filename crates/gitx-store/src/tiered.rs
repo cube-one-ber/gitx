@@ -29,9 +29,7 @@ fn shared_store_runtime() -> Result<&'static tokio::runtime::Runtime> {
     if let Some(rt) = STORE_RUNTIME.get() {
         return Ok(rt);
     }
-    let _guard = STORE_RUNTIME_INIT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = STORE_RUNTIME_INIT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(rt) = STORE_RUNTIME.get() {
         return Ok(rt);
     }

@@ -48,15 +48,30 @@ impl FleetWorkspaceMetadata {
     }
 }
 
+/// Encrypted anonymous WIP `ChangeSet` snapshot carried inside a [`FleetOverlayBundle`] so
+/// uncommitted work-in-progress moves across machines alongside `.env` overlays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetWipSnapshot {
+    pub change_id: ChangeId,
+    pub base_changeset: Option<ObjectHash>,
+    pub description: String,
+    pub files: BTreeMap<String, OverlayFile>,
+    #[serde(default)]
+    pub deleted_paths: Vec<String>,
+}
+
 /// Cross-machine "Dropbox for Devs" overlay bundle capturing private/ignored local files
-/// (such as `.env`, `.env.local`, editor/tool configs) and workspace metadata while strictly
-/// excluding OS-specific directories (`node_modules/`, `target/`, `.git/`, `.gitx/`).
+/// (such as `.env`, `.env.local`, editor/tool configs), optional WIP `ChangeSet` state, and
+/// workspace metadata while strictly excluding OS-specific directories (`node_modules/`,
+/// `target/`, `.git/`, `.gitx/`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetOverlayBundle {
     pub format_version: u32,
     pub created_at: DateTime<Utc>,
     pub workspace: FleetWorkspaceMetadata,
     pub files: BTreeMap<String, OverlayFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wip_snapshot: Option<FleetWipSnapshot>,
 }
 
 impl FleetOverlayBundle {
@@ -118,14 +133,17 @@ pub fn export_overlay_with_metadata(
         });
 
     for entry_res in walker {
-        let entry = entry_res
-            .map_err(|e| GitxError::Workspace(format!("walkdir error during overlay export: {e}")))?;
+        let entry = entry_res.map_err(|e| {
+            GitxError::Workspace(format!("walkdir error during overlay export: {e}"))
+        })?;
         if entry.depth() == 0 || entry.file_type().is_dir() {
             continue;
         }
 
         let rel = entry.path().strip_prefix(root).map_err(|e| {
-            GitxError::Workspace(format!("failed to strip root prefix during overlay export: {e}"))
+            GitxError::Workspace(format!(
+                "failed to strip root prefix during overlay export: {e}"
+            ))
         })?;
         let rel_str = normalize_rel_path(
             &rel.components()
@@ -172,6 +190,7 @@ pub fn export_overlay_with_metadata(
         created_at: Utc::now(),
         workspace,
         files,
+        wip_snapshot: None,
     })
 }
 
@@ -274,24 +293,23 @@ fn fleet_overlay_aad_path(machine_id: &str) -> String {
     format!("gitx:fleet-overlay:v1/{machine_id}")
 }
 
-/// Export private/ignored overlay files matching `include_patterns` from `root` and seal the
-/// entire bundle inside an end-to-end encrypted [`EncryptedFleetBundle`] for `recipients`.
-///
-/// Strictly excludes OS/build/VCS directories (`node_modules/`, `target/`, `.git/`, `.gitx/`)
-/// and binds `(domain, machine_id, key_epoch)` into the AEAD associated data.
-pub fn export_encrypted_overlay(
+/// Export private/ignored overlay files matching `include_patterns` from `root` plus an optional
+/// active WIP `ChangeSet` snapshot and seal everything inside an [`EncryptedFleetBundle`].
+pub fn export_encrypted_overlay_with_wip(
     root: &Path,
     include_patterns: &[&str],
     machine_id: &str,
     domain: &DomainId,
     key_epoch: u64,
     recipients: &[PublicKeyBundle],
+    wip_snapshot: Option<FleetWipSnapshot>,
 ) -> Result<EncryptedFleetBundle> {
     let metadata = FleetWorkspaceMetadata {
         source_machine: Some(machine_id.to_string()),
         ..Default::default()
     };
-    let bundle = export_overlay_with_metadata(root, include_patterns, metadata)?;
+    let mut bundle = export_overlay_with_metadata(root, include_patterns, metadata)?;
+    bundle.wip_snapshot = wip_snapshot;
     let file_count = bundle.files.len();
     let created_at = bundle.created_at;
 
@@ -308,16 +326,36 @@ pub fn export_encrypted_overlay(
     })
 }
 
-/// Decrypt an [`EncryptedFleetBundle`] using an authorized machine/user `keypair` and restore
-/// its overlay files onto `root`, returning the sorted list of restored relative file paths.
+/// Export private/ignored overlay files matching `include_patterns` from `root` and seal the
+/// entire bundle inside an end-to-end encrypted [`EncryptedFleetBundle`] for `recipients`.
 ///
-/// Fails with [`GitxError::AccessDenied`] if `keypair` is not an authorized recipient, or
-/// [`GitxError::Crypto`] if the ciphertext or authenticated header metadata was tampered with.
-pub fn apply_encrypted_overlay(
+/// Strictly excludes OS/build/VCS directories (`node_modules/`, `target/`, `.git/`, `.gitx/`)
+/// and binds `(domain, machine_id, key_epoch)` into the AEAD associated data.
+pub fn export_encrypted_overlay(
     root: &Path,
+    include_patterns: &[&str],
+    machine_id: &str,
+    domain: &DomainId,
+    key_epoch: u64,
+    recipients: &[PublicKeyBundle],
+) -> Result<EncryptedFleetBundle> {
+    export_encrypted_overlay_with_wip(
+        root,
+        include_patterns,
+        machine_id,
+        domain,
+        key_epoch,
+        recipients,
+        None,
+    )
+}
+
+/// Decrypt an [`EncryptedFleetBundle`] and return the inner [`FleetOverlayBundle`] (including
+/// any attached [`FleetWipSnapshot`]) without mutating disk.
+pub fn decrypt_encrypted_overlay(
     bundle: &EncryptedFleetBundle,
     keypair: &UserKeyPair,
-) -> Result<Vec<String>> {
+) -> Result<FleetOverlayBundle> {
     let aad_path = fleet_overlay_aad_path(&bundle.machine_id);
     let plaintext = decrypt_secret(&bundle.envelope, &aad_path, keypair)?;
 
@@ -331,7 +369,20 @@ pub fn apply_encrypted_overlay(
             decoded.files.len()
         )));
     }
+    Ok(decoded)
+}
 
+/// Decrypt an [`EncryptedFleetBundle`] using an authorized machine/user `keypair` and restore
+/// its overlay files onto `root`, returning the sorted list of restored relative file paths.
+///
+/// Fails with [`GitxError::AccessDenied`] if `keypair` is not an authorized recipient, or
+/// [`GitxError::Crypto`] if the ciphertext or authenticated header metadata was tampered with.
+pub fn apply_encrypted_overlay(
+    root: &Path,
+    bundle: &EncryptedFleetBundle,
+    keypair: &UserKeyPair,
+) -> Result<Vec<String>> {
+    let decoded = decrypt_encrypted_overlay(bundle, keypair)?;
     apply_overlay(root, &decoded)
 }
 

@@ -32,10 +32,7 @@ fn ensure_git_dir_initialized(target_git_dir: &Path) -> Result<()> {
 
     let config_path = target_git_dir.join("config");
     if !config_path.exists() {
-        let is_bare = target_git_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            != Some(".git");
+        let is_bare = target_git_dir.file_name().and_then(|n| n.to_str()) != Some(".git");
         let bare_val = if is_bare { "true" } else { "false" };
         let config = format!(
             "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = {bare_val}\n"
@@ -64,8 +61,7 @@ fn is_changeset_visible(cs: &ChangeSet, allowed: &HashSet<&DomainId>) -> bool {
             .iter()
             .any(|d| !d.is_public() && allowed.contains(d)),
         Some(EmbargoState::Published { .. }) => {
-            allowed.contains(&DomainId::public())
-                || allowed.contains(&cs.visibility.primary_domain)
+            allowed.contains(&DomainId::public()) || allowed.contains(&cs.visibility.primary_domain)
         }
         None => allowed.contains(&cs.visibility.primary_domain),
     }

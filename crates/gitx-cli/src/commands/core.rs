@@ -9,11 +9,7 @@ use gitx_store::ObjectStore;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::env;
 
-pub fn cmd_init(
-    colocate: bool,
-    name: Option<String>,
-    email: Option<String>,
-) -> Result<()> {
+pub fn cmd_init(colocate: bool, name: Option<String>, email: Option<String>) -> Result<()> {
     let cwd = env::current_dir()?;
     let summary = Repo::init(&cwd, colocate, name, email)?;
     println!("Initialized gitx repository at {}", summary.root.display());
@@ -35,10 +31,7 @@ pub fn cmd_status() -> Result<()> {
     let snap = repo.snapshot_working_copy()?;
     let cs = &snap.changeset;
 
-    println!(
-        "Workspace:  {} (@)",
-        repo.config.active_workspace
-    );
+    println!("Workspace:  {} (@)", repo.config.active_workspace);
     println!("ChangeId:   {} ({})", cs.change_id.short(), cs.change_id);
     println!("Revision:   {}", cs.id.short());
     println!("Visibility: {}", format_visibility(&cs.visibility));
@@ -255,7 +248,11 @@ pub fn cmd_log(limit: usize, all_domains: bool) -> Result<()> {
     let changesets = if all_domains {
         let mut all = repo.store.list_changesets()?;
         // Deduplicate by ChangeId (keep latest revision) or show latest-first across all domains
-        all.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        all.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         all
     } else {
         // Walk reachable DAG from `@` and all bookmarks

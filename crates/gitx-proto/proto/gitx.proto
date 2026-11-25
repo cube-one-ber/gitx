@@ -12,9 +12,16 @@ service GitxService {
   rpc Diff(DiffRequest) returns (DiffResponse);
   rpc Grep(GrepRequest) returns (GrepResponse);
   rpc Blame(BlameRequest) returns (BlameResponse);
+  rpc Log(LogRequest) returns (LogResponse);
+  rpc Why(WhyRequest) returns (WhyResponse);
+  rpc Symbols(SymbolsRequest) returns (SymbolsResponse);
   rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Rebase(RebaseRequest) returns (RebaseResponse);
   rpc Land(LandRequest) returns (LandResponse);
   rpc Revert(RevertRequest) returns (RevertResponse);
+  rpc PublishEmbargo(PublishEmbargoRequest) returns (PublishEmbargoResponse);
+  rpc UploadFleetBundle(UploadFleetBundleRequest) returns (FleetSyncRecord);
+  rpc DownloadFleetBundle(DownloadFleetBundleRequest) returns (FleetSyncRecord);
   rpc EnqueueMerge(EnqueueMergeRequest) returns (EnqueueMergeResponse);
   rpc DrainMergeQueue(DrainMergeQueueRequest) returns (DrainMergeQueueResponse);
 }
@@ -165,6 +172,12 @@ message FileWrite {
   bytes content = 2;
 }
 
+message SecretEnvelopeEntry {
+  string domain = 1;
+  string path = 2;
+  string envelope_json = 3;
+}
+
 message CommitRequest {
   string owner = 1;
   string name = 2;
@@ -181,6 +194,121 @@ message CommitRequest {
   optional string embargo_advisory = 13;
   repeated string embargo_allowed_teams = 14;
   optional string context_prompt = 15;
+  repeated SecretEnvelopeEntry secret_envelopes = 16;
+}
+
+message LogRequest {
+  string owner = 1;
+  string name = 2;
+  optional string rev = 3;
+  optional uint64 limit = 4;
+}
+
+message LogEntry {
+  string changeset_id = 1;
+  string change_id = 2;
+  string public_projection_hash = 3;
+  repeated string parents = 4;
+  string author_name = 5;
+  string author_email = 6;
+  string visibility = 7;
+  string timestamp = 8;
+  string message = 9;
+  bool has_conflicts = 10;
+}
+
+message LogResponse {
+  repeated LogEntry commits = 1;
+}
+
+message WhyRequest {
+  string owner = 1;
+  string name = 2;
+  string path = 3;
+  optional uint32 line = 4;
+  optional string rev = 5;
+}
+
+message WhyResponse {
+  string path = 1;
+  uint32 line = 2;
+  optional string rev = 3;
+  string matches_json = 4;
+}
+
+message SymbolsRequest {
+  string owner = 1;
+  string name = 2;
+  optional string rev = 3;
+  optional string path = 4;
+}
+
+message SymbolEntry {
+  string path = 1;
+  string domain = 2;
+  string name = 3;
+  string kind = 4;
+  uint32 line_start = 5;
+  uint32 line_end = 6;
+}
+
+message SymbolsResponse {
+  optional string rev = 1;
+  repeated SymbolEntry symbols = 2;
+}
+
+message RebaseRequest {
+  string owner = 1;
+  string name = 2;
+  string changeset_id = 3;
+  string onto = 4;
+  optional string update_bookmark = 5;
+}
+
+message RebaseResponse {
+  string changeset_id = 1;
+  string change_id = 2;
+  string onto = 3;
+  bool has_conflicts = 4;
+  repeated string conflicts = 5;
+  optional string updated_bookmark = 6;
+}
+
+message PublishEmbargoRequest {
+  string owner = 1;
+  string name = 2;
+  string advisory = 3;
+  optional string target = 4;
+  optional string message = 5;
+}
+
+message PublishEmbargoResponse {
+  string advisory = 1;
+  string published_changeset_id = 2;
+  uint64 land_seq = 3;
+  string target = 4;
+}
+
+message UploadFleetBundleRequest {
+  string owner = 1;
+  string name = 2;
+  string bundle_json = 3;
+  optional string machine = 4;
+}
+
+message DownloadFleetBundleRequest {
+  string owner = 1;
+  string name = 2;
+  optional string machine = 3;
+}
+
+message FleetSyncRecord {
+  string owner = 1;
+  string repo = 2;
+  string principal_id = 3;
+  optional string machine = 4;
+  string updated_at = 5;
+  string bundle_json = 6;
 }
 
 message CommitResponse {

@@ -149,7 +149,9 @@ pub fn read_loose_object(git_dir: &Path, oid: GitOid) -> Result<(String, Vec<u8>
         .map_err(|e| GitxError::GitBridge(format!("failed to inflate git object {oid}: {e}")))?;
 
     let nul_pos = raw.iter().position(|&b| b == 0).ok_or_else(|| {
-        GitxError::GitBridge(format!("corrupt git object {oid}: missing NUL header delimiter"))
+        GitxError::GitBridge(format!(
+            "corrupt git object {oid}: missing NUL header delimiter"
+        ))
     })?;
 
     let header = std::str::from_utf8(&raw[..nul_pos]).map_err(|e| {
@@ -157,7 +159,9 @@ pub fn read_loose_object(git_dir: &Path, oid: GitOid) -> Result<(String, Vec<u8>
     })?;
 
     let (kind, size_str) = header.split_once(' ').ok_or_else(|| {
-        GitxError::GitBridge(format!("corrupt git object {oid}: malformed header '{header}'"))
+        GitxError::GitBridge(format!(
+            "corrupt git object {oid}: malformed header '{header}'"
+        ))
     })?;
 
     let declared_size: usize = size_str.parse().map_err(|e| {
@@ -389,10 +393,7 @@ fn sanitize_ident_field(raw: &str, fallback: &str) -> String {
 
 fn sanitize_tz(raw: &str) -> &str {
     let b = raw.as_bytes();
-    if b.len() == 5
-        && (b[0] == b'+' || b[0] == b'-')
-        && b[1..].iter().all(|c| c.is_ascii_digit())
-    {
+    if b.len() == 5 && (b[0] == b'+' || b[0] == b'-') && b[1..].iter().all(|c| c.is_ascii_digit()) {
         let hh = (b[1] - b'0') * 10 + (b[2] - b'0');
         let mm = (b[3] - b'0') * 10 + (b[4] - b'0');
         if hh <= 23 && mm <= 59 {

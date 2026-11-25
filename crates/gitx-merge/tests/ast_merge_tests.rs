@@ -27,7 +27,12 @@ pub fn triple(x: i32) -> i32 {
 }
 "#;
 
-    let outcome = merge_bytes("src/math.rs", base.as_bytes(), ours.as_bytes(), theirs.as_bytes());
+    let outcome = merge_bytes(
+        "src/math.rs",
+        base.as_bytes(),
+        ours.as_bytes(),
+        theirs.as_bytes(),
+    );
     match outcome {
         MergeOutcome::Clean(bytes) => {
             let merged = String::from_utf8(bytes).unwrap();
@@ -71,7 +76,12 @@ pub fn greet() -> String {
 }
 "#;
 
-    let outcome = merge_bytes("src/lib.rs", base.as_bytes(), ours.as_bytes(), theirs.as_bytes());
+    let outcome = merge_bytes(
+        "src/lib.rs",
+        base.as_bytes(),
+        ours.as_bytes(),
+        theirs.as_bytes(),
+    );
     match outcome {
         MergeOutcome::Clean(bytes) => {
             let merged = String::from_utf8(bytes).unwrap();
@@ -128,7 +138,12 @@ pub fn theirs_only() -> i32 {
 }
 "#;
 
-    let outcome = merge_bytes("src/ops.rs", base.as_bytes(), ours.as_bytes(), theirs.as_bytes());
+    let outcome = merge_bytes(
+        "src/ops.rs",
+        base.as_bytes(),
+        ours.as_bytes(),
+        theirs.as_bytes(),
+    );
     match outcome {
         MergeOutcome::Clean(bytes) => {
             let merged = String::from_utf8(bytes).unwrap();
@@ -302,10 +317,8 @@ fn javascript_and_tsx_adjacent_additions_merge_cleanly() {
     assert!(js_text.contains("export const BETA = 3;"));
 
     let tsx_base = "export function App() {\n  return <main />;\n}\n";
-    let tsx_ours =
-        "export function App() {\n  return <main />;\n}\n\nexport function Header() {\n  return <header />;\n}\n";
-    let tsx_theirs =
-        "export function App() {\n  return <main />;\n}\n\nexport function Footer() {\n  return <footer />;\n}\n";
+    let tsx_ours = "export function App() {\n  return <main />;\n}\n\nexport function Header() {\n  return <header />;\n}\n";
+    let tsx_theirs = "export function App() {\n  return <main />;\n}\n\nexport function Footer() {\n  return <footer />;\n}\n";
 
     let tsx_outcome = merge_bytes(
         "src/App.tsx",
@@ -689,7 +702,10 @@ def agent_two():
             assert!(merged.contains("def agent_two():"));
 
             let syms = extract_ast_symbols("app/worker.py", &merged);
-            assert!(syms.iter().any(|s| s.name == "Service" && s.kind == "class"));
+            assert!(
+                syms.iter()
+                    .any(|s| s.name == "Service" && s.kind == "class")
+            );
             assert!(syms.iter().any(|s| s.name == "start" && s.kind == "method"));
             assert!(syms.iter().any(|s| s.name == "agent_one" && s.kind == "fn"));
             assert!(syms.iter().any(|s| s.name == "agent_two" && s.kind == "fn"));

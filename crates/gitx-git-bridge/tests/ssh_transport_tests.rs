@@ -213,7 +213,11 @@ fn unpack_and_verify_pack(pack_bytes: &[u8]) -> (TempDir, Vec<String>, String) {
     // Enumerate EVERY unpacked object (commits, trees, blobs)
     let all_oids_raw = run_git(
         dir.path(),
-        &["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ],
     );
     let mut oids = Vec::new();
     let mut all_contents = String::new();
@@ -421,13 +425,17 @@ fn ssh_receive_pack_preserves_other_domains_and_blocks_public_secret_push() {
     );
     run_git(&work_dir, &["config", "user.name", "Alice"]);
     run_git(&work_dir, &["config", "user.email", "alice@acme.dev"]);
-    let old_oid = run_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let old_oid = run_git(&work_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     // 1. Clean public commit pushed through GitSshSession::ReceivePack
     std::fs::write(work_dir.join("PUBLIC_NOTE.md"), "clean public update\n").unwrap();
     run_git(&work_dir, &["add", "PUBLIC_NOTE.md"]);
     run_git(&work_dir, &["commit", "-m", "Public SSH push"]);
-    let new_oid = run_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let new_oid = run_git(&work_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     // Build packfile for old_oid..new_oid using `git pack-objects --stdout`
     let mut pack_child = Command::new("git")
@@ -454,10 +462,15 @@ fn ssh_receive_pack_preserves_other_domains_and_blocks_public_secret_push() {
     req.extend_from_slice(&encode_flush_pkt());
     req.extend_from_slice(&pack_out.stdout);
 
-    let session = GitSshSession::new(&store, public_only.clone()).with_write_domain(DomainId::public());
+    let session =
+        GitSshSession::new(&store, public_only.clone()).with_write_domain(DomainId::public());
     let mut wire_out = Vec::new();
     session
-        .run("git-receive-pack '/acme/mono.git'", req.as_slice(), &mut wire_out)
+        .run(
+            "git-receive-pack '/acme/mono.git'",
+            req.as_slice(),
+            &mut wire_out,
+        )
         .expect("clean public SSH receive-pack should succeed");
 
     let after_head = store.get_bookmark("master").unwrap().unwrap();
@@ -465,8 +478,13 @@ fn ssh_receive_pack_preserves_other_domains_and_blocks_public_secret_push() {
     let after_cs = store.get_changeset(after_head).unwrap();
     // Untouched private/secret domains MUST be preserved!
     assert_eq!(after_cs.domain_trees.get(&team_core), Some(&orig_core_tree));
-    assert_eq!(after_cs.domain_trees.get(&secret_prod), Some(&orig_secret_tree));
-    let pub_tree = store.get_tree(after_cs.domain_trees[&DomainId::public()]).unwrap();
+    assert_eq!(
+        after_cs.domain_trees.get(&secret_prod),
+        Some(&orig_secret_tree)
+    );
+    let pub_tree = store
+        .get_tree(after_cs.domain_trees[&DomainId::public()])
+        .unwrap();
     assert!(pub_tree.entries.contains_key("PUBLIC_NOTE.md"));
 
     // 2. Pushing a leaked secret credential to public MUST be rejected
@@ -478,7 +496,9 @@ fn ssh_receive_pack_preserves_other_domains_and_blocks_public_secret_push() {
     .unwrap();
     run_git(&work_dir, &["add", "leaked.txt"]);
     run_git(&work_dir, &["commit", "-m", "Accidental AWS key"]);
-    let secret_oid = run_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let secret_oid = run_git(&work_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     let mut pack_child2 = Command::new("git")
         .arg("-C")
@@ -506,7 +526,11 @@ fn ssh_receive_pack_preserves_other_domains_and_blocks_public_secret_push() {
 
     let mut wire_out2 = Vec::new();
     let secret_err = session
-        .run("git-receive-pack '/acme/mono.git'", req2.as_slice(), &mut wire_out2)
+        .run(
+            "git-receive-pack '/acme/mono.git'",
+            req2.as_slice(),
+            &mut wire_out2,
+        )
         .unwrap_err();
     assert!(
         matches!(secret_err, GitxError::AccessDenied { .. }),
@@ -568,7 +592,11 @@ fn export_to_git_repo_never_leaks_active_embargo_via_flat_embargo_domain_id() {
 
     let all_oids = run_git(
         &bare_dir,
-        &["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ],
     );
     for oid in all_oids.lines() {
         if oid.trim().is_empty() {
@@ -686,11 +714,15 @@ domain secret:prod read=team:ops write=team:ops
     );
     run_git(&sec_work, &["config", "user.name", "Ops"]);
     run_git(&sec_work, &["config", "user.email", "ops@acme.dev"]);
-    let sec_old = run_git(&sec_work, &["rev-parse", "HEAD"]).trim().to_string();
+    let sec_old = run_git(&sec_work, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     std::fs::write(sec_work.join("secrets/app.env"), "TOKEN=v2\n").unwrap();
     run_git(&sec_work, &["add", "secrets/app.env"]);
     run_git(&sec_work, &["commit", "-m", "Rotate secret"]);
-    let sec_new = run_git(&sec_work, &["rev-parse", "HEAD"]).trim().to_string();
+    let sec_new = run_git(&sec_work, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     let sec_pack = build_pack(&sec_work, &format!("{sec_new}\n^{sec_old}\n"));
 
     let mut sec_req = encode_pkt_line(
@@ -703,12 +735,18 @@ domain secret:prod read=team:ops write=team:ops
         .with_write_domain(secret_prod.clone());
     let mut sec_out = Vec::new();
     sec_session
-        .run("git-receive-pack '/acme/app.git'", sec_req.as_slice(), &mut sec_out)
+        .run(
+            "git-receive-pack '/acme/app.git'",
+            sec_req.as_slice(),
+            &mut sec_out,
+        )
         .expect("authorized secret:prod SSH session must be able to update existing secret");
     assert!(String::from_utf8_lossy(&sec_out).contains("unpack ok"));
     let updated_head = store.get_bookmark("master").unwrap().unwrap();
     let updated_cs = store.get_changeset(updated_head).unwrap();
-    let updated_sec_tree = store.get_tree(updated_cs.domain_trees[&secret_prod]).unwrap();
+    let updated_sec_tree = store
+        .get_tree(updated_cs.domain_trees[&secret_prod])
+        .unwrap();
     let EntryKind::File { blob_hash, .. } = updated_sec_tree.entries["secrets/app.env"] else {
         panic!("expected File entry");
     };
@@ -737,19 +775,25 @@ domain secret:prod read=team:ops write=team:ops
     );
     run_git(&pub_work, &["config", "user.name", "Alice"]);
     run_git(&pub_work, &["config", "user.email", "alice@acme.dev"]);
-    let pub_old = run_git(&pub_work, &["rev-parse", "HEAD"]).trim().to_string();
+    let pub_old = run_git(&pub_work, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     std::fs::write(pub_work.join("good.txt"), "ok\n").unwrap();
     run_git(&pub_work, &["add", "good.txt"]);
     run_git(&pub_work, &["commit", "-m", "Valid master commit"]);
-    let good_oid = run_git(&pub_work, &["rev-parse", "HEAD"]).trim().to_string();
+    let good_oid = run_git(&pub_work, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     run_git(&pub_work, &["checkout", "-b", "zz-bad"]);
     std::fs::create_dir_all(pub_work.join("packages/private")).unwrap();
     std::fs::write(pub_work.join("packages/private/forbidden.rs"), "nope\n").unwrap();
     run_git(&pub_work, &["add", "packages/private/forbidden.rs"]);
     run_git(&pub_work, &["commit", "-m", "Bad ref commit"]);
-    let bad_oid = run_git(&pub_work, &["rev-parse", "HEAD"]).trim().to_string();
+    let bad_oid = run_git(&pub_work, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     let multi_pack = build_pack(&pub_work, &format!("{good_oid}\n{bad_oid}\n^{pub_old}\n"));
     let zero_oid = "0".repeat(40);
@@ -766,7 +810,11 @@ domain secret:prod read=team:ops write=team:ops
         .with_write_domain(pub_dom.clone());
     let mut multi_out = Vec::new();
     let err = pub_session
-        .run("git-receive-pack '/acme/app.git'", multi_req.as_slice(), &mut multi_out)
+        .run(
+            "git-receive-pack '/acme/app.git'",
+            multi_req.as_slice(),
+            &mut multi_out,
+        )
         .unwrap_err();
     assert!(matches!(err, GitxError::AccessDenied { .. }));
     let multi_out_str = String::from_utf8_lossy(&multi_out);
@@ -788,7 +836,9 @@ domain secret:prod read=team:ops write=team:ops
     std::fs::write(pub_work.join(".gitxacl"), &updated_acl).unwrap();
     run_git(&pub_work, &["add", ".gitxacl"]);
     run_git(&pub_work, &["commit", "-m", "Admin updates .gitxacl"]);
-    let acl_oid = run_git(&pub_work, &["rev-parse", "HEAD"]).trim().to_string();
+    let acl_oid = run_git(&pub_work, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     let acl_pack = build_pack(&pub_work, &format!("{acl_oid}\n^{pub_old}\n"));
     let mut acl_req = encode_pkt_line(
         format!("{pub_old} {acl_oid} refs/heads/master\0report-status\n").as_bytes(),
@@ -804,17 +854,18 @@ domain secret:prod read=team:ops write=team:ops
         fingerprint: None,
     };
     let parsed_policy = AclPolicy::parse(acl_text).unwrap();
-    let admin_session = GitSshSession::new(
-        &store,
-        vec![pub_dom.clone(), team_core, secret_prod],
-    )
-    .with_write_domain(pub_dom)
-    .with_acl_policy(parsed_policy)
-    .with_principal(admin_principal)
-    .with_acl_admin(true);
+    let admin_session = GitSshSession::new(&store, vec![pub_dom.clone(), team_core, secret_prod])
+        .with_write_domain(pub_dom)
+        .with_acl_policy(parsed_policy)
+        .with_principal(admin_principal)
+        .with_acl_admin(true);
     let mut acl_out = Vec::new();
     admin_session
-        .run("git-receive-pack '/acme/app.git'", acl_req.as_slice(), &mut acl_out)
+        .run(
+            "git-receive-pack '/acme/app.git'",
+            acl_req.as_slice(),
+            &mut acl_out,
+        )
         .expect("admin SSH session with with_acl_admin(true) must be allowed to update .gitxacl");
     assert!(String::from_utf8_lossy(&acl_out).contains("unpack ok"));
 }

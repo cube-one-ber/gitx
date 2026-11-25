@@ -270,9 +270,10 @@ impl McpServer {
     fn tool_diff(&self, args: &Value) -> std::result::Result<Value, String> {
         let ws = self.workspace_arg(args);
         let diff = match args.get("base_ref").and_then(Value::as_str) {
-            Some(base_ref) if !base_ref.is_empty() => {
-                self.repo.diff_against(ws, base_ref).map_err(|e| e.to_string())?
-            }
+            Some(base_ref) if !base_ref.is_empty() => self
+                .repo
+                .diff_against(ws, base_ref)
+                .map_err(|e| e.to_string())?,
             _ => self.repo.diff(ws).map_err(|e| e.to_string())?,
         };
         Ok(json!({
@@ -351,10 +352,7 @@ impl McpServer {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .unwrap_or("master");
-        let outcome = self
-            .repo
-            .land(&ws, target)
-            .map_err(|e| e.to_string())?;
+        let outcome = self.repo.land(&ws, target).map_err(|e| e.to_string())?;
         Ok(json!({
             "workspace": ws,
             "target": outcome.land_record.target,
@@ -422,10 +420,7 @@ impl McpServer {
             .filter(|&n| n >= 1)
             .ok_or_else(|| "missing or invalid 1-based integer argument 'line'".to_string())?;
 
-        let matches = self
-            .repo
-            .why(ws, path, line)
-            .map_err(|e| e.to_string())?;
+        let matches = self.repo.why(ws, path, line).map_err(|e| e.to_string())?;
         Ok(json!({
             "workspace": ws,
             "path": path,
