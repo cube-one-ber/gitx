@@ -33,6 +33,9 @@ const TTL: Duration = Duration::ZERO;
 /// Standard POSIX block size reported by virtual mounts.
 const BLOCK_SIZE: u32 = 4096;
 
+/// Maximum virtual file size (64 MiB) accepted by in-memory CoW write/truncate operations.
+const MAX_VFS_FILE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Linux `renameat2` `RENAME_NOREPLACE` flag.
 const RENAME_NOREPLACE: u32 = 1;
 
@@ -335,6 +338,9 @@ impl FuseCore {
         let mode = self.file_mode_for_path(&path)?;
         let start = usize::try_from(offset).map_err(|_| libc::EFBIG)?;
         let end = start.checked_add(data.len()).ok_or(libc::EFBIG)?;
+        if end > MAX_VFS_FILE_SIZE {
+            return Err(libc::EFBIG);
+        }
 
         let current_size = self.file_attr_for_path(ino, &path)?.size;
         let mut buf = if start == 0 && current_size == 0 {
@@ -386,6 +392,9 @@ impl FuseCore {
 
         if let Some(new_size) = size {
             let target_len = usize::try_from(new_size).map_err(|_| libc::EFBIG)?;
+            if target_len > MAX_VFS_FILE_SIZE {
+                return Err(libc::EFBIG);
+            }
             if target_len == 0 {
                 // Truncating to 0 never requires hydrating the base blob from ObjectStore.
                 self.workspace

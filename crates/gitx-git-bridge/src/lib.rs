@@ -23,13 +23,18 @@ pub use objects::{
     read_loose_object, write_commit_object, write_loose_object, write_tree_from_files,
 };
 pub use pktline::{
-    DELIM_PKT, FLUSH_PKT, PktLine, UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE,
-    UPLOAD_PACK_RESULT_CONTENT_TYPE, advertise_upload_pack_refs,
-    advertise_upload_pack_refs_with_protocol, decode_pkt_lines, encode_delim_pkt, encode_flush_pkt,
-    encode_pkt_line, handle_upload_pack, handle_upload_pack_with_protocol,
+    DELIM_PKT, FLUSH_PKT, PktLine, RECEIVE_PACK_ADVERTISEMENT_CONTENT_TYPE,
+    RECEIVE_PACK_RESULT_CONTENT_TYPE, UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE,
+    UPLOAD_PACK_RESULT_CONTENT_TYPE, advertise_receive_pack_refs_with_protocol,
+    advertise_upload_pack_refs, advertise_upload_pack_refs_with_protocol, decode_pkt_lines,
+    encode_delim_pkt, encode_flush_pkt, encode_pkt_line, handle_receive_pack_with_protocol,
+    handle_upload_pack, handle_upload_pack_with_protocol,
 };
-pub use project::{ProjectionReport, export_to_git_repo};
+pub use project::{ProjectionReport, export_to_git_repo, export_to_git_repo_filtered};
 pub use ssh::{
     GitSshService, GitSshSession, ParsedSshCommand, SshSessionReport,
-    advertise_ssh_upload_pack_refs, handle_ssh_command, parse_advertised_refs, parse_ssh_command,
+    advertise_ssh_upload_pack_refs, export_receive_pack_staging,
+    export_receive_pack_staging_filtered, handle_ssh_command, import_received_refs,
+    import_received_refs_with_policy, list_bare_branch_refs, parse_advertised_refs,
+    parse_ssh_command,
 };

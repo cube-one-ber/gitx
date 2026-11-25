@@ -8,6 +8,7 @@ use gitx_core::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
@@ -20,6 +21,7 @@ pub trait MetadataBackend: Send + Sync {
     fn get_changeset(&self, id: ObjectHash) -> Result<ChangeSet>;
     fn list_changesets(&self) -> Result<Vec<ChangeSet>>;
     fn get_revisions_for_change(&self, change_id: ChangeId) -> Result<Vec<ChangeSet>>;
+    fn delete_changeset(&self, id: ObjectHash) -> Result<()>;
 
     // ---- Stack storage ----
     fn put_stack(&self, stack: &Stack) -> Result<()>;
@@ -43,11 +45,20 @@ pub trait MetadataBackend: Send + Sync {
     ) -> Result<LandRecord>;
     fn get_land(&self, land_seq: u64) -> Result<LandRecord>;
     fn list_lands(&self, target: &str, limit: usize) -> Result<Vec<LandRecord>>;
+    fn list_all_lands(&self, after_land_seq: u64, limit: usize) -> Result<Vec<LandRecord>>;
     fn mark_reverted(&self, land_seq: u64, reverted_by: u64) -> Result<()>;
+    fn revert_land(&self, land_seq: u64) -> Result<LandRecord>;
 
     // ---- Bookmarks & Workspaces ----
     fn get_bookmark(&self, name: &str) -> Result<Option<ObjectHash>>;
     fn set_bookmark(&self, name: &str, hash: ObjectHash) -> Result<()>;
+    fn cas_bookmark(
+        &self,
+        name: &str,
+        expected: Option<ObjectHash>,
+        new_hash: ObjectHash,
+    ) -> Result<()>;
+    fn cas_bookmarks(&self, updates: &[(String, Option<ObjectHash>, ObjectHash)]) -> Result<()>;
     fn list_bookmarks(&self) -> Result<BTreeMap<String, ObjectHash>>;
     fn put_workspace(&self, ws: &WorkspaceRef) -> Result<()>;
     fn get_workspace(&self, name: &str) -> Result<Option<WorkspaceRef>>;
@@ -87,7 +98,7 @@ impl PostgresSslMode {
 }
 
 /// Connection pool & schema configuration for the PostgreSQL metadata backend.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostgresConfig {
     pub url: String,
     pub max_connections: u32,
@@ -96,6 +107,20 @@ pub struct PostgresConfig {
     pub schema: String,
     pub ssl_mode: PostgresSslMode,
     pub application_name: String,
+}
+
+impl fmt::Debug for PostgresConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresConfig")
+            .field("url", &"<redacted>")
+            .field("max_connections", &self.max_connections)
+            .field("min_connections", &self.min_connections)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("schema", &self.schema)
+            .field("ssl_mode", &self.ssl_mode)
+            .field("application_name", &self.application_name)
+            .finish()
+    }
 }
 
 impl PostgresConfig {
@@ -144,34 +169,31 @@ impl PostgresConfig {
     /// Validates connection URL scheme, pool bounds, and SQL schema identifier safety.
     pub fn validate(&self) -> Result<()> {
         let trimmed = self.url.trim();
+        let redacted = redact_url_credentials(trimmed);
         let rest = trimmed
             .strip_prefix("postgres://")
             .or_else(|| trimmed.strip_prefix("postgresql://"))
             .ok_or_else(|| {
                 GitxError::Storage(format!(
-                    "invalid postgres URL '{}': must start with postgres:// or postgresql://",
-                    self.url
+                    "invalid postgres URL '{redacted}': must start with postgres:// or postgresql://"
                 ))
             })?;
 
         let (authority, db_part) = rest.split_once('/').ok_or_else(|| {
             GitxError::Storage(format!(
-                "invalid postgres URL '{}': missing database name",
-                self.url
+                "invalid postgres URL '{redacted}': missing database name"
             ))
         })?;
         let host_part = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
         if host_part.trim().is_empty() {
             return Err(GitxError::Storage(format!(
-                "invalid postgres URL '{}': missing host",
-                self.url
+                "invalid postgres URL '{redacted}': missing host"
             )));
         }
         let db_name = db_part.split('?').next().unwrap_or("");
         if db_name.trim().is_empty() {
             return Err(GitxError::Storage(format!(
-                "invalid postgres URL '{}': empty database name",
-                self.url
+                "invalid postgres URL '{redacted}': empty database name"
             )));
         }
 
@@ -484,8 +506,8 @@ impl SqlMetadataBackend {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path).map_err(sqlite_err)?;
-        configure_and_migrate_sqlite(&conn, true)?;
+        let mut conn = Connection::open(&db_path).map_err(sqlite_err)?;
+        configure_and_migrate_sqlite(&mut conn, true)?;
         Ok(Self {
             engine: SqlEngine::Sqlite {
                 path: Some(db_path),
@@ -496,8 +518,8 @@ impl SqlMetadataBackend {
 
     /// Create an in-memory SQLite metadata database with all migrations applied (ideal for tests).
     pub fn in_memory_sqlite() -> Result<Self> {
-        let conn = Connection::open_in_memory().map_err(sqlite_err)?;
-        configure_and_migrate_sqlite(&conn, false)?;
+        let mut conn = Connection::open_in_memory().map_err(sqlite_err)?;
+        configure_and_migrate_sqlite(&mut conn, false)?;
         Ok(Self {
             engine: SqlEngine::Sqlite {
                 path: None,
@@ -585,7 +607,7 @@ impl SqlMetadataBackend {
     }
 }
 
-fn configure_and_migrate_sqlite(conn: &Connection, enable_wal: bool) -> Result<()> {
+fn configure_and_migrate_sqlite(conn: &mut Connection, enable_wal: bool) -> Result<()> {
     let pragmas = if enable_wal {
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
@@ -596,7 +618,11 @@ fn configure_and_migrate_sqlite(conn: &Connection, enable_wal: bool) -> Result<(
     };
     conn.execute_batch(pragmas).map_err(sqlite_err)?;
 
-    conn.execute_batch(
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_err)?;
+
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS gitx_schema_migrations (
              version INTEGER PRIMARY KEY,
              name TEXT NOT NULL,
@@ -606,7 +632,7 @@ fn configure_and_migrate_sqlite(conn: &Connection, enable_wal: bool) -> Result<(
     .map_err(sqlite_err)?;
 
     for migration in SQLITE_MIGRATIONS {
-        let already_applied: Option<i64> = conn
+        let already_applied: Option<i64> = tx
             .query_row(
                 "SELECT version FROM gitx_schema_migrations WHERE version = ?1",
                 params![migration.version as i64],
@@ -616,9 +642,9 @@ fn configure_and_migrate_sqlite(conn: &Connection, enable_wal: bool) -> Result<(
             .map_err(sqlite_err)?;
 
         if already_applied.is_none() {
-            conn.execute_batch(migration.sql).map_err(sqlite_err)?;
+            tx.execute_batch(migration.sql).map_err(sqlite_err)?;
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-            conn.execute(
+            tx.execute(
                 "INSERT INTO gitx_schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
                 params![migration.version as i64, migration.name, now],
             )
@@ -626,7 +652,21 @@ fn configure_and_migrate_sqlite(conn: &Connection, enable_wal: bool) -> Result<(
         }
     }
 
+    tx.commit().map_err(sqlite_err)?;
     Ok(())
+}
+
+fn redact_url_credentials(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let (authority, tail) = match rest.find(['/', '?', '#']) {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, ""),
+        };
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            return format!("{scheme}://<redacted>@{host}{tail}");
+        }
+    }
+    url.to_string()
 }
 
 fn sqlite_err(err: rusqlite::Error) -> GitxError {
@@ -737,6 +777,13 @@ impl MetadataBackend for SqlMetadataBackend {
             items.push((seq, cs));
         }
         Ok(sort_revisions_oldest_first(items))
+    }
+
+    fn delete_changeset(&self, id: ObjectHash) -> Result<()> {
+        let conn = self.lock_sqlite()?;
+        conn.execute("DELETE FROM changesets WHERE id = ?1", params![id.to_hex()])
+            .map_err(sqlite_err)?;
+        Ok(())
     }
 
     fn put_stack(&self, stack: &Stack) -> Result<()> {
@@ -949,6 +996,26 @@ impl MetadataBackend for SqlMetadataBackend {
         Ok(out)
     }
 
+    fn list_all_lands(&self, after_land_seq: u64, limit: usize) -> Result<Vec<LandRecord>> {
+        let conn = self.lock_sqlite()?;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = conn
+            .prepare(
+                "SELECT land_seq, target, previous_head, new_head, landed_changes, timestamp, reverted_by
+                 FROM lands WHERE land_seq > ?1 ORDER BY land_seq ASC LIMIT ?2",
+            )
+            .map_err(sqlite_err)?;
+
+        let mut rows = stmt
+            .query(params![after_land_seq as i64, limit_i64])
+            .map_err(sqlite_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_err)? {
+            out.push(row_to_land_record(row)?);
+        }
+        Ok(out)
+    }
+
     fn mark_reverted(&self, land_seq: u64, reverted_by: u64) -> Result<()> {
         let mut conn = self.lock_sqlite()?;
         let tx = conn
@@ -985,6 +1052,97 @@ impl MetadataBackend for SqlMetadataBackend {
         Ok(())
     }
 
+    fn revert_land(&self, land_seq: u64) -> Result<LandRecord> {
+        let mut conn = self.lock_sqlite()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_err)?;
+
+        let original = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT land_seq, target, previous_head, new_head, landed_changes, timestamp, reverted_by
+                     FROM lands WHERE land_seq = ?1",
+                )
+                .map_err(sqlite_err)?;
+            let mut rows = stmt.query(params![land_seq as i64]).map_err(sqlite_err)?;
+            match rows.next().map_err(sqlite_err)? {
+                Some(row) => row_to_land_record(row)?,
+                None => return Err(GitxError::NotFound(format!("land record {land_seq}"))),
+            }
+        };
+
+        if let Some(existing_rev) = original.reverted_by {
+            return Err(GitxError::Merge(format!(
+                "land record {land_seq} already reverted by {existing_rev}"
+            )));
+        }
+        let previous_head = original.previous_head.ok_or_else(|| {
+            GitxError::Merge(format!(
+                "land record {land_seq} has no previous_head to revert to"
+            ))
+        })?;
+
+        let current_head_str: Option<String> = tx
+            .query_row(
+                "SELECT hash FROM bookmarks WHERE name = ?1",
+                params![&original.target],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        let current_head = current_head_str
+            .as_deref()
+            .map(ObjectHash::from_str)
+            .transpose()?;
+
+        if current_head != Some(original.new_head) {
+            return Err(GitxError::Merge(format!(
+                "cannot revert land_seq {land_seq}: target '{}' head is {current_head:?}, expected {}",
+                original.target, original.new_head
+            )));
+        }
+
+        let timestamp = Utc::now();
+        let ts_str = timestamp.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let changes: Vec<ChangeId> = Vec::new();
+        let changes_blob = bincode::serialize(&changes).map_err(ser_err)?;
+        let prev_hex = Some(original.new_head.to_hex());
+        let new_hex = previous_head.to_hex();
+
+        tx.execute(
+            "INSERT INTO lands (target, previous_head, new_head, landed_changes, timestamp, reverted_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            params![&original.target, prev_hex, &new_hex, changes_blob, ts_str],
+        )
+        .map_err(sqlite_err)?;
+        let revert_seq = tx.last_insert_rowid() as u64;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO bookmarks (name, hash) VALUES (?1, ?2)",
+            params![&original.target, &new_hex],
+        )
+        .map_err(sqlite_err)?;
+
+        tx.execute(
+            "UPDATE lands SET reverted_by = ?1 WHERE land_seq = ?2",
+            params![revert_seq as i64, land_seq as i64],
+        )
+        .map_err(sqlite_err)?;
+
+        tx.commit().map_err(sqlite_err)?;
+
+        Ok(LandRecord {
+            land_seq: revert_seq,
+            target: original.target,
+            previous_head: Some(original.new_head),
+            new_head: previous_head,
+            landed_changes: changes,
+            timestamp,
+            reverted_by: None,
+        })
+    }
+
     fn get_bookmark(&self, name: &str) -> Result<Option<ObjectHash>> {
         let conn = self.lock_sqlite()?;
         let hash_str: Option<String> = conn
@@ -1006,6 +1164,80 @@ impl MetadataBackend for SqlMetadataBackend {
             params![name, hash.to_hex()],
         )
         .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    fn cas_bookmark(
+        &self,
+        name: &str,
+        expected: Option<ObjectHash>,
+        new_hash: ObjectHash,
+    ) -> Result<()> {
+        let mut conn = self.lock_sqlite()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_err)?;
+        let current_str: Option<String> = tx
+            .query_row(
+                "SELECT hash FROM bookmarks WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        let current = current_str
+            .as_deref()
+            .map(ObjectHash::from_str)
+            .transpose()?;
+        if current != expected {
+            return Err(GitxError::Merge(format!(
+                "CAS conflict updating bookmark '{name}': expected {expected:?}, actual {current:?}"
+            )));
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO bookmarks (name, hash) VALUES (?1, ?2)",
+            params![name, new_hash.to_hex()],
+        )
+        .map_err(sqlite_err)?;
+        tx.commit().map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    fn cas_bookmarks(&self, updates: &[(String, Option<ObjectHash>, ObjectHash)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock_sqlite()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_err)?;
+        for (name, expected, _) in updates {
+            let current_str: Option<String> = tx
+                .query_row(
+                    "SELECT hash FROM bookmarks WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_err)?;
+            let current = current_str
+                .as_deref()
+                .map(ObjectHash::from_str)
+                .transpose()?;
+            if current != *expected {
+                return Err(GitxError::Merge(format!(
+                    "CAS conflict updating bookmark '{name}': expected {expected:?}, actual {current:?}"
+                )));
+            }
+        }
+        for (name, _, new_hash) in updates {
+            tx.execute(
+                "INSERT OR REPLACE INTO bookmarks (name, hash) VALUES (?1, ?2)",
+                params![name, new_hash.to_hex()],
+            )
+            .map_err(sqlite_err)?;
+        }
+        tx.commit().map_err(sqlite_err)?;
         Ok(())
     }
 

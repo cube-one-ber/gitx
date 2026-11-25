@@ -631,3 +631,85 @@ fn ambiguous_duplicate_impl_blocks_fall_back_safely() {
     );
     assert!(outcome.is_conflict());
 }
+
+#[test]
+fn python_symbol_extraction_and_parallel_ast_merge() {
+    let base = "\
+import os
+
+class Service:
+    def start(self):
+        return True
+
+def base_fn():
+    return 1
+";
+    let ours = "\
+import os
+import json
+
+class Service:
+    def start(self):
+        return True
+
+def base_fn():
+    return 1
+
+def agent_one():
+    return 'one'
+";
+    let theirs = "\
+import os
+import sys
+
+class Service:
+    def start(self):
+        return True
+
+def base_fn():
+    return 1
+
+@staticmethod
+def agent_two():
+    return 'two'
+";
+
+    let outcome = merge_bytes(
+        "app/worker.py",
+        base.as_bytes(),
+        ours.as_bytes(),
+        theirs.as_bytes(),
+    );
+    match outcome {
+        MergeOutcome::Clean(bytes) => {
+            let merged = String::from_utf8(bytes).unwrap();
+            assert!(merged.contains("import json"));
+            assert!(merged.contains("import sys"));
+            assert!(merged.contains("def agent_one():"));
+            assert!(merged.contains("def agent_two():"));
+
+            let syms = extract_ast_symbols("app/worker.py", &merged);
+            assert!(syms.iter().any(|s| s.name == "Service" && s.kind == "class"));
+            assert!(syms.iter().any(|s| s.name == "start" && s.kind == "method"));
+            assert!(syms.iter().any(|s| s.name == "agent_one" && s.kind == "fn"));
+            assert!(syms.iter().any(|s| s.name == "agent_two" && s.kind == "fn"));
+        }
+        MergeOutcome::Conflict { materialized, .. } => {
+            panic!(
+                "expected clean Python AST merge, got conflict:\n{}",
+                String::from_utf8_lossy(&materialized)
+            );
+        }
+    }
+
+    // Editing the same Python function body differently must still conflict.
+    let ours_c = "def base_fn():\n    return 10\n";
+    let theirs_c = "def base_fn():\n    return 20\n";
+    let conflict = merge_bytes(
+        "app/worker.py",
+        "def base_fn():\n    return 1\n".as_bytes(),
+        ours_c.as_bytes(),
+        theirs_c.as_bytes(),
+    );
+    assert!(conflict.is_conflict());
+}

@@ -12,8 +12,18 @@ use std::fmt;
 /// - `secret:prod`
 /// - `private:user:theo`
 /// - `embargo:cve-2026-0001`
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct DomainId(String);
+
+impl<'de> Deserialize<'de> for DomainId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        DomainId::new(raw).map_err(serde::de::Error::custom)
+    }
+}
 
 impl DomainId {
     pub fn public() -> Self {
@@ -124,5 +134,11 @@ impl VisibilityPolicy {
                 allowed_domains,
             }),
         })
+    }
+
+    /// Returns `true` if a ChangeSet with this policy belongs to the public projection
+    /// (public primary domain and NOT under an active embargo; published embargoes are public).
+    pub fn is_publicly_visible(&self) -> bool {
+        self.primary_domain.is_public() && !matches!(self.embargo, Some(EmbargoState::Active { .. }))
     }
 }

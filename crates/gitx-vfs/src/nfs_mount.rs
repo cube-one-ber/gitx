@@ -5,12 +5,19 @@ use gitx_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 /// Maximum framed RPC payload size (64 MiB).
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum concurrent loopback RPC client connections to prevent thread exhaustion.
+const MAX_CONCURRENT_CLIENTS: usize = 64;
+
+/// Per-socket read/write timeout on loopback RPC connections.
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serializable NFSv3-style file attributes over the loopback RPC channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +131,9 @@ pub struct LoopbackVfsServer {
 
 impl LoopbackVfsServer {
     /// Bind `bind_addr` (e.g. `"127.0.0.1:0"`) and spawn the background RPC accept loop.
+    ///
+    /// Strictly requires a loopback IP address (`127.0.0.1` / `::1`) because the loopback
+    /// VFS RPC protocol is unauthenticated and intended only for local mount clients.
     pub fn start(
         bind_addr: &str,
         workspace: LazyWorkspace,
@@ -131,11 +141,17 @@ impl LoopbackVfsServer {
     ) -> Result<Self> {
         let listener = TcpListener::bind(bind_addr)?;
         let addr = listener.local_addr()?;
+        if !addr.ip().is_loopback() {
+            return Err(GitxError::Workspace(format!(
+                "refusing to bind unauthenticated LoopbackVfsServer to non-loopback address {addr}"
+            )));
+        }
         let core = Arc::new(Mutex::new(FuseCore::new(workspace, store)));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let core_clone = Arc::clone(&core);
         let shutdown_clone = Arc::clone(&shutdown);
+        let active_clients = Arc::new(AtomicUsize::new(0));
         let accept_thread = thread::spawn(move || {
             for incoming in listener.incoming() {
                 if shutdown_clone.load(Ordering::SeqCst) {
@@ -143,10 +159,26 @@ impl LoopbackVfsServer {
                 }
                 match incoming {
                     Ok(stream) => {
+                        let prev = active_clients.fetch_add(1, Ordering::AcqRel);
+                        if prev >= MAX_CONCURRENT_CLIENTS {
+                            active_clients.fetch_sub(1, Ordering::AcqRel);
+                            drop(stream);
+                            continue;
+                        }
                         let _ = stream.set_nodelay(true);
+                        let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
+                        let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
                         let conn_core = Arc::clone(&core_clone);
                         let conn_shutdown = Arc::clone(&shutdown_clone);
+                        let conn_counter = Arc::clone(&active_clients);
                         thread::spawn(move || {
+                            struct ActiveGuard(Arc<AtomicUsize>);
+                            impl Drop for ActiveGuard {
+                                fn drop(&mut self) {
+                                    self.0.fetch_sub(1, Ordering::AcqRel);
+                                }
+                            }
+                            let _guard = ActiveGuard(conn_counter);
                             handle_client_connection(stream, conn_core, conn_shutdown);
                         });
                     }

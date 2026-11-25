@@ -143,6 +143,16 @@ impl ObjectStore for MemoryStore {
         Ok(sort_revisions_oldest_first(items))
     }
 
+    fn delete_changeset(&self, id: ObjectHash) -> Result<()> {
+        let mut state = self.write_state()?;
+        if let Some((_, cs)) = state.changesets.remove(&id)
+            && let Some(ids) = state.changesets_by_change_id.get_mut(&cs.change_id)
+        {
+            ids.retain(|h| *h != id);
+        }
+        Ok(())
+    }
+
     fn put_stack(&self, stack: &Stack) -> Result<()> {
         let mut state = self.write_state()?;
         state.stacks.insert(stack.name.clone(), stack.clone());
@@ -256,6 +266,19 @@ impl ObjectStore for MemoryStore {
             .collect())
     }
 
+    fn list_all_lands(&self, after_land_seq: u64, limit: usize) -> Result<Vec<LandRecord>> {
+        let state = self.read_state()?;
+        Ok(state
+            .lands
+            .range((
+                std::ops::Bound::Excluded(after_land_seq),
+                std::ops::Bound::Unbounded,
+            ))
+            .take(limit)
+            .map(|(_, r)| r.clone())
+            .collect())
+    }
+
     fn mark_reverted(&self, land_seq: u64, reverted_by: u64) -> Result<()> {
         let mut state = self.write_state()?;
         let rec = state
@@ -273,6 +296,51 @@ impl ObjectStore for MemoryStore {
         Ok(())
     }
 
+    fn revert_land(&self, land_seq: u64) -> Result<LandRecord> {
+        let mut state = self.write_state()?;
+        let original = state
+            .lands
+            .get(&land_seq)
+            .cloned()
+            .ok_or_else(|| GitxError::NotFound(format!("land record {land_seq}")))?;
+        if let Some(existing) = original.reverted_by {
+            return Err(GitxError::Merge(format!(
+                "land record {land_seq} already reverted by {existing}"
+            )));
+        }
+        let previous_head = original.previous_head.ok_or_else(|| {
+            GitxError::Merge(format!(
+                "land record {land_seq} has no previous_head to revert to"
+            ))
+        })?;
+        let current_head = state.bookmarks.get(&original.target).copied();
+        if current_head != Some(original.new_head) {
+            return Err(GitxError::Merge(format!(
+                "cannot revert land_seq {land_seq}: target '{}' head is {current_head:?}, expected {}",
+                original.target, original.new_head
+            )));
+        }
+
+        let revert_seq = state.next_land_seq;
+        state.next_land_seq += 1;
+
+        let revert_rec = LandRecord {
+            land_seq: revert_seq,
+            target: original.target.clone(),
+            previous_head: Some(original.new_head),
+            new_head: previous_head,
+            landed_changes: Vec::new(),
+            timestamp: Utc::now(),
+            reverted_by: None,
+        };
+        state.lands.insert(revert_seq, revert_rec.clone());
+        state.bookmarks.insert(original.target, previous_head);
+        if let Some(orig_mut) = state.lands.get_mut(&land_seq) {
+            orig_mut.reverted_by = Some(revert_seq);
+        }
+        Ok(revert_rec)
+    }
+
     fn get_bookmark(&self, name: &str) -> Result<Option<ObjectHash>> {
         let state = self.read_state()?;
         Ok(state.bookmarks.get(name).copied())
@@ -281,6 +349,42 @@ impl ObjectStore for MemoryStore {
     fn set_bookmark(&self, name: &str, hash: ObjectHash) -> Result<()> {
         let mut state = self.write_state()?;
         state.bookmarks.insert(name.to_string(), hash);
+        Ok(())
+    }
+
+    fn cas_bookmark(
+        &self,
+        name: &str,
+        expected: Option<ObjectHash>,
+        new_hash: ObjectHash,
+    ) -> Result<()> {
+        let mut state = self.write_state()?;
+        let current = state.bookmarks.get(name).copied();
+        if current != expected {
+            return Err(GitxError::Merge(format!(
+                "CAS conflict updating bookmark '{name}': expected {expected:?}, actual {current:?}"
+            )));
+        }
+        state.bookmarks.insert(name.to_string(), new_hash);
+        Ok(())
+    }
+
+    fn cas_bookmarks(&self, updates: &[(String, Option<ObjectHash>, ObjectHash)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.write_state()?;
+        for (name, expected, _) in updates {
+            let current = state.bookmarks.get(name).copied();
+            if current != *expected {
+                return Err(GitxError::Merge(format!(
+                    "CAS conflict updating bookmark '{name}': expected {expected:?}, actual {current:?}"
+                )));
+            }
+        }
+        for (name, _, new_hash) in updates {
+            state.bookmarks.insert(name.clone(), *new_hash);
+        }
         Ok(())
     }
 

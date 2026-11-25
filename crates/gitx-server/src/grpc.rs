@@ -5,7 +5,9 @@ use crate::api::{
     self, ActorAgentInput, BlameQuery, CommitRequest, DiffQuery, GrepQuery, LandRequest, TreeQuery,
     read_blob_authorized,
 };
-use crate::auth::{AuthenticatedPrincipal, extract_principal_from_grpc_metadata};
+use crate::auth::{
+    AuthenticatedPrincipal, can_administer_acl, extract_principal_from_grpc_metadata,
+};
 use crate::error::ApiError;
 use crate::queue::{self, DrainRequest, EnqueueRequest, QueueEntry, QueueStatus};
 use crate::state::{AppState, RepoInfo};
@@ -132,13 +134,32 @@ impl GitxService for GitxGrpcService {
         &self,
         request: Request<CreateRepoRequest>,
     ) -> std::result::Result<Response<CreateRepoResponse>, Status> {
-        let _principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        let principal = extract_principal_from_grpc_metadata(&self.state, request.metadata())?;
+        if principal.is_anonymous {
+            return Err(Status::permission_denied(
+                "anonymous callers are not permitted to create or configure repositories",
+            ));
+        }
         let req = request.into_inner();
-        let repo = self
+        let (repo, existed) = self
             .state
-            .get_or_create_repo(&req.owner, &req.name)
+            .get_or_create_repo_with_status(&req.owner, &req.name)
             .map_err(|e| api_err_to_status(ApiError::from(e)))?;
         if let Some(acl_text) = req.acl {
+            if existed || repo.has_default_acl() {
+                let existing_policy = repo
+                    .acl_snapshot()
+                    .map_err(|e| api_err_to_status(ApiError::from(e)))?;
+                let unchanged = repo
+                    .current_acl_text()
+                    .is_some_and(|cur| cur.trim() == acl_text.trim());
+                if !unchanged && !can_administer_acl(&existing_policy, &principal) {
+                    return Err(Status::permission_denied(format!(
+                        "principal '{}' is not authorized to modify .gitxacl on '{}/{}'",
+                        principal.id, req.owner, req.name
+                    )));
+                }
+            }
             repo.update_acl_from_text(&acl_text)
                 .map_err(|e| api_err_to_status(ApiError::from(e)))?;
         }
@@ -387,6 +408,7 @@ impl GitxService for GitxGrpcService {
             embargo_advisory: req.embargo_advisory,
             embargo_allowed_teams: req.embargo_allowed_teams,
             context_prompt: req.context_prompt,
+            secret_envelopes: BTreeMap::new(),
         };
 
         let Json(resp) = api::commit(

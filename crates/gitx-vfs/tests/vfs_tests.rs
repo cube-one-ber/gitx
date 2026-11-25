@@ -523,4 +523,109 @@ fn security_and_edge_cases_paths_conflicts_and_manager_lifecycle() {
     mgr.remove_workspace("dev").unwrap();
     assert!(mgr.get_workspace("dev").unwrap().is_none());
     assert!(mgr.remove_workspace("dev").is_err());
+
+    // Path traversal workspace names are rejected
+    assert!(mgr.create_mem_workspace("../escape", base_cs).is_err());
+    assert!(mgr.create_mem_workspace(".", base_cs).is_err());
+    assert!(mgr.create_mem_workspace("/abs", base_cs).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn cow_and_overlay_reject_symlink_ancestor_escape_and_handle_dir_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().join("outside");
+    let root = tmp.path().join("workspace");
+    let pool = tmp.path().join("pool");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(&root).unwrap();
+
+    // Symlink inside workspace pointing outside
+    fs::write(outside.join("outside_secret.txt"), b"top-secret").unwrap();
+    symlink(&outside, root.join("linkdir")).unwrap();
+
+    let mut ws = CowWorkspace::open(&root, &pool).unwrap();
+    assert!(
+        ws.read_file("linkdir/outside_secret.txt").is_err(),
+        "CowWorkspace::read_file must reject symlink ancestor escape"
+    );
+    assert!(
+        ws.write_file("linkdir/pwn.txt", b"escaped", FileMode::Regular)
+            .is_err(),
+        "CowWorkspace::write_file must reject symlink ancestor escape"
+    );
+    assert!(!outside.join("pwn.txt").exists());
+
+    // apply_overlay must also reject symlink ancestor escape
+    let src = tmp.path().join("src");
+    fs::create_dir_all(src.join("linkdir")).unwrap();
+    fs::write(src.join("linkdir/env"), b"K=V\n").unwrap();
+    let bundle = export_overlay(&src, &["linkdir/env"]).unwrap();
+    assert!(
+        apply_overlay(&root, &bundle).is_err(),
+        "apply_overlay must reject symlink ancestor escape"
+    );
+    assert!(!outside.join("env").exists());
+
+    // Replacing a non-empty directory containing untracked files must fail without wiping them
+    fs::create_dir_all(root.join("nonempty_dir/nested")).unwrap();
+    fs::write(root.join("nonempty_dir/nested/untracked.txt"), b"keep me").unwrap();
+    assert!(
+        ws.write_file("nonempty_dir", b"overwrite", FileMode::Regular)
+            .is_err(),
+        "write_file must not recursively delete non-empty directories containing untracked files"
+    );
+    assert_eq!(
+        fs::read(root.join("nonempty_dir/nested/untracked.txt")).unwrap(),
+        b"keep me"
+    );
+
+    // Replacing an empty directory with a regular file succeeds cleanly
+    fs::create_dir_all(root.join("empty_dir")).unwrap();
+    ws.write_file("empty_dir", b"now a file", FileMode::Regular)
+        .expect("replacing empty directory with file should not fail with EISDIR");
+    assert_eq!(ws.read_file("empty_dir").unwrap(), b"now a file");
+
+    // Materializing a tree that replaces a tracked directory (`sub/victim.txt`) with a symlink
+    // (`sub -> outside`) must NOT delete `outside/victim.txt` outside the workspace root!
+    let store = MemoryStore::new();
+    let victim_outside = outside.join("victim.txt");
+    fs::write(&victim_outside, b"do not delete me").unwrap();
+
+    let mat_root = tmp.path().join("mat_workspace");
+    let mat_pool = tmp.path().join("mat_pool");
+    let mut mat_ws = CowWorkspace::open(&mat_root, &mat_pool).unwrap();
+
+    let mut t1 = DomainTree::new(DomainId::public());
+    let b1 = store.put_blob_bytes(b"inside").unwrap();
+    t1.insert(
+        "sub/victim.txt",
+        EntryKind::File {
+            blob_hash: b1.manifest_hash(),
+            mode: FileMode::Regular,
+            size: b1.total_size,
+        },
+    );
+    mat_ws.materialize_tree(&t1, &store).unwrap();
+    assert!(mat_root.join("sub/victim.txt").is_file());
+
+    let mut t2 = DomainTree::new(DomainId::public());
+    let sym_bytes = outside.to_string_lossy().into_owned().into_bytes();
+    let b2 = store.put_blob_bytes(&sym_bytes).unwrap();
+    t2.insert(
+        "sub",
+        EntryKind::File {
+            blob_hash: b2.manifest_hash(),
+            mode: FileMode::Symlink,
+            size: b2.total_size,
+        },
+    );
+    mat_ws.materialize_tree(&t2, &store).unwrap();
+    assert!(
+        victim_outside.is_file(),
+        "materialize_tree must never delete files outside workspace via symlink replacement"
+    );
+    assert_eq!(fs::read(&victim_outside).unwrap(), b"do not delete me");
 }

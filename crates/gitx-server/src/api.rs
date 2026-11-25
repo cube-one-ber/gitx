@@ -1,9 +1,10 @@
 use crate::auth::{
-    AuthenticatedPrincipal, can_publish_embargo, can_write_domain_effective,
+    AuthenticatedPrincipal, can_administer_acl, can_publish_embargo, can_write_domain_effective,
     effective_allowed_domains,
 };
 use crate::derived::DerivedStats;
 use crate::error::{ApiError, ApiResult};
+use crate::outbox::{OutboxEvent, spawn_webhook_dispatch};
 use crate::state::{AppState, RepoHandle, RepoInfo};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -16,10 +17,11 @@ use gitx_core::{
     Actor, ChangeSet, ChangeSetBuilder, DomainId, DomainTree, EmbargoState, EntryKind, FileMode,
     Identity, ObjectHash, VisibilityPolicy,
 };
-use gitx_crypto::{AclPolicy, Principal, scan_content};
+use gitx_crypto::{AclPolicy, Principal, SecretEnvelope, scan_content};
 use gitx_merge::{merge_domain_trees, unified_diff};
 use gitx_store::ObjectStore;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use similar::{DiffOp, TextDiff};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::str::FromStr;
@@ -53,9 +55,16 @@ pub struct CreateRepoResponse {
 
 pub async fn create_repo(
     State(state): State<Arc<AppState>>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     Path((owner, name)): Path<(String, String)>,
     body: Bytes,
 ) -> ApiResult<Json<CreateRepoResponse>> {
+    if principal.is_anonymous {
+        return Err(ApiError::forbidden(
+            "anonymous callers are not permitted to create or configure repositories",
+        ));
+    }
+
     let req: CreateRepoRequest = if body.is_empty() {
         CreateRepoRequest::default()
     } else {
@@ -63,8 +72,20 @@ pub async fn create_repo(
             .map_err(|e| ApiError::bad_request(format!("invalid create repo JSON: {e}")))?
     };
 
-    let repo = state.get_or_create_repo(&owner, &name)?;
+    let (repo, existed) = state.get_or_create_repo_with_status(&owner, &name)?;
     if let Some(acl_text) = req.acl {
+        if existed || repo.has_default_acl() {
+            let existing_policy = repo.acl_snapshot()?;
+            let unchanged = repo
+                .current_acl_text()
+                .is_some_and(|cur| cur.trim() == acl_text.trim());
+            if !unchanged && !can_administer_acl(&existing_policy, &principal) {
+                return Err(ApiError::forbidden(format!(
+                    "principal '{}' is not authorized to modify .gitxacl on '{owner}/{name}'",
+                    principal.id
+                )));
+            }
+        }
         repo.update_acl_from_text(&acl_text)?;
     }
 
@@ -78,6 +99,7 @@ pub struct ListReposResponse {
 
 pub async fn list_all_repos(
     State(state): State<Arc<AppState>>,
+    AuthenticatedPrincipal(_principal): AuthenticatedPrincipal,
 ) -> ApiResult<Json<ListReposResponse>> {
     let repos = state.list_repos(None)?;
     Ok(Json(ListReposResponse { repos }))
@@ -85,6 +107,7 @@ pub async fn list_all_repos(
 
 pub async fn list_owner_repos(
     State(state): State<Arc<AppState>>,
+    AuthenticatedPrincipal(_principal): AuthenticatedPrincipal,
     Path(owner): Path<String>,
 ) -> ApiResult<Json<ListReposResponse>> {
     let repos = state.list_repos(Some(&owner))?;
@@ -93,6 +116,7 @@ pub async fn list_owner_repos(
 
 pub async fn list_repo_scoped_repos(
     State(state): State<Arc<AppState>>,
+    AuthenticatedPrincipal(_principal): AuthenticatedPrincipal,
     Path((owner, _name)): Path<(String, String)>,
 ) -> ApiResult<Json<ListReposResponse>> {
     let repos = state.list_repos(Some(&owner))?;
@@ -141,6 +165,10 @@ pub struct CommitRequest {
     pub embargo_allowed_teams: Vec<String>,
     #[serde(default)]
     pub context_prompt: Option<String>,
+    /// Optional end-to-end encrypted secret envelopes (`domain -> path -> SecretEnvelope JSON`).
+    /// The server validates envelope structure and domain ACLs without ever seeing plaintext.
+    #[serde(default)]
+    pub secret_envelopes: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 fn default_author_name() -> String {
@@ -166,12 +194,18 @@ pub async fn commit(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<CommitRequest>,
 ) -> ApiResult<Json<CommitResponse>> {
-    // Push-to-create: automatically provisions repo if it does not yet exist.
-    let repo = state.get_or_create_repo(&owner, &name)?;
+    // Push-to-create: reject anonymous repository creation or commits before touching disk.
+    if principal.is_anonymous {
+        return Err(ApiError::forbidden(
+            "anonymous callers are not permitted to commit changes",
+        ));
+    }
 
-    if req.files.is_empty() && req.delete_files.is_empty() {
+    let (repo, existed) = state.get_or_create_repo_with_status(&owner, &name)?;
+
+    if req.files.is_empty() && req.delete_files.is_empty() && req.secret_envelopes.is_empty() {
         return Err(ApiError::bad_request(
-            "commit must include at least one file or deletion",
+            "commit must include at least one file, secret envelope, or deletion",
         ));
     }
 
@@ -188,12 +222,27 @@ pub async fn commit(
         decoded_files.insert(norm_path, bytes);
     }
 
-    // Determine effective ACL policy (if `.gitxacl` is being committed, parse and validate it first).
-    let mut policy = repo.acl_snapshot()?;
+    // Always authorize against the EXISTING repository ACL policy — never let a submitted
+    // `.gitxacl` authorize its own commit.
+    let policy = repo.acl_snapshot()?;
+    let current_acl_text = repo.current_acl_text();
     let new_acl_text = if let Some(acl_bytes) = decoded_files.get(".gitxacl") {
         let text = std::str::from_utf8(acl_bytes)
             .map_err(|e| ApiError::bad_request(format!(".gitxacl must be valid UTF-8: {e}")))?;
-        policy = AclPolicy::parse(text)?;
+        // Validate syntax upfront without replacing `policy` for this request's auth checks.
+        let _ = AclPolicy::parse(text)?;
+
+        let unchanged = current_acl_text
+            .as_deref()
+            .is_some_and(|cur| cur.trim() == text.trim());
+        let is_initial_unconfigured_repo =
+            !existed && !repo.has_default_acl() && repo.store.get_bookmark("master")?.is_none();
+        if !unchanged && !is_initial_unconfigured_repo && !can_administer_acl(&policy, &principal) {
+            return Err(ApiError::forbidden(format!(
+                "principal '{}' is not authorized to modify .gitxacl",
+                principal.id
+            )));
+        }
         Some(text.to_string())
     } else {
         None
@@ -218,17 +267,131 @@ pub async fn commit(
         .map(DomainId::embargo)
         .transpose()?;
 
+    // Prevent advisory-ID hijacking / decoy attachment: if this embargo advisory already has a
+    // live (unreverted, landed) publication, reject further embargo commits (409), and require
+    // admin or existing-advisory publish permission before attaching commits to an active advisory (403).
+    if let Some(ref advisory) = req.embargo_advisory {
+        if repo.is_advisory_published(advisory)? {
+            return Err(ApiError::conflict(format!(
+                "embargo advisory '{advisory}' has already been published"
+            )));
+        }
+        let is_admin_caller = principal.roles.iter().any(|r| r == "admin");
+        let existing_cs = repo.store.list_changesets()?;
+        for cs in &existing_cs {
+            if let Some(EmbargoState::Active { advisory_id, .. }) = &cs.visibility.embargo
+                && advisory_id == advisory
+                && !is_admin_caller
+                && !can_publish_embargo(&policy, &principal, cs)
+            {
+                return Err(ApiError::forbidden(format!(
+                    "principal '{}' is not authorized to attach commits to existing embargo advisory '{advisory}'",
+                    principal.id
+                )));
+            }
+        }
+    }
+
+    // Resolve target bookmark and parent changeset under a per-target RwLock guard BEFORE
+    // checking overwrites so commits cannot race with an in-flight `publish_embargo` / `post_land_cmd`.
+    let target_name = req.target.clone().unwrap_or_else(|| "master".to_string());
+    let should_update_target = req.update_target.unwrap_or(true);
+    let _target_write_guard = if should_update_target {
+        Some(repo.try_write_target(&target_name)?)
+    } else {
+        None
+    };
+    let _target_read_guard = if !should_update_target {
+        Some(repo.try_read_target(&target_name)?)
+    } else {
+        None
+    };
+    let current_target_head = repo.store.get_bookmark(&target_name)?;
+    let _master_fallback_read_guard =
+        if req.parent.is_none() && current_target_head.is_none() && target_name != "master" {
+            Some(repo.try_read_target("master")?)
+        } else {
+            None
+        };
+    if let Some(h) = current_target_head
+        && repo.is_head_pending_verification(h)
+    {
+        return Err(ApiError::conflict(format!(
+            "target '{target_name}' is currently undergoing post-land verification; retry shortly"
+        )));
+    }
+    let parent_hash = if let Some(ref parent_str) = req.parent {
+        Some(resolve_hash_or_bookmark_visible(
+            &repo,
+            &policy,
+            &principal,
+            parent_str,
+        )?)
+    } else if let Some(h) = current_target_head {
+        Some(h)
+    } else if target_name != "master" {
+        repo.store.get_bookmark("master")?
+    } else {
+        None
+    };
+
+    if let Some(h) = parent_hash
+        && repo.is_head_pending_verification(h)
+    {
+        return Err(ApiError::conflict(
+            "parent revision is currently undergoing post-land verification; retry shortly",
+        ));
+    }
+
+    let parent_cs = parent_hash
+        .map(|h| repo.store.get_changeset(h))
+        .transpose()?;
+
+    if let Some(ref p_cs) = parent_cs
+        && repo.is_unlive_published_changeset(p_cs)?
+    {
+        return Err(ApiError::conflict(
+            "cannot base a commit on an unverified, unlanded, or reverted embargo publication",
+        ));
+    }
+
+    if req.parent.is_some()
+        && let Some(ref p_cs) = parent_cs
+        && !repo.can_read_changeset_live(&policy, &principal, p_cs)
+    {
+        return Err(ApiError::forbidden(format!(
+            "principal '{}' cannot base a commit on unreadable parent {}",
+            principal.id, p_cs.id
+        )));
+    }
+
+    // Start from parent's domain trees (preserving unaffected domains).
+    let mut domain_trees: BTreeMap<DomainId, DomainTree> = BTreeMap::new();
+    if let Some(ref p_cs) = parent_cs {
+        for (dom, &tree_hash) in &p_cs.domain_trees {
+            let tree = repo.store.get_tree(tree_hash)?;
+            domain_trees.insert(dom.clone(), tree);
+        }
+    }
+
+    let is_admin = principal.roles.iter().any(|r| r == "admin");
+
     // Classify every submitted file and enforce zero-trust secret scanning + write ACLs.
     let mut files_by_domain: BTreeMap<DomainId, Vec<(String, Vec<u8>)>> = BTreeMap::new();
     let mut touched_domains: BTreeSet<DomainId> = BTreeSet::new();
 
     for (path, bytes) in &decoded_files {
+        let acl_routed = policy.domain_for_path(path);
         let target_domain = if let Some(ref emb_dom) = embargo_domain {
             emb_dom.clone()
         } else if let Some(ref vis_dom) = explicit_visibility_domain {
-            let acl_routed = policy.domain_for_path(path);
             if vis_dom.is_public() {
-                // Caller explicitly requested public: honor ACL secret rules or catch via scanner below.
+                // Never allow caller to downgrade a non-public ACL-protected path into `public`.
+                if !acl_routed.is_public() {
+                    return Err(ApiError::forbidden(format!(
+                        "path '{path}' is routed to protected domain '{acl_routed}' and cannot be forced into 'public'"
+                    )));
+                }
                 DomainId::public()
             } else if acl_routed.is_secret() && !vis_dom.is_secret() {
                 acl_routed
@@ -236,7 +399,7 @@ pub async fn commit(
                 vis_dom.clone()
             }
         } else {
-            policy.domain_for_path(path)
+            acl_routed
         };
 
         // Secret scanner guard: reject unlabelled secrets landing in `public`.
@@ -264,6 +427,24 @@ pub async fn commit(
             )));
         }
 
+        // Unconfigured `secret:*` domains act as write-only dropboxes for new secrets;
+        // overwriting or shadowing an existing secret in ANY secret tree requires explicit
+        // write permission on that secret domain or the admin role.
+        if embargo_domain.is_none() {
+            for tree in domain_trees.values() {
+                if tree.domain.is_secret()
+                    && tree.entries.contains_key(path)
+                    && !is_admin
+                    && !policy.can_write_domain(&principal, &tree.domain)
+                {
+                    return Err(ApiError::forbidden(format!(
+                        "principal '{}' is not authorized to overwrite or shadow existing secret '{}' in '{}'",
+                        principal.id, path, tree.domain
+                    )));
+                }
+            }
+        }
+
         touched_domains.insert(target_domain.clone());
         files_by_domain
             .entry(target_domain)
@@ -275,43 +456,57 @@ pub async fn commit(
     let mut delete_paths: Vec<String> = Vec::with_capacity(req.delete_files.len());
     for raw_path in &req.delete_files {
         let norm = normalize_repo_path(raw_path)?;
-        let dom = embargo_domain
-            .clone()
-            .or_else(|| explicit_visibility_domain.clone())
-            .unwrap_or_else(|| policy.domain_for_path(&norm));
+        if norm == ".gitxacl" && !can_administer_acl(&policy, &principal) {
+            return Err(ApiError::forbidden(format!(
+                "principal '{}' is not authorized to delete .gitxacl",
+                principal.id
+            )));
+        }
+        let acl_routed = policy.domain_for_path(&norm);
+        let dom = if let Some(ref emb_dom) = embargo_domain {
+            emb_dom.clone()
+        } else if let Some(ref vis_dom) = explicit_visibility_domain {
+            if vis_dom.is_public() && !acl_routed.is_public() {
+                return Err(ApiError::forbidden(format!(
+                    "path '{norm}' is routed to protected domain '{acl_routed}' and cannot be deleted via 'public'"
+                )));
+            }
+            if acl_routed.is_secret() && !vis_dom.is_secret() {
+                acl_routed
+            } else {
+                vis_dom.clone()
+            }
+        } else {
+            acl_routed
+        };
         if !can_write_domain_effective(&policy, &principal, &dom, &embargo_allowed_domains) {
             return Err(ApiError::forbidden(format!(
                 "principal '{}' is not authorized to delete '{}' in domain '{}'",
                 principal.id, norm, dom
             )));
         }
+        if dom.is_secret() && !is_admin && !policy.can_write_domain(&principal, &dom) {
+            return Err(ApiError::forbidden(format!(
+                "principal '{}' is not authorized to delete secret '{}' in '{}'",
+                principal.id, norm, dom
+            )));
+        }
+        if embargo_domain.is_none() {
+            for tree in domain_trees.values() {
+                if tree.entries.contains_key(&norm)
+                    && tree.domain.is_secret()
+                    && !is_admin
+                    && !policy.can_write_domain(&principal, &tree.domain)
+                {
+                    return Err(ApiError::forbidden(format!(
+                        "principal '{}' is not authorized to delete existing secret '{}' in '{}'",
+                        principal.id, norm, tree.domain
+                    )));
+                }
+            }
+        }
         touched_domains.insert(dom);
         delete_paths.push(norm);
-    }
-
-    // Resolve target bookmark and parent changeset.
-    let target_name = req.target.clone().unwrap_or_else(|| "master".to_string());
-    let parent_hash = if let Some(ref parent_str) = req.parent {
-        Some(resolve_hash_or_bookmark(repo.store.as_ref(), parent_str)?)
-    } else if let Some(h) = repo.store.get_bookmark(&target_name)? {
-        Some(h)
-    } else if target_name != "master" {
-        repo.store.get_bookmark("master")?
-    } else {
-        None
-    };
-
-    let parent_cs = parent_hash
-        .map(|h| repo.store.get_changeset(h))
-        .transpose()?;
-
-    // Start from parent's domain trees (preserving unaffected domains).
-    let mut domain_trees: BTreeMap<DomainId, DomainTree> = BTreeMap::new();
-    if let Some(ref p_cs) = parent_cs {
-        for (dom, &tree_hash) in &p_cs.domain_trees {
-            let tree = repo.store.get_tree(tree_hash)?;
-            domain_trees.insert(dom.clone(), tree);
-        }
     }
 
     // Apply deletions.
@@ -329,6 +524,9 @@ pub async fn commit(
                         &tree.domain,
                         &embargo_allowed_domains,
                     )
+                    && !(tree.domain.is_secret()
+                        && !is_admin
+                        && !policy.can_write_domain(&principal, &tree.domain))
                 {
                     tree.remove(path);
                 }
@@ -352,6 +550,69 @@ pub async fn commit(
                 },
             );
         }
+    }
+
+    // Validate and store end-to-end encrypted secret envelopes (`secret:*` domains only).
+    for (dom_raw, entries) in &req.secret_envelopes {
+        let dom = DomainId::new(dom_raw)?;
+        if !dom.is_secret() {
+            return Err(ApiError::bad_request(format!(
+                "secret_envelopes domain '{dom}' must start with 'secret:'"
+            )));
+        }
+        if !can_write_domain_effective(&policy, &principal, &dom, &embargo_allowed_domains) {
+            return Err(ApiError::forbidden(format!(
+                "principal '{}' is not authorized to write encrypted secrets to domain '{}'",
+                principal.id, dom
+            )));
+        }
+        let mut validated_envelopes: Vec<(String, SecretEnvelope)> =
+            Vec::with_capacity(entries.len());
+        for (raw_path, env_json) in entries {
+            let norm_path = normalize_repo_path(raw_path)?;
+            for existing_tree in domain_trees.values() {
+                if existing_tree.domain.is_secret()
+                    && existing_tree.entries.contains_key(&norm_path)
+                    && !is_admin
+                    && !policy.can_write_domain(&principal, &existing_tree.domain)
+                {
+                    return Err(ApiError::forbidden(format!(
+                        "principal '{}' is not authorized to overwrite or shadow existing secret '{}' in '{}'",
+                        principal.id, norm_path, existing_tree.domain
+                    )));
+                }
+            }
+            let envelope: SecretEnvelope = serde_json::from_str(env_json).map_err(|e| {
+                ApiError::bad_request(format!(
+                    "invalid SecretEnvelope JSON for '{norm_path}' in '{dom}': {e}"
+                ))
+            })?;
+            if envelope.domain != dom {
+                return Err(ApiError::bad_request(format!(
+                    "SecretEnvelope domain '{}' does not match target domain '{}'",
+                    envelope.domain, dom
+                )));
+            }
+            validated_envelopes.push((norm_path, envelope));
+        }
+        let tree = domain_trees
+            .entry(dom.clone())
+            .or_insert_with(|| DomainTree::new(dom.clone()));
+        for (norm_path, envelope) in validated_envelopes {
+            let env_bytes = serde_json::to_vec(&envelope)
+                .map_err(|e| ApiError::internal(format!("failed to encode SecretEnvelope: {e}")))?;
+            let env_hash = envelope.hash();
+            repo.store.put_raw_object(env_hash, &env_bytes)?;
+            tree.insert(
+                norm_path,
+                EntryKind::EncryptedSecret {
+                    envelope_hash: env_hash,
+                    key_epoch: envelope.key_epoch,
+                    mode: FileMode::Regular,
+                },
+            );
+        }
+        touched_domains.insert(dom);
     }
 
     // Persist every non-empty DomainTree.
@@ -419,11 +680,25 @@ pub async fn commit(
 
     repo.store.put_changeset(&cs)?;
 
-    let should_update_target = req.update_target.unwrap_or(true);
     let updated_target = if should_update_target {
-        repo.store.set_bookmark(&target_name, cs.id)?;
-        if let Some(ref acl_text) = new_acl_text {
-            repo.update_acl_from_text(acl_text)?;
+        // Prevent non-fast-forward bookmark rewinds or silent concurrent overwrites:
+        // if the target bookmark already exists, require that this commit's parent is the
+        // current target head and update atomically via CAS.
+        if let Some(existing_head) = current_target_head
+            && parent_hash != Some(existing_head)
+        {
+            return Err(ApiError::conflict(format!(
+                "cannot fast-forward target '{target_name}' from parent {parent_hash:?} while current head is {existing_head}; commit with update_target=false and land instead"
+            )));
+        }
+        repo.store
+            .cas_bookmark(&target_name, current_target_head, cs.id)?;
+        if target_name == "master" {
+            if let Some(ref acl_text) = new_acl_text {
+                repo.update_acl_from_text(acl_text)?;
+            } else if delete_paths.iter().any(|p| p == ".gitxacl") {
+                repo.reload_acl_from_store()?;
+            }
         }
         Some(target_name)
     } else {
@@ -535,32 +810,55 @@ pub async fn land(
     let incoming_hash = ObjectHash::from_str(&req.changeset_id)?;
     let incoming_cs = repo.store.get_changeset(incoming_hash)?;
 
-    if !policy.can_read_changeset(&principal, &incoming_cs) {
+    if !repo.can_read_changeset_live(&policy, &principal, &incoming_cs) {
         return Err(ApiError::forbidden(format!(
             "principal '{}' cannot access changeset {}",
             principal.id, incoming_hash
         )));
     }
-
-    let embargo_allowed = match &incoming_cs.visibility.embargo {
-        Some(EmbargoState::Active {
-            allowed_domains, ..
-        }) => allowed_domains.as_slice(),
-        _ => &[],
-    };
-    if !can_write_domain_effective(
-        &policy,
-        &principal,
-        &incoming_cs.visibility.primary_domain,
-        embargo_allowed,
-    ) {
-        return Err(ApiError::forbidden(format!(
-            "principal '{}' cannot write to domain '{}'",
-            principal.id, incoming_cs.visibility.primary_domain
-        )));
+    if repo.is_head_pending_verification(incoming_hash)
+        || repo.is_unlive_published_changeset(&incoming_cs)?
+    {
+        return Err(ApiError::conflict(
+            "cannot land an unverified, unlanded, or reverted embargo publication",
+        ));
     }
 
+    let incoming_parent_cs = incoming_cs
+        .parents
+        .first()
+        .copied()
+        .map(|h| repo.store.get_changeset(h))
+        .transpose()?;
+    verify_changeset_write_permissions(
+        repo.store.as_ref(),
+        &policy,
+        &principal,
+        &incoming_cs,
+        incoming_parent_cs.as_ref(),
+    )?;
+
+    let _target_write_guard = repo.try_write_target(&req.target)?;
     let current_head = repo.store.get_bookmark(&req.target)?;
+    if let Some(h) = current_head
+        && repo.is_head_pending_verification(h)
+    {
+        return Err(ApiError::conflict(format!(
+            "target '{}' is currently undergoing post-land verification; retry shortly",
+            req.target
+        )));
+    }
+    let current_head_cs = current_head
+        .map(|h| repo.store.get_changeset(h))
+        .transpose()?;
+    if let Some(ref cur_cs) = current_head_cs
+        && repo.is_unlive_published_changeset(cur_cs)?
+    {
+        return Err(ApiError::conflict(format!(
+            "target '{}' points to an unverified or reverted embargo publication",
+            req.target
+        )));
+    }
 
     if let Some(ref exp_str) = req.expected_head {
         let exp_hash = ObjectHash::from_str(exp_str)?;
@@ -660,6 +958,28 @@ pub async fn land(
         }
     };
 
+    let final_cs = repo.store.get_changeset(final_head)?;
+    // Verify write permissions for the net delta actually applied to the target bookmark
+    // (closing stacked-parent bypasses where an unlanded/reverted ancestor modified restricted
+    // domains or secrets relative to `current_head_cs`).
+    verify_changeset_write_permissions(
+        repo.store.as_ref(),
+        &policy,
+        &principal,
+        &final_cs,
+        current_head_cs.as_ref(),
+    )?;
+    let master_acl_changed = req.target == "master"
+        && acl_file_changed(repo.store.as_ref(), current_head_cs.as_ref(), &final_cs)?;
+    if master_acl_changed && !can_administer_acl(&policy, &principal) {
+        return Err(ApiError::forbidden(format!(
+            "principal '{}' is not authorized to modify .gitxacl on 'master'",
+            principal.id
+        )));
+    }
+
+    let pending_guard = repo.track_pending_verification(final_head);
+
     let record = repo.store.record_land(
         &req.target,
         current_head,
@@ -667,9 +987,115 @@ pub async fn land(
         vec![incoming_cs.change_id],
     )?;
 
-    if req.target == "master" {
-        let _ = repo.reload_acl_from_store();
+    // Run optional post-land verification BEFORE reloading `.gitxacl` or recording `"land"` so an
+    // unverified `.gitxacl` is never applied mid-hook and an API-configured `<root_dir>/.gitxacl`
+    // is never wiped on auto-revert.
+    if let Err(reason) = state
+        .run_post_land_hook_async(
+            format!("{owner}/{name}"),
+            record.target.clone(),
+            record.land_seq,
+            record.new_head,
+        )
+        .await
+    {
+        match repo.store.revert_land(record.land_seq) {
+            Ok(revert_rec) => {
+                let rev_payload = json!({
+                    "event": "auto_revert",
+                    "repo": format!("{owner}/{name}"),
+                    "target": record.target,
+                    "reverted_land_seq": record.land_seq,
+                    "revert_land_seq": revert_rec.land_seq,
+                    "restored_head": revert_rec.new_head.to_hex(),
+                    "reason": reason,
+                });
+                let ev = repo.outbox.record_event(
+                    "auto_revert",
+                    &record.target,
+                    revert_rec.land_seq,
+                    revert_rec.previous_head,
+                    revert_rec.new_head,
+                    &rev_payload,
+                )?;
+                drop(pending_guard);
+                spawn_webhook_dispatch(
+                    Arc::clone(&repo.outbox),
+                    state.config.webhook_urls.clone(),
+                    ev,
+                );
+                return Err(ApiError::conflict(format!(
+                    "land_seq {} auto-reverted: {reason}",
+                    record.land_seq
+                )));
+            }
+            Err(revert_err) => {
+                if master_acl_changed {
+                    let _ = repo.reload_acl_from_store();
+                }
+                // Bookmark remains live at `record.new_head`; best-effort record the land event
+                // (startup/list_outbox reconciliation also guarantees durability).
+                let land_payload = json!({
+                    "event": "land",
+                    "repo": format!("{owner}/{name}"),
+                    "target": record.target,
+                    "land_seq": record.land_seq,
+                    "previous_head": record.previous_head.map(|h| h.to_hex()),
+                    "new_head": record.new_head.to_hex(),
+                });
+                let ev_opt = repo
+                    .outbox
+                    .record_event(
+                        "land",
+                        &record.target,
+                        record.land_seq,
+                        record.previous_head,
+                        record.new_head,
+                        &land_payload,
+                    )
+                    .ok();
+                drop(pending_guard);
+                if let Some(ev) = ev_opt {
+                    spawn_webhook_dispatch(
+                        Arc::clone(&repo.outbox),
+                        state.config.webhook_urls.clone(),
+                        ev,
+                    );
+                }
+                return Err(ApiError::internal(format!(
+                    "post-land verification failed for land_seq {} ({reason}), and auto-revert failed ({revert_err}); bookmark '{}' remains at {}",
+                    record.land_seq, record.target, record.new_head
+                )));
+            }
+        }
     }
+
+    if master_acl_changed {
+        repo.reload_acl_from_store()?;
+    }
+
+    let land_payload = json!({
+        "event": "land",
+        "repo": format!("{owner}/{name}"),
+        "target": record.target,
+        "land_seq": record.land_seq,
+        "previous_head": record.previous_head.map(|h| h.to_hex()),
+        "new_head": record.new_head.to_hex(),
+    });
+    let ev = repo.outbox.record_event(
+        "land",
+        &record.target,
+        record.land_seq,
+        record.previous_head,
+        record.new_head,
+        &land_payload,
+    )?;
+    drop(pending_guard);
+    spawn_webhook_dispatch(
+        Arc::clone(&repo.outbox),
+        state.config.webhook_urls.clone(),
+        ev,
+    );
 
     Ok(Json(LandResponse {
         land_seq: record.land_seq,
@@ -705,6 +1131,10 @@ pub async fn revert_land(
 
     let repo = get_existing_repo(&state, &owner, &name)?;
     let original = repo.store.get_land(land_seq)?;
+    let _target_write_guard = repo.try_write_target(&original.target)?;
+    let policy = repo.acl_snapshot()?;
+    // Re-read `original` under the exclusive target write lock so `reverted_by` cannot race.
+    let original = repo.store.get_land(land_seq)?;
 
     if let Some(existing_rev) = original.reverted_by {
         return Err(ApiError::conflict(format!(
@@ -718,15 +1148,94 @@ pub async fn revert_land(
         ))
     })?;
 
-    let current_head = repo.store.get_bookmark(&original.target)?;
-    let revert_rec =
-        repo.store
-            .record_land(&original.target, current_head, previous_head, Vec::new())?;
-    repo.store.mark_reverted(land_seq, revert_rec.land_seq)?;
-
-    if original.target == "master" {
-        let _ = repo.reload_acl_from_store();
+    if repo.is_head_pending_verification(original.new_head)
+        || repo.is_head_pending_verification(previous_head)
+    {
+        return Err(ApiError::conflict(format!(
+            "land_seq {land_seq} is currently undergoing post-land verification; retry shortly"
+        )));
     }
+
+    let new_cs = repo.store.get_changeset(original.new_head)?;
+    let prev_cs = repo.store.get_changeset(previous_head)?;
+    // Block un-reverting an auto-reverted or unverified `EmbargoState::Published` changeset
+    // (which would bypass `can_publish_embargo` and `post_land_cmd` and disclose the embargo).
+    if repo.is_unlive_published_changeset(&prev_cs)? || repo.is_unlive_published_changeset(&new_cs)?
+    {
+        return Err(ApiError::conflict(format!(
+            "land_seq {land_seq} references an unverified or reverted embargo publication and cannot be reverted"
+        )));
+    }
+    if !repo.can_read_changeset_live(&policy, &principal, &new_cs)
+        || !repo.can_read_changeset_live(&policy, &principal, &prev_cs)
+    {
+        return Err(ApiError::forbidden(format!(
+            "principal '{}' cannot revert unreadable land_seq {land_seq}",
+            principal.id
+        )));
+    }
+    let new_embargo_allowed = match &new_cs.visibility.embargo {
+        Some(EmbargoState::Active {
+            allowed_domains, ..
+        }) => allowed_domains.as_slice(),
+        _ => &[],
+    };
+    if !can_write_domain_effective(
+        &policy,
+        &principal,
+        &new_cs.visibility.primary_domain,
+        new_embargo_allowed,
+    ) {
+        return Err(ApiError::forbidden(format!(
+            "principal '{}' cannot revert land in domain '{}'",
+            principal.id, new_cs.visibility.primary_domain
+        )));
+    }
+    // Verify write permissions for transitioning `new_cs -> prev_cs` so reverting a secret
+    // addition in an unconfigured `secret:*` dropbox requires explicit write/admin permission.
+    verify_changeset_write_permissions(
+        repo.store.as_ref(),
+        &policy,
+        &principal,
+        &prev_cs,
+        Some(&new_cs),
+    )?;
+    let master_acl_changed = original.target == "master"
+        && acl_file_changed(repo.store.as_ref(), Some(&new_cs), &prev_cs)?;
+    if master_acl_changed && !can_administer_acl(&policy, &principal) {
+        return Err(ApiError::forbidden(format!(
+            "principal '{}' is not authorized to revert .gitxacl on 'master'",
+            principal.id
+        )));
+    }
+
+    let revert_rec = repo.store.revert_land(land_seq)?;
+
+    if master_acl_changed {
+        repo.reload_acl_from_store()?;
+    }
+
+    let rev_payload = json!({
+        "event": "revert",
+        "repo": format!("{owner}/{name}"),
+        "target": original.target,
+        "reverted_land_seq": land_seq,
+        "revert_land_seq": revert_rec.land_seq,
+        "restored_head": previous_head.to_hex(),
+    });
+    let ev = repo.outbox.record_event(
+        "revert",
+        &original.target,
+        revert_rec.land_seq,
+        revert_rec.previous_head,
+        revert_rec.new_head,
+        &rev_payload,
+    )?;
+    spawn_webhook_dispatch(
+        Arc::clone(&repo.outbox),
+        state.config.webhook_urls.clone(),
+        ev,
+    );
 
     Ok(Json(RevertResponse {
         reverted_land_seq: land_seq,
@@ -761,10 +1270,100 @@ pub struct TreeFileEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeSecretEntry {
+    pub path: String,
+    pub domain: String,
+    pub key_epoch: u64,
+    pub envelope_hash: String,
+    pub envelope_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeResponse {
     pub rev: Option<String>,
     pub domains: Vec<String>,
     pub files: Vec<TreeFileEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<TreeSecretEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutboxQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboxResponse {
+    pub events: Vec<OutboxEvent>,
+}
+
+/// `GET /v1/repos/{owner}/{name}/outbox`
+pub async fn list_outbox(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<OutboxQuery>,
+) -> ApiResult<Json<OutboxResponse>> {
+    if principal.is_anonymous {
+        return Err(ApiError::forbidden(
+            "anonymous callers cannot inspect repository outbox events",
+        ));
+    }
+    let repo = get_existing_repo(&state, &owner, &name)?;
+    let _ = repo.reconcile_outbox();
+    let policy = repo.acl_snapshot()?;
+    let limit = query.limit.unwrap_or(50).min(500);
+    let page_size = limit.clamp(64, 500);
+
+    // Fail-closed ACL filter with full table pagination:
+    // - Both `new_head` AND `previous_head` (when present) must be readable by `principal`.
+    // - Keeps paging older events until `limit` visible events are found or the outbox is exhausted
+    //   so a burst of unreadable private/embargoed lands never hides older readable events.
+    let mut visible_events = Vec::with_capacity(limit);
+    let mut cursor: Option<u64> = None;
+    loop {
+        let batch = repo.outbox.list_events_before(cursor, page_size)?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        cursor = batch.last().map(|e| e.event_id);
+
+        for ev in batch {
+            let Ok(head_hash) = ObjectHash::from_str(&ev.new_head) else {
+                continue;
+            };
+            let Ok(cs) = repo.store.get_changeset(head_hash) else {
+                continue;
+            };
+            if !repo.can_read_changeset_live(&policy, &principal, &cs) {
+                continue;
+            }
+            if let Some(ref prev_hex) = ev.previous_head {
+                let Ok(prev_hash) = ObjectHash::from_str(prev_hex) else {
+                    continue;
+                };
+                let Ok(prev_cs) = repo.store.get_changeset(prev_hash) else {
+                    continue;
+                };
+                if !repo.can_read_changeset_live(&policy, &principal, &prev_cs) {
+                    continue;
+                }
+            }
+            visible_events.push(ev);
+            if visible_events.len() >= limit {
+                break;
+            }
+        }
+
+        if visible_events.len() >= limit || batch_len < page_size {
+            break;
+        }
+    }
+    Ok(Json(OutboxResponse {
+        events: visible_events,
+    }))
 }
 
 pub async fn get_tree(
@@ -783,7 +1382,7 @@ pub async fn get_tree(
         .map(DomainId::new)
         .transpose()?;
 
-    let Some(cs) = resolve_visible_changeset(repo.store.as_ref(), &policy, &principal, query.rev.as_deref())? else {
+    let Some(cs) = resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())? else {
         if let Some(ref dom) = domain_filter
             && !policy.can_read_domain(&principal, dom)
         {
@@ -796,6 +1395,7 @@ pub async fn get_tree(
             rev: None,
             domains: Vec::new(),
             files: Vec::new(),
+            secrets: Vec::new(),
         }));
     };
 
@@ -814,6 +1414,7 @@ pub async fn get_tree(
     let ordered_domains = ordered_domain_entries(&filtered_trees, &cs.visibility.primary_domain);
     let mut active_domains: Vec<String> = Vec::new();
     let mut merged: BTreeMap<String, TreeFileEntry> = BTreeMap::new();
+    let mut secrets: Vec<TreeSecretEntry> = Vec::new();
 
     for (dom, tree_hash) in ordered_domains {
         if domain_filter.as_ref().is_some_and(|f| f != dom) {
@@ -822,26 +1423,45 @@ pub async fn get_tree(
         active_domains.push(dom.to_string());
         let tree = repo.store.get_tree(tree_hash)?;
         for (path, entry) in &tree.entries {
-            if let EntryKind::File {
-                blob_hash, size, ..
-            } = entry
-            {
-                let bytes = repo.store.read_blob_bytes(*blob_hash)?;
-                let (content, content_base64) = match String::from_utf8(bytes) {
-                    Ok(s) => (Some(s), None),
-                    Err(e) => (None, Some(BASE64_STANDARD.encode(e.into_bytes()))),
-                };
-                merged.insert(
-                    path.clone(),
-                    TreeFileEntry {
-                        path: path.clone(),
-                        domain: dom.to_string(),
-                        size: *size,
-                        blob_hash: blob_hash.to_hex(),
-                        content,
-                        content_base64,
-                    },
-                );
+            match entry {
+                EntryKind::File {
+                    blob_hash, size, ..
+                } => {
+                    let bytes = repo.store.read_blob_bytes(*blob_hash)?;
+                    let (content, content_base64) = match String::from_utf8(bytes) {
+                        Ok(s) => (Some(s), None),
+                        Err(e) => (None, Some(BASE64_STANDARD.encode(e.into_bytes()))),
+                    };
+                    merged.insert(
+                        path.clone(),
+                        TreeFileEntry {
+                            path: path.clone(),
+                            domain: dom.to_string(),
+                            size: *size,
+                            blob_hash: blob_hash.to_hex(),
+                            content,
+                            content_base64,
+                        },
+                    );
+                }
+                EntryKind::EncryptedSecret {
+                    envelope_hash,
+                    key_epoch,
+                    ..
+                } => {
+                    if let Ok(raw) = repo.store.get_raw_object(*envelope_hash)
+                        && let Ok(env_json) = String::from_utf8(raw)
+                    {
+                        secrets.push(TreeSecretEntry {
+                            path: path.clone(),
+                            domain: dom.to_string(),
+                            key_epoch: *key_epoch,
+                            envelope_hash: envelope_hash.to_hex(),
+                            envelope_json: env_json,
+                        });
+                    }
+                }
+                EntryKind::Conflict { .. } => {}
             }
         }
     }
@@ -850,6 +1470,7 @@ pub async fn get_tree(
         rev: Some(cs.id.to_hex()),
         domains: active_domains,
         files: merged.into_values().collect(),
+        secrets,
     }))
 }
 
@@ -890,27 +1511,29 @@ pub async fn get_diff(
     let repo = get_existing_repo(&state, &owner, &name)?;
     let policy = repo.acl_snapshot()?;
 
-    let to_cs =
-        resolve_visible_changeset(repo.store.as_ref(), &policy, &principal, query.to.as_deref())?;
+    let Some(to_cs) =
+        resolve_visible_changeset(&repo, &policy, &principal, query.to.as_deref())?
+    else {
+        return Ok(Json(DiffResponse {
+            from: None,
+            to: None,
+            files: Vec::new(),
+            unified_diff: String::new(),
+        }));
+    };
 
     let from_cs = match query.from.as_deref().filter(|s| !s.is_empty()) {
         Some(from_rev) => {
-            resolve_visible_changeset(repo.store.as_ref(), &policy, &principal, Some(from_rev))?
+            resolve_visible_changeset(&repo, &policy, &principal, Some(from_rev))?
         }
-        None => match &to_cs {
-            Some(cs) => first_visible_parent(repo.store.as_ref(), &policy, &principal, cs)?,
-            None => None,
-        },
+        None => first_visible_parent(&repo, &policy, &principal, &to_cs)?,
     };
 
     let old_files = match &from_cs {
         Some(cs) => materialize_authorized_files(repo.store.as_ref(), &policy, &principal, cs)?,
         None => BTreeMap::new(),
     };
-    let new_files = match &to_cs {
-        Some(cs) => materialize_authorized_files(repo.store.as_ref(), &policy, &principal, cs)?,
-        None => BTreeMap::new(),
-    };
+    let new_files = materialize_authorized_files(repo.store.as_ref(), &policy, &principal, &to_cs)?;
 
     let mut all_paths: BTreeSet<&str> = BTreeSet::new();
     all_paths.extend(old_files.keys().map(String::as_str));
@@ -961,7 +1584,7 @@ pub async fn get_diff(
 
     Ok(Json(DiffResponse {
         from: from_cs.map(|c| c.id.to_hex()),
-        to: to_cs.map(|c| c.id.to_hex()),
+        to: Some(to_cs.id.to_hex()),
         files,
         unified_diff: full_diff,
     }))
@@ -1009,7 +1632,7 @@ pub async fn grep(
     let policy = repo.acl_snapshot()?;
 
     let Some(cs) =
-        resolve_visible_changeset(repo.store.as_ref(), &policy, &principal, query.rev.as_deref())?
+        resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
     else {
         return Ok(Json(GrepResponse {
             query: query.q,
@@ -1160,7 +1783,7 @@ pub async fn blame(
     let policy = repo.acl_snapshot()?;
 
     let Some(head_cs) =
-        resolve_visible_changeset(repo.store.as_ref(), &policy, &principal, query.rev.as_deref())?
+        resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
     else {
         return Err(ApiError::not_found(format!(
             "revision not found for blame of '{norm_path}'"
@@ -1234,7 +1857,7 @@ pub async fn blame(
 
     for cs_id in touching_commits {
         let cs = repo.store.get_changeset(cs_id)?;
-        if !policy.can_read_changeset(&principal, &cs) {
+        if !repo.can_read_changeset_live(&policy, &principal, &cs) {
             continue;
         }
         let blob_opt = if let Some(&tree_hash) = cs.domain_trees.get(&target_domain) {
@@ -1369,7 +1992,9 @@ pub async fn log_history(
     let policy = repo.acl_snapshot()?;
     let limit = query.limit.unwrap_or(50).min(1000);
 
-    let Some(start_hash) = resolve_raw_rev(repo.store.as_ref(), query.rev.as_deref())? else {
+    let Some(start_hash) =
+        resolve_raw_rev_for_principal(&repo, &policy, &principal, query.rev.as_deref())?
+    else {
         return Ok(Json(LogResponse {
             rev: None,
             commits: Vec::new(),
@@ -1393,7 +2018,7 @@ pub async fn log_history(
                 queue.push_back(parent);
             }
         }
-        if policy.can_read_changeset(&principal, &cs) {
+        if repo.can_read_changeset_live(&policy, &principal, &cs) {
             visible.push(cs);
         }
     }
@@ -1408,7 +2033,7 @@ pub async fn log_history(
         .map(|cs| {
             let filtered = policy.filter_domain_trees(&principal, &cs);
             let domains: Vec<String> = filtered.keys().map(ToString::to_string).collect();
-            let visible_parents = visible_parent_hashes(repo.store.as_ref(), &policy, &principal, &cs);
+            let visible_parents = visible_parent_hashes(&repo, &policy, &principal, &cs);
             LogEntry {
                 changeset_id: cs.id.to_hex(),
                 change_id: cs.change_id.to_string(),
@@ -1465,7 +2090,7 @@ pub async fn why(
     let policy = repo.acl_snapshot()?;
 
     let Some(cs) =
-        resolve_visible_changeset(repo.store.as_ref(), &policy, &principal, query.rev.as_deref())?
+        resolve_visible_changeset(&repo, &policy, &principal, query.rev.as_deref())?
     else {
         return Ok(Json(WhyResponse {
             path: norm_path,
@@ -1535,32 +2160,55 @@ pub async fn publish_embargo(
     };
 
     let repo = get_existing_repo(&state, &owner, &name)?;
-    let policy = repo.acl_snapshot()?;
     let embargo_domain = DomainId::embargo(&advisory)?;
 
-    // Locate the latest active embargo ChangeSet for this advisory.
+    // Serialize embargo publication per repository so two concurrent publish requests (even
+    // targeting different bookmarks) cannot both pass the already-published check and double-publish.
+    let _publish_guard = repo.publish_lock.lock().await;
+    // Snapshot ACL after acquiring `publish_lock` so we see any `.gitxacl` reloaded by an
+    // immediately preceding publish.
+    let policy = repo.acl_snapshot()?;
+
+    // Locate active embargo ChangeSets for this advisory and verify it has not already been published.
     let all_cs = repo.store.list_changesets()?;
-    let embargo_cs = all_cs
-        .into_iter()
-        .rev()
-        .find(|cs| {
+    let active_candidates: Vec<ChangeSet> = all_cs
+        .iter()
+        .filter(|cs| {
             matches!(
                 &cs.visibility.embargo,
                 Some(EmbargoState::Active { advisory_id, .. }) if advisory_id == &advisory
             )
         })
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "no active embargo found for advisory '{advisory}'"
-            ))
-        })?;
+        .cloned()
+        .collect();
 
-    if !can_publish_embargo(&policy, &principal, &embargo_cs) {
-        return Err(ApiError::forbidden(format!(
-            "principal '{}' is not authorized to publish embargo '{advisory}'",
-            principal.id
+    if active_candidates.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "no active embargo found for advisory '{advisory}'"
         )));
     }
+
+    // Key already-published check strictly on `advisory_id` using live/unreverted land status so:
+    // - an advisory can never be double-published (even onto a different bookmark),
+    // - a transient CAS conflict or crash orphan never permanently bricks the advisory, and
+    // - an auto-reverted publish (failing `post_land_cmd`) allows repair commits and retry.
+    if repo.is_advisory_published(&advisory)? {
+        return Err(ApiError::conflict(format!(
+            "embargo '{advisory}' has already been published"
+        )));
+    }
+
+    // Prefer the latest active embargo this principal is authorized to publish.
+    let embargo_cs = active_candidates
+        .into_iter()
+        .rev()
+        .find(|cs| can_publish_embargo(&policy, &principal, cs))
+        .ok_or_else(|| {
+            ApiError::forbidden(format!(
+                "principal '{}' is not authorized to publish embargo '{advisory}'",
+                principal.id
+            ))
+        })?;
 
     let embargo_tree = match embargo_cs.domain_trees.get(&embargo_domain) {
         Some(&tree_hash) => repo.store.get_tree(tree_hash)?,
@@ -1568,13 +2216,28 @@ pub async fn publish_embargo(
     };
 
     let target = req.target.unwrap_or_else(|| "master".to_string());
+    let _target_write_guard = repo.try_write_target(&target)?;
     let current_head = repo.store.get_bookmark(&target)?;
+    if let Some(h) = current_head
+        && repo.is_head_pending_verification(h)
+    {
+        return Err(ApiError::conflict(format!(
+            "target '{target}' is currently undergoing post-land verification; retry shortly"
+        )));
+    }
 
     let mut domain_trees: BTreeMap<DomainId, DomainTree> = BTreeMap::new();
-    let base_source_cs = current_head
+    let current_head_cs = current_head
         .map(|h| repo.store.get_changeset(h))
-        .transpose()?
-        .unwrap_or_else(|| embargo_cs.clone());
+        .transpose()?;
+    if let Some(ref cur_cs) = current_head_cs
+        && repo.is_unlive_published_changeset(cur_cs)?
+    {
+        return Err(ApiError::conflict(format!(
+            "target '{target}' points to an unverified or reverted embargo publication"
+        )));
+    }
+    let base_source_cs = current_head_cs.unwrap_or_else(|| embargo_cs.clone());
 
     for (dom, &tree_hash) in &base_source_cs.domain_trees {
         if dom == &embargo_domain {
@@ -1583,9 +2246,45 @@ pub async fn publish_embargo(
         domain_trees.insert(dom.clone(), repo.store.get_tree(tree_hash)?);
     }
 
+    let is_admin = principal.roles.iter().any(|r| r == "admin");
     let mut promoted_paths: Vec<String> = Vec::new();
+    let mut promoted_acl = false;
     for (path, entry) in &embargo_tree.entries {
         let dest_domain = policy.domain_for_path(path);
+        if !can_write_domain_effective(&policy, &principal, &dest_domain, &[]) {
+            return Err(ApiError::forbidden(format!(
+                "principal '{}' is not authorized to promote '{path}' into domain '{dest_domain}'",
+                principal.id
+            )));
+        }
+        for existing_tree in domain_trees.values() {
+            if existing_tree.domain.is_secret()
+                && existing_tree.entries.contains_key(path)
+                && !is_admin
+                && !policy.can_write_domain(&principal, &existing_tree.domain)
+            {
+                return Err(ApiError::forbidden(format!(
+                    "principal '{}' is not authorized to overwrite or shadow existing secret '{path}' in domain '{}'",
+                    principal.id, existing_tree.domain
+                )));
+            }
+        }
+        if path == ".gitxacl" {
+            if !can_administer_acl(&policy, &principal) {
+                return Err(ApiError::forbidden(format!(
+                    "principal '{}' is not authorized to promote .gitxacl",
+                    principal.id
+                )));
+            }
+            if let EntryKind::File { blob_hash, .. } = entry {
+                let bytes = repo.store.read_blob_bytes(*blob_hash)?;
+                let text = std::str::from_utf8(&bytes).map_err(|e| {
+                    ApiError::bad_request(format!(".gitxacl must be valid UTF-8: {e}"))
+                })?;
+                let _ = AclPolicy::parse(text)?;
+                promoted_acl = true;
+            }
+        }
         if dest_domain.is_public()
             && let EntryKind::File { blob_hash, .. } = entry
         {
@@ -1653,14 +2352,138 @@ pub async fn publish_embargo(
         .description(description)
         .build();
 
+    // Track `published_cs.id` as pending verification BEFORE persisting it so unprivileged callers
+    // cannot observe it while `post_land_cmd` runs AND concurrent `GET /outbox` reconciliation
+    // never prematurely backfills a `"land"` row before verification succeeds.
+    let pending_guard = repo.track_pending_verification(published_cs.id);
     repo.store.put_changeset(&published_cs)?;
 
-    let land_rec = repo.store.record_land(
+    let land_rec = match repo.store.record_land(
         &target,
         current_head,
         published_cs.id,
         vec![published_cs.change_id],
+    ) {
+        Ok(rec) => rec,
+        Err(err) => {
+            // Roll back the unlanded `Published` changeset on CAS conflict so no orphan remains.
+            let _ = repo.store.delete_changeset(published_cs.id);
+            return Err(err.into());
+        }
+    };
+
+    // Run optional post-land verification BEFORE reloading `.gitxacl`, recording `"land"`,
+    // releasing public visibility, or promoting embargo context records so a failing `post_land_cmd`
+    // atomically auto-reverts without disclosing the embargo or wiping `<root_dir>/.gitxacl`.
+    if let Err(reason) = state
+        .run_post_land_hook_async(
+            format!("{owner}/{name}"),
+            land_rec.target.clone(),
+            land_rec.land_seq,
+            land_rec.new_head,
+        )
+        .await
+    {
+        match repo.store.revert_land(land_rec.land_seq) {
+            Ok(revert_rec) => {
+                let rev_payload = json!({
+                    "event": "auto_revert",
+                    "repo": format!("{owner}/{name}"),
+                    "target": land_rec.target,
+                    "reverted_land_seq": land_rec.land_seq,
+                    "revert_land_seq": revert_rec.land_seq,
+                    "restored_head": revert_rec.new_head.to_hex(),
+                    "advisory_id": advisory,
+                    "reason": reason,
+                });
+                let ev = repo.outbox.record_event(
+                    "auto_revert",
+                    &land_rec.target,
+                    revert_rec.land_seq,
+                    revert_rec.previous_head,
+                    revert_rec.new_head,
+                    &rev_payload,
+                )?;
+                drop(pending_guard);
+                spawn_webhook_dispatch(
+                    Arc::clone(&repo.outbox),
+                    state.config.webhook_urls.clone(),
+                    ev,
+                );
+                return Err(ApiError::conflict(format!(
+                    "land_seq {} auto-reverted: {reason}",
+                    land_rec.land_seq
+                )));
+            }
+            Err(revert_err) => {
+                if target == "master" && promoted_acl {
+                    let _ = repo.reload_acl_from_store();
+                }
+                let publish_payload = json!({
+                    "event": "land",
+                    "repo": format!("{owner}/{name}"),
+                    "target": land_rec.target,
+                    "land_seq": land_rec.land_seq,
+                    "previous_head": land_rec.previous_head.map(|h| h.to_hex()),
+                    "new_head": land_rec.new_head.to_hex(),
+                    "advisory_id": advisory,
+                });
+                let ev_opt = repo
+                    .outbox
+                    .record_event(
+                        "land",
+                        &land_rec.target,
+                        land_rec.land_seq,
+                        land_rec.previous_head,
+                        land_rec.new_head,
+                        &publish_payload,
+                    )
+                    .ok();
+                drop(pending_guard);
+                if let Some(ev) = ev_opt {
+                    spawn_webhook_dispatch(
+                        Arc::clone(&repo.outbox),
+                        state.config.webhook_urls.clone(),
+                        ev,
+                    );
+                }
+                return Err(ApiError::internal(format!(
+                    "post-land verification failed for land_seq {} ({reason}), and auto-revert failed ({revert_err}); bookmark '{}' remains at {}",
+                    land_rec.land_seq, land_rec.target, land_rec.new_head
+                )));
+            }
+        }
+    }
+
+    if target == "master" && promoted_acl {
+        repo.reload_acl_from_store()?;
+    }
+
+    let publish_payload = json!({
+        "event": "land",
+        "repo": format!("{owner}/{name}"),
+        "target": land_rec.target,
+        "land_seq": land_rec.land_seq,
+        "previous_head": land_rec.previous_head.map(|h| h.to_hex()),
+        "new_head": land_rec.new_head.to_hex(),
+        "advisory_id": advisory,
+    });
+    let ev = repo.outbox.record_event(
+        "land",
+        &land_rec.target,
+        land_rec.land_seq,
+        land_rec.previous_head,
+        land_rec.new_head,
+        &publish_payload,
     )?;
+    // Verification succeeded and outbox event recorded — release pending guard so `published_cs`
+    // is now publicly visible.
+    drop(pending_guard);
+    spawn_webhook_dispatch(
+        Arc::clone(&repo.outbox),
+        state.config.webhook_urls.clone(),
+        ev,
+    );
 
     // Promote context records from the embargo domain into public visibility for disclosed paths.
     let embargo_records = repo
@@ -1757,7 +2580,7 @@ pub(crate) fn read_blob_authorized(
     let repo = get_existing_repo(state, owner, name)?;
     let policy = repo.acl_snapshot()?;
 
-    let Some(cs) = resolve_visible_changeset(repo.store.as_ref(), &policy, principal, rev)? else {
+    let Some(cs) = resolve_visible_changeset(&repo, &policy, principal, rev)? else {
         return Err(ApiError::not_found(format!(
             "revision not found in repository '{owner}/{name}'"
         )));
@@ -1870,18 +2693,30 @@ fn parse_team_or_domain(raw: &str) -> ApiResult<DomainId> {
     }
 }
 
-fn resolve_hash_or_bookmark(store: &dyn ObjectStore, spec: &str) -> ApiResult<ObjectHash> {
+fn resolve_hash_or_bookmark_visible(
+    repo: &RepoHandle,
+    policy: &AclPolicy,
+    principal: &Principal,
+    spec: &str,
+) -> ApiResult<ObjectHash> {
+    let store = repo.store.as_ref();
     if let Some(h) = store.get_bookmark(spec)? {
         return Ok(h);
     }
     if let Ok(h) = ObjectHash::from_str(spec) {
-        let _ = store.get_changeset(h)?;
+        let cs = store.get_changeset(h)?;
+        if !repo.can_read_changeset_live(policy, principal, &cs) {
+            return Err(ApiError::not_found(format!("revision '{spec}' not found")));
+        }
         return Ok(h);
     }
     let all = store.list_changesets()?;
     let matches: Vec<ObjectHash> = all
         .iter()
-        .filter(|cs| cs.id.to_hex().starts_with(spec) || cs.change_id.to_string() == spec)
+        .filter(|cs| {
+            repo.can_read_changeset_live(policy, principal, cs)
+                && (cs.id.to_hex().starts_with(spec) || cs.change_id.to_string() == spec)
+        })
         .map(|cs| cs.id)
         .collect();
     match matches.as_slice() {
@@ -1893,7 +2728,125 @@ fn resolve_hash_or_bookmark(store: &dyn ObjectStore, spec: &str) -> ApiResult<Ob
     }
 }
 
-fn resolve_raw_rev(store: &dyn ObjectStore, rev: Option<&str>) -> ApiResult<Option<ObjectHash>> {
+/// Verify that `principal` is permitted to write `incoming_cs`'s primary domain and EVERY
+/// domain tree modified relative to `baseline_cs` (plus `.gitxacl` admin check if changed).
+pub(crate) fn verify_changeset_write_permissions(
+    store: &dyn ObjectStore,
+    policy: &AclPolicy,
+    principal: &Principal,
+    incoming_cs: &ChangeSet,
+    baseline_cs: Option<&ChangeSet>,
+) -> ApiResult<()> {
+    let incoming_embargo_allowed = match &incoming_cs.visibility.embargo {
+        Some(EmbargoState::Active {
+            allowed_domains, ..
+        }) => allowed_domains.as_slice(),
+        _ => &[],
+    };
+    let baseline_embargo_allowed = match baseline_cs.and_then(|b| b.visibility.embargo.as_ref()) {
+        Some(EmbargoState::Active {
+            allowed_domains, ..
+        }) => allowed_domains.as_slice(),
+        _ => &[],
+    };
+
+    if !can_write_domain_effective(
+        policy,
+        principal,
+        &incoming_cs.visibility.primary_domain,
+        incoming_embargo_allowed,
+    ) {
+        return Err(ApiError::forbidden(format!(
+            "principal '{}' cannot write to domain '{}'",
+            principal.id, incoming_cs.visibility.primary_domain
+        )));
+    }
+
+    let mut domains_to_check: BTreeSet<&DomainId> = BTreeSet::new();
+    for (dom, &hash) in &incoming_cs.domain_trees {
+        let base_hash = baseline_cs.and_then(|b| b.domain_trees.get(dom).copied());
+        if base_hash != Some(hash) {
+            domains_to_check.insert(dom);
+        }
+    }
+    if let Some(base) = baseline_cs {
+        for dom in base.domain_trees.keys() {
+            if !incoming_cs.domain_trees.contains_key(dom) {
+                domains_to_check.insert(dom);
+            }
+        }
+    }
+
+    for dom in domains_to_check {
+        let dom_embargo_allowed = if *dom == incoming_cs.visibility.primary_domain {
+            incoming_embargo_allowed
+        } else if baseline_cs.is_some_and(|b| *dom == b.visibility.primary_domain) {
+            baseline_embargo_allowed
+        } else {
+            &[]
+        };
+        if !can_write_domain_effective(policy, principal, dom, dom_embargo_allowed) {
+            return Err(ApiError::forbidden(format!(
+                "principal '{}' cannot write to modified domain '{}'",
+                principal.id, dom
+            )));
+        }
+        // For unconfigured `secret:*` dropbox domains, non-admin callers without explicit write
+        // permission may only append new secrets; they may never overwrite or delete existing ones.
+        if dom.is_secret()
+            && !principal.roles.iter().any(|r| r == "admin")
+            && !policy.can_write_domain(principal, dom)
+        {
+            let base_tree = load_domain_tree_or_empty(store, baseline_cs, dom)?;
+            let incoming_tree = load_domain_tree_or_empty(store, Some(incoming_cs), dom)?;
+            for (path, existing_entry) in &base_tree.entries {
+                if incoming_tree.entries.get(path) != Some(existing_entry) {
+                    return Err(ApiError::forbidden(format!(
+                        "principal '{}' cannot overwrite or delete existing secret '{path}' in domain '{dom}'",
+                        principal.id
+                    )));
+                }
+            }
+        }
+    }
+
+    if acl_file_changed(store, baseline_cs, incoming_cs)?
+        && !can_administer_acl(policy, principal)
+    {
+        return Err(ApiError::forbidden(format!(
+            "principal '{}' is not authorized to modify .gitxacl",
+            principal.id
+        )));
+    }
+
+    Ok(())
+}
+
+/// Returns `true` if `.gitxacl` in the `public` domain tree differs between `old_cs` and `new_cs`.
+pub(crate) fn acl_file_changed(
+    store: &dyn ObjectStore,
+    old_cs: Option<&ChangeSet>,
+    new_cs: &ChangeSet,
+) -> ApiResult<bool> {
+    let pub_dom = DomainId::public();
+    let old_entry = match old_cs.and_then(|c| c.domain_trees.get(&pub_dom).copied()) {
+        Some(h) => store.get_tree(h)?.entries.get(".gitxacl").cloned(),
+        None => None,
+    };
+    let new_entry = match new_cs.domain_trees.get(&pub_dom).copied() {
+        Some(h) => store.get_tree(h)?.entries.get(".gitxacl").cloned(),
+        None => None,
+    };
+    Ok(old_entry != new_entry)
+}
+
+fn resolve_raw_rev_for_principal(
+    repo: &RepoHandle,
+    policy: &AclPolicy,
+    principal: &Principal,
+    rev: Option<&str>,
+) -> ApiResult<Option<ObjectHash>> {
+    let store = repo.store.as_ref();
     let spec = rev.map(str::trim).filter(|s| !s.is_empty());
     match spec {
         None => Ok(store.get_bookmark("master")?),
@@ -1903,14 +2856,18 @@ fn resolve_raw_rev(store: &dyn ObjectStore, rev: Option<&str>) -> ApiResult<Opti
             }
             if let Ok(h) = ObjectHash::from_str(s) {
                 match store.get_changeset(h) {
-                    Ok(_) => return Ok(Some(h)),
-                    Err(_) => return Ok(None),
+                    Ok(cs) if repo.can_read_changeset_live(policy, principal, &cs) => {
+                        return Ok(Some(h));
+                    }
+                    _ => return Ok(None),
                 }
             }
             let all = store.list_changesets()?;
             let mut found = None;
             for cs in all {
-                if cs.id.to_hex().starts_with(s) || cs.change_id.to_string() == s {
+                if repo.can_read_changeset_live(policy, principal, &cs)
+                    && (cs.id.to_hex().starts_with(s) || cs.change_id.to_string() == s)
+                {
                     found = Some(cs.id);
                     break;
                 }
@@ -1923,23 +2880,24 @@ fn resolve_raw_rev(store: &dyn ObjectStore, rev: Option<&str>) -> ApiResult<Opti
 /// Resolve `rev` (defaulting to `master`) and walk back to the nearest ChangeSet
 /// visible to `principal` so unauthorized private/embargoed tips never leak.
 fn resolve_visible_changeset(
-    store: &dyn ObjectStore,
+    repo: &RepoHandle,
     policy: &AclPolicy,
     principal: &Principal,
     rev: Option<&str>,
 ) -> ApiResult<Option<ChangeSet>> {
-    let Some(start) = resolve_raw_rev(store, rev)? else {
+    let Some(start) = resolve_raw_rev_for_principal(repo, policy, principal, rev)? else {
         return Ok(None);
     };
-    nearest_visible_changeset(store, policy, principal, start)
+    nearest_visible_changeset(repo, policy, principal, start)
 }
 
 fn nearest_visible_changeset(
-    store: &dyn ObjectStore,
+    repo: &RepoHandle,
     policy: &AclPolicy,
     principal: &Principal,
     start: ObjectHash,
 ) -> ApiResult<Option<ChangeSet>> {
+    let store = repo.store.as_ref();
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     queue.push_back(start);
@@ -1951,7 +2909,7 @@ fn nearest_visible_changeset(
         let Ok(cs) = store.get_changeset(hash) else {
             continue;
         };
-        if policy.can_read_changeset(principal, &cs) {
+        if repo.can_read_changeset_live(policy, principal, &cs) {
             return Ok(Some(cs));
         }
         for &parent in &cs.parents {
@@ -1964,13 +2922,13 @@ fn nearest_visible_changeset(
 }
 
 fn first_visible_parent(
-    store: &dyn ObjectStore,
+    repo: &RepoHandle,
     policy: &AclPolicy,
     principal: &Principal,
     cs: &ChangeSet,
 ) -> ApiResult<Option<ChangeSet>> {
     for &parent in &cs.parents {
-        if let Some(vis) = nearest_visible_changeset(store, policy, principal, parent)? {
+        if let Some(vis) = nearest_visible_changeset(repo, policy, principal, parent)? {
             return Ok(Some(vis));
         }
     }
@@ -1978,14 +2936,14 @@ fn first_visible_parent(
 }
 
 fn visible_parent_hashes(
-    store: &dyn ObjectStore,
+    repo: &RepoHandle,
     policy: &AclPolicy,
     principal: &Principal,
     cs: &ChangeSet,
 ) -> Vec<ObjectHash> {
     let mut out = Vec::new();
     for &parent in &cs.parents {
-        if let Ok(Some(vis)) = nearest_visible_changeset(store, policy, principal, parent)
+        if let Ok(Some(vis)) = nearest_visible_changeset(repo, policy, principal, parent)
             && !out.contains(&vis.id)
         {
             out.push(vis.id);
@@ -2045,7 +3003,7 @@ pub(crate) fn compute_public_parents(
     let mut out = Vec::new();
     for &p in parents {
         if let Ok(cs) = store.get_changeset(p) {
-            if cs.visibility.primary_domain.is_public() && cs.visibility.embargo.is_none() {
+            if cs.visibility.is_publicly_visible() {
                 if !out.contains(&cs.public_projection_hash) {
                     out.push(cs.public_projection_hash);
                 }

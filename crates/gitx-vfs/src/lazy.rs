@@ -228,6 +228,31 @@ impl LazyWorkspace {
         }
     }
 
+    fn reject_symlink_ancestors(&self, norm_path: &str) -> Result<()> {
+        crate::cow::ensure_no_symlink_ancestors(&self.overlay_root, norm_path)?;
+        for prefix in crate::cow::ancestor_rel_paths(norm_path) {
+            if !self.tombstones.contains(&prefix)
+                && matches!(
+                    self.base_tree.entries.get(&prefix),
+                    Some(EntryKind::File {
+                        mode: FileMode::Symlink,
+                        ..
+                    })
+                )
+            {
+                return Err(GitxError::Workspace(format!(
+                    "refusing to access '{norm_path}' beneath base symlink ancestor '{prefix}'"
+                )));
+            }
+            if matches!(self.dirty_files.get(&prefix), Some(FileMode::Symlink)) {
+                return Err(GitxError::Workspace(format!(
+                    "refusing to access '{norm_path}' beneath overlay symlink ancestor '{prefix}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn remove_empty_parent_dirs(&self, path: &Path) {
         let mut cur = path.parent();
         while let Some(dir) = cur {
@@ -245,6 +270,7 @@ impl LazyWorkspace {
 impl WorkspaceBackend for LazyWorkspace {
     fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let norm = normalize_rel_path(path)?;
+        self.reject_symlink_ancestors(&norm)?;
 
         // 1. Tombstones always shadow the base tree.
         if self.tombstones.contains(&norm) {
@@ -296,6 +322,7 @@ impl WorkspaceBackend for LazyWorkspace {
 
     fn write_file(&mut self, path: &str, data: &[u8], mode: FileMode) -> Result<()> {
         let norm = normalize_rel_path(path)?;
+        self.reject_symlink_ancestors(&norm)?;
         let full = self.overlay_root.join(&norm);
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent)?;
@@ -321,6 +348,7 @@ impl WorkspaceBackend for LazyWorkspace {
 
     fn remove_file(&mut self, path: &str) -> Result<()> {
         let norm = normalize_rel_path(path)?;
+        self.reject_symlink_ancestors(&norm)?;
         if self.tombstones.contains(&norm) {
             return Err(GitxError::NotFound(format!("lazy workspace file '{norm}'")));
         }

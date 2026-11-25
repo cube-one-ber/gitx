@@ -22,6 +22,7 @@ gitx-sdk.workspace = true
 gitx-server.workspace = true
 gitx-store.workspace = true
 gitx-vfs.workspace = true
+reflink-copy.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

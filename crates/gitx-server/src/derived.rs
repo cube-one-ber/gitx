@@ -19,6 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Alias matching the architecture specification name for [`TrigramIndex`].
 pub type TrigramSearchIndex = TrigramIndex;
 
+/// Upper bound on cached trigram trees per repository to prevent unbounded memory growth.
+const MAX_CACHED_TRIGRAM_TREES: usize = 1024;
+/// Upper bound on cached path history entries per repository to prevent unbounded memory growth.
+const MAX_CACHED_PATH_HISTORIES: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // Derived Stats (HTTP + programmatic observability)
 // ---------------------------------------------------------------------------
@@ -189,6 +194,11 @@ impl TrigramIndex {
 
         let built = TreeTrigramEntry::build(store, tree_hash, domain)?;
         let candidates = built.candidate_files(query);
+        if self.trees.len() >= MAX_CACHED_TRIGRAM_TREES
+            && let Some(evict_key) = self.trees.keys().next().cloned()
+        {
+            self.trees.remove(&evict_key);
+        }
         self.trees.insert(key, built);
         self.domain_hits
             .entry(domain.clone())
@@ -212,6 +222,11 @@ impl TrigramIndex {
             return Ok(());
         }
         let built = TreeTrigramEntry::build(store, tree_hash, domain)?;
+        if self.trees.len() >= MAX_CACHED_TRIGRAM_TREES
+            && let Some(evict_key) = self.trees.keys().next().cloned()
+        {
+            self.trees.remove(&evict_key);
+        }
         self.trees.insert(key, built);
         self.domain_hits
             .entry(domain.clone())
@@ -280,8 +295,8 @@ pub struct CommitGraphNode {
 #[derive(Debug, Default)]
 pub struct CommitGraphIndex {
     nodes: HashMap<ObjectHash, CommitGraphNode>,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    domain_hits: HashMap<DomainId, AtomicU64>,
+    domain_misses: HashMap<DomainId, AtomicU64>,
 }
 
 impl CommitGraphIndex {
@@ -313,8 +328,11 @@ impl CommitGraphIndex {
 
     /// Ensure `root` and all of its reachable ancestors are loaded into the commit graph.
     pub fn ensure_commit(&mut self, store: &dyn ObjectStore, root: ObjectHash) -> Result<()> {
-        if self.nodes.contains_key(&root) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+        if let Some(node) = self.nodes.get(&root) {
+            self.domain_hits
+                .entry(node.primary_domain.clone())
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
 
@@ -362,17 +380,24 @@ impl CommitGraphIndex {
                     .filter_map(|p| self.nodes.get(p).map(|n| n.depth.saturating_add(1)))
                     .max()
                     .unwrap_or(0);
+                let primary_domain = cs.visibility.primary_domain;
                 self.nodes.insert(
                     hash,
                     CommitGraphNode {
                         id: cs.id,
                         parents: cs.parents,
                         depth,
-                        primary_domain: cs.visibility.primary_domain,
+                        primary_domain: primary_domain.clone(),
                         tree_hashes: cs.domain_trees,
                     },
                 );
-                self.misses.fetch_add(1, Ordering::Relaxed);
+                self.domain_hits
+                    .entry(primary_domain.clone())
+                    .or_insert_with(|| AtomicU64::new(0));
+                self.domain_misses
+                    .entry(primary_domain)
+                    .or_insert_with(|| AtomicU64::new(0))
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -511,11 +536,19 @@ impl CommitGraphIndex {
                 .filter(|n| set.contains(&n.primary_domain))
                 .count(),
         };
-        (
-            count,
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
+        let mut hits = 0u64;
+        for (dom, c) in &self.domain_hits {
+            if allowed.is_none_or(|set| set.contains(dom)) {
+                hits += c.load(Ordering::Relaxed);
+            }
+        }
+        let mut misses = 0u64;
+        for (dom, c) in &self.domain_misses {
+            if allowed.is_none_or(|set| set.contains(dom)) {
+                misses += c.load(Ordering::Relaxed);
+            }
+        }
+        (count, hits, misses)
     }
 }
 
@@ -605,6 +638,12 @@ impl PathHistoryIndex {
 
         touching.reverse();
 
+        if self.entries.len() >= MAX_CACHED_PATH_HISTORIES
+            && let Some(evict_key) = self.entries.keys().next().cloned()
+        {
+            self.entries.remove(&evict_key);
+            self.tips.remove(&evict_key);
+        }
         self.entries.insert(key.clone(), touching.clone());
         self.tips.insert(key, head);
         self.domain_hits

@@ -86,6 +86,30 @@ enum Commands {
         action: StackAction,
     },
 
+    /// Squash current `@` ChangeSet into its parent ChangeSet
+    Squash {
+        /// Optional replacement description for the squashed ChangeSet
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+    },
+
+    /// Split selected paths out of `@` into a lower stacked ChangeSet ("edit first, organize later")
+    Split {
+        /// Comma-separated or repeatable relative file paths to move into the base ChangeSet
+        #[arg(long = "paths", required = true)]
+        paths: Vec<String>,
+        /// Description for the newly created base ChangeSet
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+    },
+
+    /// Rebase `@` onto another revision/bookmark (records first-class conflicts without blocking)
+    Rebase {
+        /// Target revision hash, ChangeId, or bookmark
+        #[arg(long)]
+        onto: String,
+    },
+
     /// Atomically land the current ChangeSet onto a target bookmark (default: master)
     Land {
         /// Target bookmark to land onto
@@ -162,14 +186,50 @@ enum Commands {
         action: FleetAction,
     },
 
-    /// Start the GitX HTTP/JSON and ACL-filtered Git Smart HTTP server
+    /// Start the GitX HTTP/JSON, optional Tonic gRPC, and ACL-filtered Git Smart HTTP server
     Serve {
-        /// Listen address (host:port)
+        /// HTTP listen address (host:port)
         #[arg(long, default_value = "127.0.0.1:7878")]
         addr: String,
+        /// Optional Tonic gRPC listen address (host:port) sharing the same server state
+        #[arg(long)]
+        grpc_addr: Option<String>,
         /// Server data directory
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Static bearer token binding (`<token>=<user>[:teams=a,b][:roles=admin]`, repeatable)
+        #[arg(long = "token")]
+        tokens: Vec<String>,
+        /// Shared signing secret for verifying `gitx1h.*` cryptographically signed bearer tokens
+        #[arg(long)]
+        signing_secret: Option<String>,
+        /// Strictly reject unauthenticated X-Gitx-* proxy headers (require valid Bearer tokens)
+        #[arg(long)]
+        strict_auth: bool,
+        /// Optional tiered object_store backend URI (`memory://` or `fs:///path/to/cas`)
+        #[arg(long)]
+        object_store: Option<String>,
+        /// Webhook URL notified via durable outbox on every atomic land/revert (repeatable)
+        #[arg(long = "webhook-url")]
+        webhook_urls: Vec<String>,
+        /// Optional shell/agent conflict-resolver command invoked by the batched merge queue
+        #[arg(long)]
+        conflict_resolver_cmd: Option<String>,
+        /// Optional post-land verification command; non-zero exit triggers O(1) atomic auto-revert
+        #[arg(long)]
+        post_land_cmd: Option<String>,
+    },
+
+    /// Mint cryptographically signed bearer tokens for `gitx serve --signing-secret`
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+
+    /// Bidirectional ACL-filtered Git mirror sync (GitHub / Forgejo / bare Git remotes)
+    Mirror {
+        #[command(subcommand)]
+        action: MirrorAction,
     },
 
     /// Start the JSON-RPC 2.0 Model Context Protocol (MCP) server over stdin/stdout
@@ -194,9 +254,9 @@ enum Commands {
         action: RemoteAction,
     },
 
-    /// Push local ChangeSet and working copy changes to a remote gitx-server (supports push-to-create)
+    /// Push local ChangeSet (including encrypted `.env` secrets) to a remote gitx-server (supports direct URL push-to-create)
     Push {
-        /// Configured remote name (defaults to 'origin')
+        /// Configured remote name (defaults to 'origin') or direct http(s)://host/owner/repo URL
         remote: Option<String>,
         /// Target bookmark on the remote (defaults to repository default branch)
         #[arg(long)]
@@ -204,9 +264,12 @@ enum Commands {
         /// Commit message override for the pushed ChangeSet
         #[arg(short = 'm', long = "message")]
         message: Option<String>,
-        /// Authentication token override (e.g. 'alice' or 'user=alice;teams=core,security')
+        /// Authentication token override (e.g. 'alice', 'user=alice;teams=core', or signed 'gitx1h...')
         #[arg(long)]
         token: Option<String>,
+        /// Allow pushing a WIP ChangeSet containing unresolved conflicts to a non-trunk branch
+        #[arg(long)]
+        allow_conflicts: bool,
     },
 
     /// Pull ACL-filtered ChangeSets and files from a remote gitx-server into the local repo
@@ -245,11 +308,16 @@ enum OpAction {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Restore repository state to any historical OpLog entry by ID/prefix/suffix
+    Restore {
+        /// Operation ID (full ULID or prefix/suffix from `gitx op log`)
+        op_id: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum WsAction {
-    /// Add a new lock-free workspace off master
+    /// Add a new lock-free workspace off latest trunk (automatically prefers fresh remote head)
     Add {
         name: String,
         /// Target directory for a Copy-on-Write or lazy overlay workspace
@@ -261,6 +329,12 @@ enum WsAction {
         /// Create a demand-paged virtualized sparse workspace (O(1) mount, zero base files written)
         #[arg(long, conflicts_with = "mem")]
         lazy: bool,
+        /// Base workspace explicitly off `<remote>/<default_branch>` tracking ref
+        #[arg(long)]
+        from_remote: Option<String>,
+        /// Reflink-hydrate shared ignored directories (e.g. `--share node_modules`, repeatable)
+        #[arg(long = "share")]
+        share: Vec<String>,
     },
     /// List registered workspaces
     List,
@@ -308,6 +382,28 @@ enum SecretAction {
         domain: String,
         #[arg(long)]
         drop: Option<String>,
+    },
+    /// Import an existing OpenSSH Ed25519 private key (`~/.ssh/id_ed25519`) or teammate `.pub` key
+    ImportSsh {
+        /// Path to local OpenSSH Ed25519 private key (defaults to ~/.ssh/id_ed25519)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Path or inline string of a teammate's `ssh-ed25519` public key to grant access
+        #[arg(long = "pub", conflicts_with = "path")]
+        pub_key: Option<PathBuf>,
+        /// Optional label / recipient name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Revoke a recipient across ALL secret domains, rotate all DEKs, and print exposure audit
+    Revoke {
+        /// Recipient name or public-key fingerprint to revoke
+        target: String,
+    },
+    /// Print deterministic exposure audit report for a revoked/target identity
+    RotateReport {
+        /// Recipient name or public-key fingerprint
+        target: String,
     },
 }
 
@@ -383,6 +479,67 @@ enum FleetAction {
         /// Decrypt an end-to-end encrypted fleet overlay bundle using the repo's local keypair
         #[arg(long)]
         encrypted: bool,
+    },
+    /// Live end-to-end encrypted cross-machine sync ("Dropbox for Devs") via `gitx-server`
+    Sync {
+        /// Configured remote name (defaults to 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+        /// Direct remote URL (e.g. http://127.0.0.1:7878/owner/repo)
+        #[arg(long)]
+        url: Option<String>,
+        /// Comma-separated glob patterns to include
+        #[arg(long, default_value = ".env,.env.local")]
+        include: String,
+        /// Source machine identifier
+        #[arg(long)]
+        machine: Option<String>,
+        /// Push local encrypted overlay bundle to remote
+        #[arg(long)]
+        push: bool,
+        /// Pull and decrypt remote overlay bundle onto local workspace
+        #[arg(long)]
+        pull: bool,
+        /// Authentication token override
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// Mint a signed `gitx1h.*` bearer token using the server's signing secret
+    Mint {
+        /// Shared signing secret matching `gitx serve --signing-secret`
+        #[arg(long)]
+        secret: String,
+        /// Principal user ID (`sub`)
+        #[arg(long)]
+        user: String,
+        /// Comma-separated teams (e.g. `core,security`)
+        #[arg(long)]
+        teams: Option<String>,
+        /// Comma-separated roles (e.g. `admin`)
+        #[arg(long)]
+        roles: Option<String>,
+        /// Optional expiration TTL in seconds
+        #[arg(long)]
+        ttl_secs: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MirrorAction {
+    /// Push ACL-filtered projection to a Git remote and pull upstream public commits back
+    Sync {
+        /// Target Git remote URL or bare repository path
+        remote: String,
+        /// Comma-separated visibility domains to mirror (default: public)
+        #[arg(long, default_value = "public")]
+        domains: String,
+        /// Branch name to mirror
+        #[arg(long, default_value = "master")]
+        branch: String,
     },
 }
 
@@ -587,10 +744,14 @@ fn main() -> Result<()> {
             StackAction::List => commands::stack::cmd_stack_list(),
             StackAction::Sync => commands::stack::cmd_stack_sync(),
         },
+        Commands::Squash { message } => commands::stack::cmd_squash(message),
+        Commands::Split { paths, message } => commands::stack::cmd_split(paths, message),
+        Commands::Rebase { onto } => commands::stack::cmd_rebase(onto),
         Commands::Land { target } => commands::stack::cmd_land(target),
         Commands::Revert { land_seq } => commands::stack::cmd_revert(land_seq),
         Commands::Op { action } => match action {
             OpAction::Log { limit } => commands::stack::cmd_op_log(limit),
+            OpAction::Restore { op_id } => commands::stack::cmd_op_restore(op_id),
         },
         Commands::Undo => commands::stack::cmd_undo(),
         Commands::Ws { action } => match action {
@@ -599,7 +760,9 @@ fn main() -> Result<()> {
                 path,
                 mem,
                 lazy,
-            } => commands::workspace::cmd_ws_add(name, path, mem, lazy),
+                from_remote,
+                share,
+            } => commands::workspace::cmd_ws_add(name, path, mem, lazy, from_remote, share),
             WsAction::List => commands::workspace::cmd_ws_list(),
             WsAction::Rm { name } => commands::workspace::cmd_ws_rm(name),
             WsAction::Mount {
@@ -618,6 +781,15 @@ fn main() -> Result<()> {
             }
             SecretAction::Rotate { path, domain, drop } => {
                 commands::security::cmd_secret_rotate(path, domain, drop)
+            }
+            SecretAction::ImportSsh {
+                path,
+                pub_key,
+                name,
+            } => commands::security::cmd_secret_import_ssh(path, pub_key, name),
+            SecretAction::Revoke { target } => commands::security::cmd_secret_revoke(target),
+            SecretAction::RotateReport { target } => {
+                commands::security::cmd_secret_rotate_report(target)
             }
         },
         Commands::Embargo { action } => match action {
@@ -663,8 +835,55 @@ fn main() -> Result<()> {
                 bundle_path,
                 encrypted,
             } => commands::workspace::cmd_fleet_apply(bundle_path, encrypted),
+            FleetAction::Sync {
+                remote,
+                url,
+                include,
+                machine,
+                push,
+                pull,
+                token,
+            } => commands::workspace::cmd_fleet_sync(remote, url, include, machine, push, pull, token),
         },
-        Commands::Serve { addr, data_dir } => commands::serve::cmd_serve(addr, data_dir),
+        Commands::Serve {
+            addr,
+            grpc_addr,
+            data_dir,
+            tokens,
+            signing_secret,
+            strict_auth,
+            object_store,
+            webhook_urls,
+            conflict_resolver_cmd,
+            post_land_cmd,
+        } => commands::serve::cmd_serve(
+            addr,
+            grpc_addr,
+            data_dir,
+            tokens,
+            signing_secret,
+            strict_auth,
+            object_store,
+            webhook_urls,
+            conflict_resolver_cmd,
+            post_land_cmd,
+        ),
+        Commands::Token { action } => match action {
+            TokenAction::Mint {
+                secret,
+                user,
+                teams,
+                roles,
+                ttl_secs,
+            } => commands::serve::cmd_token_mint(secret, user, teams, roles, ttl_secs),
+        },
+        Commands::Mirror { action } => match action {
+            MirrorAction::Sync {
+                remote,
+                domains,
+                branch,
+            } => commands::workspace::cmd_mirror_sync(remote, domains, branch),
+        },
         Commands::Mcp { in_memory } => commands::mcp::cmd_mcp(in_memory),
         Commands::Symbols { path, json } => commands::symbols::cmd_symbols(path, json),
         Commands::Remote { action } => match action {
@@ -723,7 +942,8 @@ fn main() -> Result<()> {
             target,
             message,
             token,
-        } => commands::remote::cmd_push(remote, target, message, token),
+            allow_conflicts,
+        } => commands::remote::cmd_push(remote, target, message, token, allow_conflicts),
         Commands::Pull {
             remote,
             target,

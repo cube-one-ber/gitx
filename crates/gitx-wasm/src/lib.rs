@@ -700,23 +700,29 @@ fn op_land(inst: &mut RepoInstance, req: &Value) -> OpResult {
 
 fn op_diff(inst: &RepoInstance, req: &Value) -> OpResult {
     let ws = workspace_or_default(inst, req);
-    let diff = match req_str(req, &["baseRef", "base_ref"]) {
-        Some(base_ref) if !base_ref.is_empty() => inst
-            .mcp
-            .repo()
-            .diff_against(ws, base_ref)
-            .map_err(InvokeEnvelope::from_gitx_error)?,
-        _ => inst
-            .mcp
-            .repo()
-            .diff(ws)
-            .map_err(InvokeEnvelope::from_gitx_error)?,
+    let base_ref = req_str(req, &["baseRef", "base_ref"]).filter(|s| !s.is_empty());
+    let (diff, entries) = match base_ref {
+        Some(base_ref) => (
+            inst.mcp
+                .repo()
+                .diff_against(ws, base_ref)
+                .map_err(InvokeEnvelope::from_gitx_error)?,
+            inst.mcp
+                .repo()
+                .diff_entries_against(ws, base_ref)
+                .map_err(InvokeEnvelope::from_gitx_error)?,
+        ),
+        None => (
+            inst.mcp
+                .repo()
+                .diff(ws)
+                .map_err(InvokeEnvelope::from_gitx_error)?,
+            inst.mcp
+                .repo()
+                .diff_entries(ws)
+                .map_err(InvokeEnvelope::from_gitx_error)?,
+        ),
     };
-    let entries = inst
-        .mcp
-        .repo()
-        .diff_entries(ws)
-        .map_err(InvokeEnvelope::from_gitx_error)?;
     Ok(json!({
         "workspace": ws,
         "diff": diff,
@@ -791,11 +797,12 @@ fn op_log(inst: &RepoInstance, req: &Value) -> OpResult {
         .map(|cs| {
             let filtered = repo.acl().filter_domain_trees(repo.principal(), &cs);
             let domains: Vec<String> = filtered.keys().map(ToString::to_string).collect();
+            let visible_parents = visible_parent_hashes_wasm(repo, &cs);
             json!({
                 "changesetId": cs.id.to_hex(),
                 "changeId": cs.change_id.to_string(),
                 "publicProjectionHash": cs.public_projection_hash.to_hex(),
-                "parents": cs.parents.iter().map(ObjectHash::to_hex).collect::<Vec<_>>(),
+                "parents": visible_parents.iter().map(ObjectHash::to_hex).collect::<Vec<_>>(),
                 "author": cs.author,
                 "committer": cs.committer,
                 "description": cs.description,
@@ -811,6 +818,35 @@ fn op_log(inst: &RepoInstance, req: &Value) -> OpResult {
         "rev": rev,
         "commits": commits,
     }))
+}
+
+fn visible_parent_hashes_wasm(repo: &AgentRepo, cs: &ChangeSet) -> Vec<ObjectHash> {
+    let mut out = Vec::new();
+    for &parent in &cs.parents {
+        let mut visited = HashSet::new();
+        let mut q = VecDeque::new();
+        q.push_back(parent);
+        while let Some(h) = q.pop_front() {
+            if !visited.insert(h) {
+                continue;
+            }
+            let Ok(p_cs) = repo.get_changeset(h) else {
+                continue;
+            };
+            if repo.acl().can_read_changeset(repo.principal(), &p_cs) {
+                if !out.contains(&p_cs.id) {
+                    out.push(p_cs.id);
+                }
+                break;
+            }
+            for &gp in &p_cs.parents {
+                if !visited.contains(&gp) {
+                    q.push_back(gp);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn op_record_context(inst: &RepoInstance, req: &Value) -> OpResult {

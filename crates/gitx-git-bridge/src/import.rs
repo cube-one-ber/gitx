@@ -233,11 +233,40 @@ fn read_blobs_batch(
         buf
     };
     let writer = std::thread::spawn(move || -> std::io::Result<()> {
-        stdin.write_all(&input_bytes)?;
-        stdin.flush()?;
+        match stdin.write_all(&input_bytes) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(err) => return Err(err),
+        }
+        match stdin.flush() {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(err) => return Err(err),
+        }
         drop(stdin);
         Ok(())
     });
+
+    struct ChildGuard {
+        child: Option<std::process::Child>,
+        writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    }
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.join();
+            }
+        }
+    }
+
+    let mut guard = ChildGuard {
+        child: Some(child),
+        writer: Some(writer),
+    };
 
     let mut reader = BufReader::new(stdout);
     let mut results = HashMap::with_capacity(blob_shas.len());
@@ -274,10 +303,14 @@ fn read_blobs_batch(
         results.insert(expected_sha.clone(), data);
     }
 
-    writer
-        .join()
-        .map_err(|_| GitxError::GitBridge("git cat-file stdin writer thread panicked".into()))??;
+    drop(reader);
+    if let Some(writer) = guard.writer.take() {
+        writer
+            .join()
+            .map_err(|_| GitxError::GitBridge("git cat-file stdin writer thread panicked".into()))??;
+    }
 
+    let child = guard.child.take().expect("child still present");
     let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

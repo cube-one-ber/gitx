@@ -702,3 +702,21 @@ fn live_linux_fuse3_mount_std_fs_read_write_delete_snapshot_unmount() {
     // 4. Clean explicit unmount.
     handle.unmount().expect("clean FUSE3 unmount");
 }
+
+#[test]
+fn loopback_vfs_server_rejects_non_loopback_bind_addr() {
+    let store: Arc<dyn ObjectStore> = Arc::new(CountingStore::new());
+    let base_tree = DomainTree::new(DomainId::public());
+    let tmp = TempDir::new().unwrap();
+    let ws = LazyWorkspace::mount(tmp.path().join("overlay"), Arc::clone(&store), base_tree)
+        .unwrap();
+    let res = LoopbackVfsServer::start("0.0.0.0:0", ws, store);
+    let err = match res {
+        Ok(_) => panic!("expected non-loopback bind address to be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("loopback"),
+        "expected loopback bind rejection, got: {err}"
+    );
+}

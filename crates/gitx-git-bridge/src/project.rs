@@ -52,18 +52,23 @@ fn ensure_git_dir_initialized(target_git_dir: &Path) -> Result<()> {
 }
 
 /// Returns true iff `cs` may be projected under `allowed_domains`.
+///
+/// Active embargoes are NEVER authorized solely by placing `embargo:<advisory>` in the flat
+/// `allowed` set; each active embargo changeset must intersect `allowed` on a non-public
+/// domain listed in that changeset's own `allowed_domains`.
 fn is_changeset_visible(cs: &ChangeSet, allowed: &HashSet<&DomainId>) -> bool {
-    if !allowed.contains(&cs.visibility.primary_domain) {
-        return false;
+    match &cs.visibility.embargo {
+        Some(EmbargoState::Active {
+            allowed_domains, ..
+        }) => allowed_domains
+            .iter()
+            .any(|d| !d.is_public() && allowed.contains(d)),
+        Some(EmbargoState::Published { .. }) => {
+            allowed.contains(&DomainId::public())
+                || allowed.contains(&cs.visibility.primary_domain)
+        }
+        None => allowed.contains(&cs.visibility.primary_domain),
     }
-    if let Some(EmbargoState::Active {
-        allowed_domains, ..
-    }) = &cs.visibility.embargo
-        && !allowed_domains.iter().any(|d| allowed.contains(d))
-    {
-        return false;
-    }
-    true
 }
 
 /// Loads all ChangeSets reachable from `bookmarks` and returns them in topological order
@@ -172,6 +177,25 @@ pub fn export_to_git_repo(
     allowed_domains: &[DomainId],
     bookmarks: &BTreeMap<String, ObjectHash>,
 ) -> Result<ProjectionReport> {
+    let allowed_set: HashSet<&DomainId> = allowed_domains.iter().collect();
+    export_to_git_repo_filtered(store, target_git_dir, allowed_domains, bookmarks, |cs| {
+        is_changeset_visible(cs, &allowed_set)
+    })
+}
+
+/// Projects authorized visibility domains from `store` into `target_git_dir`, using an explicit
+/// per-changeset visibility predicate `can_read_cs` (e.g. `AclPolicy::can_read_changeset`) so
+/// active embargoes are always authorized per-changeset rather than via a flat domain allowlist.
+pub fn export_to_git_repo_filtered<F>(
+    store: &dyn ObjectStore,
+    target_git_dir: &Path,
+    allowed_domains: &[DomainId],
+    bookmarks: &BTreeMap<String, ObjectHash>,
+    mut can_read_cs: F,
+) -> Result<ProjectionReport>
+where
+    F: FnMut(&ChangeSet) -> bool,
+{
     ensure_git_dir_initialized(target_git_dir)?;
 
     let allowed_set: HashSet<&DomainId> = allowed_domains.iter().collect();
@@ -184,6 +208,7 @@ pub fn export_to_git_repo(
     // - If skipped: deduplicated union of parents' effective visible Git commit OIDs
     let mut effective_ancestors: HashMap<ObjectHash, Vec<GitOid>> =
         HashMap::with_capacity(ordered.len());
+    let mut skipped_commit_ids: HashSet<ObjectHash> = HashSet::new();
     // Cache GitX blob manifest ObjectHash -> Git blob GitOid across commits.
     let mut blob_cache: HashMap<ObjectHash, GitOid> = HashMap::new();
 
@@ -200,24 +225,45 @@ pub fn export_to_git_repo(
             }
         }
 
-        if !is_changeset_visible(cs, &allowed_set) {
+        if !can_read_cs(cs) {
             report.skipped_private_commits += 1;
+            skipped_commit_ids.insert(cs.id);
             effective_ancestors.insert(cs.id, visible_parents);
             continue;
         }
 
-        // Merge allowed DomainTrees (public first, then remaining allowed domains in sorted order).
+        // Merge allowed DomainTrees in canonical precedence matching `gitx-server`:
+        // public (0) < team/private/secret (1) < active primary embargo (2).
         let mut merged_files: BTreeMap<String, (FileMode, GitOid)> = BTreeMap::new();
 
         let mut domain_entries: Vec<(&DomainId, &ObjectHash)> = cs.domain_trees.iter().collect();
-        domain_entries.sort_by(|(a, _), (b, _)| match (a.is_public(), b.is_public()) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.cmp(b),
+        domain_entries.sort_by(|(a, _), (b, _)| {
+            let rank = |d: &DomainId| -> u8 {
+                if d.is_public() {
+                    0
+                } else if *d == cs.visibility.primary_domain && d.is_embargo() {
+                    2
+                } else {
+                    1
+                }
+            };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
         });
 
         for (domain_id, &tree_hash) in domain_entries {
-            if !allowed_set.contains(domain_id) {
+            // An `embargo:*` tree is projected ONLY when it is the primary domain of THIS
+            // changeset that already passed `can_read_cs(cs)` — never via a flat allowlist entry.
+            let tree_allowed = if domain_id.is_embargo() {
+                *domain_id == cs.visibility.primary_domain
+                    && matches!(
+                        &cs.visibility.embargo,
+                        Some(EmbargoState::Active { .. }) | Some(EmbargoState::Published { .. })
+                    )
+            } else {
+                allowed_set.contains(domain_id)
+            };
+
+            if !tree_allowed {
                 match store.get_tree(tree_hash) {
                     Ok(tree) => {
                         report.omitted_private_files += tree.entries.len();
@@ -270,8 +316,13 @@ pub fn export_to_git_repo(
     }
 
     // Update refs/heads/<bookmark> for every bookmark that resolves to a visible commit.
+    // Never advertise a non-default bookmark whose tip is an unauthorized/skipped commit
+    // (avoiding leaking embargo or private branch names to unauthorized callers).
     for (bookmark, target_hash) in bookmarks {
         validate_bookmark_name(bookmark)?;
+        if bookmark != "master" && skipped_commit_ids.contains(target_hash) {
+            continue;
+        }
         if let Some(oids) = effective_ancestors.get(target_hash)
             && let Some(&tip_oid) = oids.first()
         {

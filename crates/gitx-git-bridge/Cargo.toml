@@ -8,6 +8,7 @@ license-file.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 gitx-core.workspace = true
+gitx-crypto.workspace = true
 gitx-store.workspace = true
 hex.workspace = true
 serde.workspace = true

@@ -702,3 +702,74 @@ proptest! {
         prop_assert!(!visible.contains_key(&d_priv));
     }
 }
+
+#[test]
+fn openssh_ed25519_import_derives_matching_x25519_and_decrypts_secrets() {
+    use gitx_crypto::{
+        PublicKeyBundle, encode_openssh_ed25519_private, format_openssh_ed25519_pub,
+    };
+
+    let seed = [42u8; 32];
+    let pem = encode_openssh_ed25519_private(&seed, "theo@t3.gg");
+    let kp = UserKeyPair::from_openssh_ed25519(&pem, None).unwrap();
+    assert_eq!(kp.label(), Some("theo@t3.gg"));
+
+    let pub_line = format_openssh_ed25519_pub(&kp.public_bundle().ed25519_public, Some("theo@t3.gg"));
+    let imported_pub = PublicKeyBundle::from_openssh_ed25519_pub(&pub_line).unwrap();
+
+    // Derived X25519 key & fingerprint from `.pub` MUST match the PEM private key identically.
+    assert_eq!(imported_pub.x25519_public, kp.public_bundle().x25519_public);
+    assert_eq!(imported_pub.ed25519_public, kp.public_bundle().ed25519_public);
+    assert_eq!(imported_pub.fingerprint(), kp.fingerprint());
+
+    // Encrypting a `.env` secret to the teammate's OpenSSH `.pub` decrypts with their private key!
+    let domain = DomainId::secret("prod").unwrap();
+    let env = encrypt_secret(&domain, ".env", 1, b"DATABASE_URL=postgres://secret\n", &[imported_pub])
+        .unwrap();
+    let plain = decrypt_secret(&env, ".env", &kp).unwrap();
+    assert_eq!(plain, b"DATABASE_URL=postgres://secret\n");
+
+    // Malformed / wrong-type keys are cleanly rejected.
+    assert!(PublicKeyBundle::from_openssh_ed25519_pub("ssh-rsa AAAA fake").is_err());
+    assert!(UserKeyPair::from_openssh_ed25519("not-a-pem", None).is_err());
+}
+
+#[test]
+fn signed_hmac_and_ed25519_tokens_verify_and_reject_tamper_or_expiry() {
+    use gitx_crypto::{
+        TokenClaims, sign_token_ed25519, sign_token_hmac, verify_token_ed25519, verify_token_hmac,
+    };
+
+    let claims = TokenClaims::new("theo", 1_000)
+        .with_teams(vec!["core".into(), "security".into()])
+        .with_roles(vec!["admin".into()])
+        .with_expires_at(2_000);
+
+    let secret = b"super-secret-signing-key";
+    let hmac_tok = sign_token_hmac(&claims, secret).unwrap();
+    assert!(hmac_tok.starts_with("gitx1h."));
+
+    let principal = verify_token_hmac(&hmac_tok, secret, 1_500).unwrap();
+    assert_eq!(principal.id, "theo");
+    assert_eq!(principal.teams, vec!["core", "security"]);
+    assert_eq!(principal.roles, vec!["admin"]);
+    assert!(!principal.is_anonymous);
+
+    // Expired token rejected.
+    assert!(verify_token_hmac(&hmac_tok, secret, 2_001).is_err());
+    // Wrong secret rejected.
+    assert!(verify_token_hmac(&hmac_tok, b"wrong-secret", 1_500).is_err());
+    // Tampered token rejected.
+    let tampered = format!("{hmac_tok}x");
+    assert!(verify_token_hmac(&tampered, secret, 1_500).is_err());
+
+    // Asymmetric Ed25519 signed token roundtrip.
+    let kp = UserKeyPair::generate_with_label("issuer");
+    let ed_tok = sign_token_ed25519(&claims, &kp).unwrap();
+    assert!(ed_tok.starts_with("gitx1e."));
+    let ed_principal = verify_token_ed25519(&ed_tok, &kp.public_bundle(), 1_500).unwrap();
+    assert_eq!(ed_principal.id, "theo");
+    assert!(verify_token_ed25519(&ed_tok, &kp.public_bundle(), 2_500).is_err());
+    let other_kp = UserKeyPair::generate();
+    assert!(verify_token_ed25519(&ed_tok, &other_kp.public_bundle(), 1_500).is_err());
+}

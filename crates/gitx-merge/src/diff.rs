@@ -171,7 +171,14 @@ where
     match tree.entries.get(path) {
         None => Ok(Vec::new()),
         Some(EntryKind::File { blob_hash, .. }) => read_blob(*blob_hash),
-        Some(EntryKind::EncryptedSecret { envelope_hash, .. }) => read_blob(*envelope_hash),
+        Some(EntryKind::EncryptedSecret {
+            envelope_hash,
+            key_epoch,
+            ..
+        }) => Ok(format!(
+            "[encrypted secret: epoch={key_epoch}, envelope={envelope_hash}]\n"
+        )
+        .into_bytes()),
         Some(EntryKind::Conflict { term, .. }) => materialize_conflict(term, path, read_blob),
     }
 }

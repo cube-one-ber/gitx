@@ -19,6 +19,7 @@ enum AstLanguage {
     TypeScript,
     Tsx,
     JavaScript,
+    Python,
 }
 
 impl AstLanguage {
@@ -36,6 +37,8 @@ impl AstLanguage {
             || ext.eq_ignore_ascii_case("cjs")
         {
             Some(Self::JavaScript)
+        } else if ext.eq_ignore_ascii_case("py") || ext.eq_ignore_ascii_case("pyi") {
+            Some(Self::Python)
         } else {
             None
         }
@@ -47,6 +50,7 @@ impl AstLanguage {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Self::Python => tree_sitter_python::LANGUAGE.into(),
         }
     }
 }
@@ -78,6 +82,9 @@ pub fn extract_ast_symbols(path: &str, source: &str) -> Vec<AstSymbol> {
         AstLanguage::Rust => collect_rust_symbols(root, source, false, &mut symbols),
         AstLanguage::TypeScript | AstLanguage::Tsx | AstLanguage::JavaScript => {
             collect_ts_js_symbols(root, source, &mut symbols);
+        }
+        AstLanguage::Python => {
+            collect_python_symbols(root, source, false, &mut symbols);
         }
     }
     symbols
@@ -594,10 +601,90 @@ fn has_blank_line(gap: &str) -> bool {
     false
 }
 
+fn collect_python_symbols(
+    node: Node<'_>,
+    source: &str,
+    in_class_body: bool,
+    out: &mut Vec<AstSymbol>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        let (line_start, line_end) = node_lines(child);
+        match child.kind() {
+            "function_definition" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    out.push(AstSymbol {
+                        name: node_text(name_node, source).to_string(),
+                        kind: if in_class_body {
+                            "method".to_string()
+                        } else {
+                            "fn".to_string()
+                        },
+                        line_start,
+                        line_end,
+                    });
+                }
+            }
+            "class_definition" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    out.push(AstSymbol {
+                        name: node_text(name_node, source).to_string(),
+                        kind: "class".to_string(),
+                        line_start,
+                        line_end,
+                    });
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_python_symbols(body, source, true, out);
+                }
+            }
+            "decorated_definition" => {
+                if let Some(def) = child.child_by_field_name("definition") {
+                    match def.kind() {
+                        "function_definition" => {
+                            if let Some(name_node) = def.child_by_field_name("name") {
+                                out.push(AstSymbol {
+                                    name: node_text(name_node, source).to_string(),
+                                    kind: if in_class_body {
+                                        "method".to_string()
+                                    } else {
+                                        "fn".to_string()
+                                    },
+                                    line_start,
+                                    line_end,
+                                });
+                            }
+                        }
+                        "class_definition" => {
+                            if let Some(name_node) = def.child_by_field_name("name") {
+                                out.push(AstSymbol {
+                                    name: node_text(name_node, source).to_string(),
+                                    kind: "class".to_string(),
+                                    line_start,
+                                    line_end,
+                                });
+                            }
+                            if let Some(body) = def.child_by_field_name("body") {
+                                collect_python_symbols(body, source, true, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn is_comment_node(lang: AstLanguage, kind: &str) -> bool {
     match lang {
         AstLanguage::Rust => matches!(kind, "line_comment" | "block_comment"),
         AstLanguage::TypeScript | AstLanguage::Tsx | AstLanguage::JavaScript => kind == "comment",
+        AstLanguage::Python => kind == "comment",
     }
 }
 
@@ -614,6 +701,9 @@ fn is_file_preamble_node(lang: AstLanguage, node: Node<'_>, source: &str) -> boo
         AstLanguage::TypeScript | AstLanguage::Tsx | AstLanguage::JavaScript => {
             node.kind() == "hash_bang_line"
         }
+        AstLanguage::Python => {
+            node.kind() == "comment" && node_text(node, source).starts_with("#!")
+        }
     }
 }
 
@@ -623,6 +713,7 @@ fn is_leading_trivia(lang: AstLanguage, kind: &str) -> bool {
         AstLanguage::TypeScript | AstLanguage::Tsx | AstLanguage::JavaScript => {
             matches!(kind, "comment" | "decorator")
         }
+        AstLanguage::Python => kind == "comment",
     }
 }
 
@@ -645,6 +736,7 @@ fn is_sticky_trivia(lang: AstLanguage, node: Node<'_>, source: &str) -> bool {
             "comment" => node_text(node, source).starts_with("/**"),
             _ => false,
         },
+        AstLanguage::Python => false,
     }
 }
 
@@ -654,6 +746,67 @@ fn extract_item_key(lang: AstLanguage, node: Node<'_>, source: &str) -> Option<(
         AstLanguage::TypeScript | AstLanguage::Tsx | AstLanguage::JavaScript => {
             extract_ts_js_item_key(node, source)
         }
+        AstLanguage::Python => extract_python_item_key(node, source),
+    }
+}
+
+fn extract_python_item_key(node: Node<'_>, source: &str) -> Option<(ItemKey, bool)> {
+    match node.kind() {
+        "import_statement" | "import_from_statement" | "future_import_statement" => Some((
+            ItemKey {
+                kind: "import".to_string(),
+                name: normalize_ws(node_text(node, source)),
+            },
+            true,
+        )),
+        "function_definition" => named_key(node, source, "fn", true),
+        "class_definition" => named_key(node, source, "class", true),
+        "decorated_definition" => {
+            if let Some(def) = node.child_by_field_name("definition") {
+                extract_python_item_key(def, source)
+            } else {
+                Some((
+                    ItemKey {
+                        kind: "py:decorated".to_string(),
+                        name: normalize_ws(node_text(node, source)),
+                    },
+                    true,
+                ))
+            }
+        }
+        "expression_statement" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "assignment"
+                    && let Some(left) = child.child_by_field_name("left")
+                {
+                    let name = normalize_ws(node_text(left, source));
+                    if !name.is_empty() {
+                        return Some((
+                            ItemKey {
+                                kind: "assign".to_string(),
+                                name,
+                            },
+                            true,
+                        ));
+                    }
+                }
+            }
+            Some((
+                ItemKey {
+                    kind: "py:expr".to_string(),
+                    name: normalize_ws(node_text(node, source)),
+                },
+                false,
+            ))
+        }
+        kind => Some((
+            ItemKey {
+                kind: format!("py:{kind}"),
+                name: normalize_ws(node_text(node, source)),
+            },
+            false,
+        )),
     }
 }
 

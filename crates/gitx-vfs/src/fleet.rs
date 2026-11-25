@@ -185,6 +185,7 @@ pub fn apply_overlay(root: &Path, bundle: &FleetOverlayBundle) -> Result<Vec<Str
 
     // Validate all entries before mutating the target directory.
     let mut validated = Vec::with_capacity(bundle.files.len());
+    let mut symlink_paths = std::collections::BTreeSet::new();
     for (key, file) in &bundle.files {
         let norm_key = normalize_rel_path(key)?;
         let norm_path = normalize_rel_path(&file.path)?;
@@ -205,11 +206,26 @@ pub fn apply_overlay(root: &Path, bundle: &FleetOverlayBundle) -> Result<Vec<Str
                 file.content_hash, actual_hash
             )));
         }
+        if file.mode == FileMode::Symlink {
+            symlink_paths.insert(norm_path.clone());
+        }
         validated.push((norm_path, file));
+    }
+
+    for (rel_path, _) in &validated {
+        for prefix in crate::cow::ancestor_rel_paths(rel_path) {
+            if symlink_paths.contains(&prefix) {
+                return Err(GitxError::Workspace(format!(
+                    "overlay bundle cannot restore '{rel_path}' beneath symlink ancestor '{prefix}'"
+                )));
+            }
+        }
+        crate::cow::ensure_no_symlink_ancestors(root, rel_path)?;
     }
 
     let mut restored = Vec::with_capacity(validated.len());
     for (rel_path, file) in validated {
+        crate::cow::ensure_no_symlink_ancestors(root, &rel_path)?;
         let dest = root.join(&rel_path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;

@@ -525,7 +525,9 @@ impl AclPolicy {
                 if principal.is_anonymous {
                     return false;
                 }
-                if self.can_read_domain(principal, &cs.visibility.primary_domain) {
+                if !cs.visibility.primary_domain.is_public()
+                    && self.can_read_domain(principal, &cs.visibility.primary_domain)
+                {
                     return true;
                 }
                 allowed_domains
@@ -586,14 +588,12 @@ fn is_private_owner(principal: &Principal, domain: &DomainId) -> bool {
 }
 
 fn normalize_path(path: &str) -> String {
-    let mut s = path.replace('\\', "/");
-    while let Some(stripped) = s.strip_prefix("./") {
-        s = stripped.to_string();
-    }
-    while let Some(stripped) = s.strip_prefix('/') {
-        s = stripped.to_string();
-    }
-    s
+    let replaced = path.replace('\\', "/");
+    let parts: Vec<&str> = replaced
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect();
+    parts.join("/")
 }
 
 fn strip_comment(line: &str) -> &str {
