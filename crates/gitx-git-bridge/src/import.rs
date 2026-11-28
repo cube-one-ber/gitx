@@ -155,6 +155,17 @@ fn load_commits_topo_order(
         if loaded.contains_key(&oid) {
             continue;
         }
+        // Gracefully stop traversal at shallow clone boundaries where parent commits are absent.
+        if oid != head_oid
+            && repo
+                .try_find_object(oid)
+                .map_err(|e| {
+                    GitxError::GitBridge(format!("gitoxide failed to probe commit {oid}: {e}"))
+                })?
+                .is_none()
+        {
+            continue;
+        }
         let meta = parse_commit_with_gix(repo, oid)?;
         for &p in &meta.parents {
             if !loaded.contains_key(&p) {
