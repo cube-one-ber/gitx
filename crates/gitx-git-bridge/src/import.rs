@@ -142,11 +142,16 @@ fn collect_tree_entries_gix(
     Ok(())
 }
 
-/// Topologically sort all commits reachable from `head_oid` (parents strictly before children).
+/// Topologically sort commits reachable from `head_oid` (parents strictly before children).
+/// When `max_commits` is `Some(limit)`, stops collecting once `limit` newest commits have been
+/// loaded (useful for fast colocated initialization on huge existing Git repositories while
+/// preserving full history inside `.git`).
 fn load_commits_topo_order(
     repo: &gix::Repository,
     head_oid: gix::ObjectId,
+    max_commits: Option<usize>,
 ) -> Result<Vec<ParsedCommitMeta>> {
+    let limit = max_commits.map(|n| n.max(1));
     let mut loaded: HashMap<gix::ObjectId, ParsedCommitMeta> = HashMap::new();
     let mut queue: VecDeque<gix::ObjectId> = VecDeque::new();
     queue.push_back(head_oid);
@@ -154,6 +159,11 @@ fn load_commits_topo_order(
     while let Some(oid) = queue.pop_front() {
         if loaded.contains_key(&oid) {
             continue;
+        }
+        if let Some(max) = limit
+            && loaded.len() >= max
+        {
+            break;
         }
         // Gracefully stop traversal at shallow clone boundaries where parent commits are absent.
         if oid != head_oid
@@ -167,9 +177,11 @@ fn load_commits_topo_order(
             continue;
         }
         let meta = parse_commit_with_gix(repo, oid)?;
-        for &p in &meta.parents {
-            if !loaded.contains_key(&p) {
-                queue.push_back(p);
+        if limit.is_none_or(|max| loaded.len() + 1 < max) {
+            for &p in &meta.parents {
+                if !loaded.contains_key(&p) {
+                    queue.push_back(p);
+                }
             }
         }
         loaded.insert(oid, meta);
@@ -230,6 +242,17 @@ pub fn import_from_git_repo(
     store: &dyn ObjectStore,
     target_domain: DomainId,
 ) -> Result<ImportReport> {
+    import_from_git_repo_with_depth(git_worktree, store, target_domain, None)
+}
+
+/// Imports up to `max_commits` most recent commits from an existing Git repository into `store`.
+/// When `max_commits` is `None`, imports all commits reachable from `HEAD`.
+pub fn import_from_git_repo_with_depth(
+    git_worktree: &Path,
+    store: &dyn ObjectStore,
+    target_domain: DomainId,
+    max_commits: Option<usize>,
+) -> Result<ImportReport> {
     let repo = gix::open(git_worktree).map_err(|e| {
         GitxError::GitBridge(format!(
             "gitoxide failed to open repository '{}': {e}",
@@ -269,7 +292,7 @@ pub fn import_from_git_repo(
     };
     let head_oid = head_commit.id().detach();
 
-    let commits = load_commits_topo_order(&repo, head_oid)?;
+    let commits = load_commits_topo_order(&repo, head_oid, max_commits)?;
 
     let mut git_to_gitx: HashMap<gix::ObjectId, ObjectHash> = HashMap::with_capacity(commits.len());
     let mut git_to_pub_proj: HashMap<gix::ObjectId, ObjectHash> =

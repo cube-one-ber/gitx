@@ -23,6 +23,9 @@ enum Commands {
         /// Import history from an existing colocated .git repository
         #[arg(long)]
         colocate: bool,
+        /// Limit how many recent Git commits to import during --colocate (full history remains in .git)
+        #[arg(long)]
+        depth: Option<usize>,
         /// Author name for commits
         #[arg(long)]
         name: Option<String>,
@@ -781,9 +784,10 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init {
             colocate,
+            depth,
             name,
             email,
-        } => commands::core::cmd_init(colocate, name, email),
+        } => commands::core::cmd_init(colocate, depth, name, email),
         Commands::Status => commands::core::cmd_status(),
         Commands::Diff {
             interdiff,

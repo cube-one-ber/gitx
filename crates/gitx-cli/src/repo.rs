@@ -9,7 +9,7 @@ use gitx_crypto::{
     AclPolicy, PublicKeyBundle, SecretAuditLog, SecretEnvelope, SecretFinding, SecretKeyBundle,
     UserKeyPair, decrypt_secret, encrypt_secret, scan_content,
 };
-use gitx_git_bridge::{GitOid, export_to_git_repo_colocated, import_from_git_repo};
+use gitx_git_bridge::{GitOid, export_to_git_repo_colocated, import_from_git_repo_with_depth};
 use gitx_merge::{materialize_conflict, merge_domain_trees};
 use gitx_store::{LocalStore, ObjectStore};
 use gitx_vfs::{CowWorkspace, WorkspaceBackend, WorkspaceBackendKind};
@@ -84,6 +84,7 @@ impl Repo {
     pub fn init(
         root: &Path,
         colocate: bool,
+        depth: Option<usize>,
         author_name: Option<String>,
         author_email: Option<String>,
     ) -> Result<InitSummary> {
@@ -159,7 +160,12 @@ impl Repo {
 
         let mut imported_commits = None;
         let master_cs = if is_colocated {
-            let report = import_from_git_repo(&root, repo.store.as_ref(), DomainId::public())?;
+            let report = import_from_git_repo_with_depth(
+                &root,
+                repo.store.as_ref(),
+                DomainId::public(),
+                depth,
+            )?;
             imported_commits = Some(report.imported_commits);
             let detected_branch = if !report.branch.is_empty() && report.branch != "HEAD" {
                 report.branch.clone()

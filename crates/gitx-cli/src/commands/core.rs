@@ -9,9 +9,14 @@ use gitx_store::ObjectStore;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::env;
 
-pub fn cmd_init(colocate: bool, name: Option<String>, email: Option<String>) -> Result<()> {
+pub fn cmd_init(
+    colocate: bool,
+    depth: Option<usize>,
+    name: Option<String>,
+    email: Option<String>,
+) -> Result<()> {
     let cwd = env::current_dir()?;
-    let summary = Repo::init(&cwd, colocate, name, email)?;
+    let summary = Repo::init(&cwd, colocate, depth, name, email)?;
     println!("Initialized gitx repository at {}", summary.root.display());
     println!("  master:    {}", summary.master_hash.short());
     println!(

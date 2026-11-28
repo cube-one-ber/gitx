@@ -17,7 +17,7 @@ pub mod pktline;
 pub mod project;
 pub mod ssh;
 
-pub use import::{ImportReport, import_from_git_repo};
+pub use import::{ImportReport, import_from_git_repo, import_from_git_repo_with_depth};
 pub use objects::{
     GitCommitParams, GitOid, GitSignature, build_commit_payload, hash_git_object,
     read_loose_object, write_commit_object, write_loose_object, write_tree_from_files,
