@@ -9,7 +9,7 @@ use gitx_crypto::{
     AclPolicy, PublicKeyBundle, SecretAuditLog, SecretEnvelope, SecretFinding, SecretKeyBundle,
     UserKeyPair, decrypt_secret, encrypt_secret, scan_content,
 };
-use gitx_git_bridge::{export_to_git_repo, import_from_git_repo};
+use gitx_git_bridge::{GitOid, export_to_git_repo_colocated, import_from_git_repo};
 use gitx_merge::{materialize_conflict, merge_domain_trees};
 use gitx_store::{LocalStore, ObjectStore};
 use gitx_vfs::{CowWorkspace, WorkspaceBackend, WorkspaceBackendKind};
@@ -133,7 +133,7 @@ impl Repo {
         };
 
         let is_colocated = colocate && root.join(".git").exists();
-        let config = RepoConfig {
+        let mut config = RepoConfig {
             author: author.clone(),
             default_branch: "master".to_string(),
             active_workspace: "default".to_string(),
@@ -149,20 +149,42 @@ impl Repo {
         let store = Arc::new(LocalStore::open(&store_dir)?);
         let context = ContextStore::open(gitx_dir.join("context.db"))?;
 
-        let repo = Self {
+        let mut repo = Self {
             root: root.clone(),
             gitx_dir: gitx_dir.clone(),
             store,
             context,
-            config,
+            config: config.clone(),
         };
 
         let mut imported_commits = None;
-        let master_cs = if colocate && root.join(".git").exists() {
+        let master_cs = if is_colocated {
             let report = import_from_git_repo(&root, repo.store.as_ref(), DomainId::public())?;
             imported_commits = Some(report.imported_commits);
+            let detected_branch = if !report.branch.is_empty() && report.branch != "HEAD" {
+                report.branch.clone()
+            } else if root
+                .join(".git")
+                .join("refs")
+                .join("heads")
+                .join("main")
+                .is_file()
+            {
+                "main".to_string()
+            } else {
+                "master".to_string()
+            };
+            config.default_branch = detected_branch.clone();
+            repo.config.default_branch = detected_branch.clone();
+            save_json_file(&gitx_dir.join("config.json"), &config)?;
+
+            if !report.commit_oid_map.is_empty() {
+                repo.save_git_oid_map(&report.commit_oid_map)?;
+            }
+            ensure_colocated_git_excludes(&root);
+
             if let Some(imported_head) = report.head_changeset {
-                repo.store.set_bookmark("master", imported_head)?;
+                repo.store.set_bookmark(&detected_branch, imported_head)?;
                 repo.store.get_changeset(imported_head)?
             } else {
                 repo.create_initial_root_changeset(&author)?
@@ -234,7 +256,8 @@ impl Repo {
             .description("Initial commit")
             .build();
         self.store.put_changeset(&root_cs)?;
-        self.store.set_bookmark("master", root_cs.id)?;
+        self.store
+            .set_bookmark(&self.config.default_branch, root_cs.id)?;
         Ok(root_cs)
     }
 
@@ -557,7 +580,7 @@ impl Repo {
         cow: &CowWorkspace,
         acl: &AclPolicy,
     ) -> Result<PartitionedWorkspaceScan> {
-        let files = cow.scan_files()?;
+        let files = cow.scan_files_allowing(|p| acl.domain_for_path(p).is_secret())?;
         let mut plain_trees: BTreeMap<DomainId, DomainTree> = BTreeMap::new();
         let mut secret_entries: BTreeMap<DomainId, SecretDomainEntries> = BTreeMap::new();
 
@@ -737,6 +760,13 @@ impl Repo {
         let workspaces = self.store.list_workspaces()?;
         let change_heads = self.collect_change_heads()?;
 
+        let should_sync_git = matches!(
+            kind,
+            OpKind::Land { .. }
+                | OpKind::Revert { .. }
+                | OpKind::Undo { .. }
+                | OpKind::EmbargoPublish { .. }
+        );
         let entry = OpLogEntry {
             id: OpId::new(),
             parent,
@@ -748,13 +778,39 @@ impl Repo {
             change_heads,
         };
         self.store.append_op(&entry)?;
-        self.sync_colocated_git_if_enabled();
+        if should_sync_git {
+            self.sync_colocated_git_if_enabled();
+        }
         Ok(entry)
+    }
+
+    pub fn load_git_oid_map(&self) -> BTreeMap<ObjectHash, GitOid> {
+        let path = self.gitx_dir.join("git-oid-map.json");
+        if !path.is_file() {
+            return BTreeMap::new();
+        }
+        let raw: BTreeMap<String, String> = load_json_file(&path).unwrap_or_default();
+        let mut map = BTreeMap::new();
+        for (cs_hex, oid_hex) in raw {
+            if let (Ok(cs_hash), Ok(git_oid)) =
+                (ObjectHash::from_str(&cs_hex), GitOid::from_hex(&oid_hex))
+            {
+                map.insert(cs_hash, git_oid);
+            }
+        }
+        map
+    }
+
+    pub fn save_git_oid_map(&self, map: &BTreeMap<ObjectHash, GitOid>) -> Result<()> {
+        let raw: BTreeMap<String, String> =
+            map.iter().map(|(k, v)| (k.to_hex(), v.to_hex())).collect();
+        save_json_file(&self.gitx_dir.join("git-oid-map.json"), &raw)
     }
 
     /// When initialized with `--colocate`, continuously keep the colocated `.git` directory
     /// synchronized with the `public` domain projection of GitX bookmarks (never exporting
-    /// private domains, encrypted `.env` secrets, or active embargoes).
+    /// private domains, encrypted `.env` secrets, or active embargoes, and preserving exact
+    /// original Git commit SHA-1 hashes so GitHub pushes remain fast-forward compatible).
     pub fn sync_colocated_git_if_enabled(&self) {
         if !self.config.colocated {
             return;
@@ -769,12 +825,18 @@ impl Repo {
         if bookmarks.is_empty() {
             return;
         }
-        let _ = export_to_git_repo(
+        let mut oid_map = self.load_git_oid_map();
+        if let Ok(report) = export_to_git_repo_colocated(
             self.store.as_ref(),
             &git_dir,
             &[DomainId::public()],
             &bookmarks,
-        );
+            &oid_map,
+        ) && !report.exported_oid_map.is_empty()
+        {
+            oid_map.extend(report.exported_oid_map);
+            let _ = self.save_git_oid_map(&oid_map);
+        }
     }
 
     fn collect_change_heads(&self) -> Result<BTreeMap<ChangeId, ObjectHash>> {
@@ -958,6 +1020,38 @@ impl Repo {
         out.reverse();
         Ok(out)
     }
+}
+
+pub fn ensure_colocated_git_excludes(root: &Path) {
+    let git_dir = root.join(".git");
+    if !git_dir.is_dir() {
+        return;
+    }
+    let info_dir = git_dir.join("info");
+    if fs::create_dir_all(&info_dir).is_err() {
+        return;
+    }
+    let exclude_path = info_dir.join("exclude");
+    let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+    let existing_lines: HashSet<&str> = existing.lines().map(str::trim).collect();
+    let mut additions = Vec::new();
+    for entry in [".gitx/", ".gitxacl"] {
+        if !existing_lines.contains(entry) {
+            additions.push(entry);
+        }
+    }
+    if additions.is_empty() {
+        return;
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for entry in additions {
+        updated.push_str(entry);
+        updated.push('\n');
+    }
+    let _ = fs::write(&exclude_path, updated);
 }
 
 pub fn save_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {

@@ -1399,6 +1399,7 @@ fn import_received_refs_internal(
         imported_commits,
         head_changeset,
         branch: last_branch,
+        commit_oid_map: BTreeMap::new(),
     })
 }
 

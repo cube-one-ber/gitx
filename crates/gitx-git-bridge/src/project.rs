@@ -21,6 +21,8 @@ pub struct ProjectionReport {
     pub skipped_private_commits: usize,
     pub omitted_private_files: usize,
     pub ref_map: BTreeMap<String, GitOid>,
+    #[serde(default)]
+    pub exported_oid_map: BTreeMap<ObjectHash, GitOid>,
 }
 
 /// Initializes a minimal valid Git directory layout if not already present.
@@ -179,6 +181,28 @@ pub fn export_to_git_repo(
     })
 }
 
+/// Projects ONLY authorized visibility domains from `store` into a colocated `.git` directory,
+/// reusing exact original Git commit SHA-1 OIDs from `seed_oid_map` for previously imported
+/// commits so GitHub remotes remain fast-forward compatible and preserving an existing `.git/HEAD`.
+pub fn export_to_git_repo_colocated(
+    store: &dyn ObjectStore,
+    target_git_dir: &Path,
+    allowed_domains: &[DomainId],
+    bookmarks: &BTreeMap<String, ObjectHash>,
+    seed_oid_map: &BTreeMap<ObjectHash, GitOid>,
+) -> Result<ProjectionReport> {
+    let allowed_set: HashSet<&DomainId> = allowed_domains.iter().collect();
+    export_to_git_repo_filtered_impl(
+        store,
+        target_git_dir,
+        allowed_domains,
+        bookmarks,
+        seed_oid_map,
+        true,
+        |cs| is_changeset_visible(cs, &allowed_set),
+    )
+}
+
 /// Projects authorized visibility domains from `store` into `target_git_dir`, using an explicit
 /// per-changeset visibility predicate `can_read_cs` (e.g. `AclPolicy::can_read_changeset`) so
 /// active embargoes are always authorized per-changeset rather than via a flat domain allowlist.
@@ -187,6 +211,30 @@ pub fn export_to_git_repo_filtered<F>(
     target_git_dir: &Path,
     allowed_domains: &[DomainId],
     bookmarks: &BTreeMap<String, ObjectHash>,
+    can_read_cs: F,
+) -> Result<ProjectionReport>
+where
+    F: FnMut(&ChangeSet) -> bool,
+{
+    let empty_seed = BTreeMap::new();
+    export_to_git_repo_filtered_impl(
+        store,
+        target_git_dir,
+        allowed_domains,
+        bookmarks,
+        &empty_seed,
+        false,
+        can_read_cs,
+    )
+}
+
+fn export_to_git_repo_filtered_impl<F>(
+    store: &dyn ObjectStore,
+    target_git_dir: &Path,
+    allowed_domains: &[DomainId],
+    bookmarks: &BTreeMap<String, ObjectHash>,
+    seed_oid_map: &BTreeMap<ObjectHash, GitOid>,
+    preserve_head: bool,
     mut can_read_cs: F,
 ) -> Result<ProjectionReport>
 where
@@ -225,6 +273,14 @@ where
             report.skipped_private_commits += 1;
             skipped_commit_ids.insert(cs.id);
             effective_ancestors.insert(cs.id, visible_parents);
+            continue;
+        }
+
+        // Reuse the exact original Git commit SHA-1 for commits previously imported from `.git`
+        // so colocated GitHub repositories never rewrite history or diverge from origin.
+        if let Some(&existing_oid) = seed_oid_map.get(&cs.id) {
+            report.exported_oid_map.insert(cs.id, existing_oid);
+            effective_ancestors.insert(cs.id, vec![existing_oid]);
             continue;
         }
 
@@ -308,6 +364,7 @@ where
         )?;
 
         report.exported_commits += 1;
+        report.exported_oid_map.insert(cs.id, commit_oid);
         effective_ancestors.insert(cs.id, vec![commit_oid]);
     }
 
@@ -315,6 +372,9 @@ where
     // Never advertise a non-default bookmark whose tip is an unauthorized/skipped commit
     // (avoiding leaking embargo or private branch names to unauthorized callers).
     for (bookmark, target_hash) in bookmarks {
+        if bookmark == "HEAD" {
+            continue;
+        }
         validate_bookmark_name(bookmark)?;
         if bookmark != "master" && skipped_commit_ids.contains(target_hash) {
             continue;
@@ -331,18 +391,19 @@ where
         }
     }
 
-    // Update HEAD to refs/heads/master if present, else the first exported bookmark.
-    let head_branch = if report.ref_map.contains_key("master") {
-        "master"
-    } else if let Some(first) = report.ref_map.keys().next() {
-        first.as_str()
-    } else {
-        "master"
-    };
-    fs::write(
-        target_git_dir.join("HEAD"),
-        format!("ref: refs/heads/{head_branch}\n"),
-    )?;
+    // Update HEAD to refs/heads/master if present, else the first exported bookmark,
+    // unless preserving an existing colocated `.git/HEAD`.
+    let head_path = target_git_dir.join("HEAD");
+    if !preserve_head || !head_path.exists() {
+        let head_branch = if report.ref_map.contains_key("master") {
+            "master"
+        } else if let Some(first) = report.ref_map.keys().next() {
+            first.as_str()
+        } else {
+            "master"
+        };
+        fs::write(&head_path, format!("ref: refs/heads/{head_branch}\n"))?;
+    }
 
     Ok(report)
 }

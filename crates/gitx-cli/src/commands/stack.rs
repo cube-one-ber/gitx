@@ -170,8 +170,9 @@ pub fn cmd_stack_sync() -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_land(target: String) -> Result<()> {
+pub fn cmd_land(target: Option<String>) -> Result<()> {
     let repo = Repo::open(&env::current_dir()?)?;
+    let target = target.unwrap_or_else(|| repo.config.default_branch.clone());
     let snap = repo.snapshot_working_copy()?;
     let head = snap.changeset;
 

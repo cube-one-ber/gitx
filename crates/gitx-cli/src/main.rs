@@ -116,11 +116,11 @@ enum Commands {
         onto: String,
     },
 
-    /// Atomically land the current ChangeSet onto a target bookmark (default: master)
+    /// Atomically land the current ChangeSet onto a target bookmark (defaults to repository default branch)
     Land {
-        /// Target bookmark to land onto
-        #[arg(long, default_value = "master")]
-        target: String,
+        /// Target bookmark to land onto (defaults to repository default branch)
+        #[arg(long)]
+        target: Option<String>,
     },
 
     /// O(1) atomic revert of a previously landed sequence number

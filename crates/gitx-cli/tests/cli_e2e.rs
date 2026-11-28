@@ -552,3 +552,134 @@ fn e2e_cli_secrets_never_stored_plaintext_in_cas_and_key_hardening() {
         assert_eq!(mode, 0o600, "local.json must have 0600 permissions");
     }
 }
+
+#[test]
+fn e2e_colocate_preserves_github_sha_branch_clean_status_and_fast_forward_push() {
+    let tmp = TempDir::new().unwrap();
+    let remote = tmp.path().join("remote.git");
+    let local = tmp.path().join("repo");
+    fs::create_dir_all(&remote).unwrap();
+    fs::create_dir_all(&local).unwrap();
+
+    run_git_ok(&remote, &["init", "--bare", "-b", "main"]);
+    run_git_ok(&local, &["init", "-b", "main"]);
+    run_git_ok(&local, &["config", "user.name", "Remy"]);
+    run_git_ok(&local, &["config", "user.email", "remy@example.com"]);
+    fs::write(local.join("README.md"), "# Hello GitHub\n").unwrap();
+    fs::write(local.join(".gitignore"), "build/\n.env\n").unwrap();
+    run_git_ok(&local, &["add", "README.md", ".gitignore"]);
+    run_git_ok(&local, &["commit", "-m", "Initial commit on main"]);
+    run_git_ok(
+        &local,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    run_git_ok(&local, &["push", "-u", "origin", "main"]);
+
+    let original_sha = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    // Create a gitignored build artifact and a secret .env before colocating.
+    fs::create_dir_all(local.join("build")).unwrap();
+    fs::write(local.join("build/huge.bin"), "ignored artifact\n").unwrap();
+
+    gitx_ok(&local, &["init", "--colocate"]);
+
+    // 1. Exact Git HEAD SHA-1 and branch (`main`) must be preserved byte-for-byte.
+    let after_sha = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        after_sha, original_sha,
+        "colocate init must preserve Git HEAD SHA-1"
+    );
+
+    let after_branch = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        after_branch, "main",
+        "colocate init must preserve checked-out branch"
+    );
+
+    // 2. Working tree must stay clean in `git status` (`.gitx/` and `.gitxacl` excluded locally).
+    let git_status = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&local)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .to_string();
+    assert!(
+        git_status.trim().is_empty(),
+        "expected clean git status after colocate init, got:\n{git_status}"
+    );
+
+    // 3. Land a new GitX change (with a gitignored `.env` secret) and verify fast-forward git push!
+    fs::write(local.join("feature.txt"), "new feature\n").unwrap();
+    fs::write(local.join(".env"), "API_KEY=super_secret_123\n").unwrap();
+    gitx_ok(&local, &["describe", "-m", "Add feature via GitX"]);
+    gitx_ok(&local, &["land"]);
+
+    // Parent of new Git HEAD must be the exact original GitHub SHA-1.
+    let parent_sha = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD^"])
+            .current_dir(&local)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        parent_sha, original_sha,
+        "landed GitX commit must fast-forward directly on top of original GitHub SHA-1"
+    );
+
+    // Fast-forward push to origin/main without --force succeeds!
+    run_git_ok(&local, &["push", "origin", "main"]);
+
+    // Verify neither `.env` nor `build/huge.bin` was exported into `.git`!
+    let ls_tree = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .to_string();
+    assert!(ls_tree.contains("feature.txt"), "got:\n{ls_tree}");
+    assert!(
+        !ls_tree.contains(".env"),
+        ".env must never leak to Git:\n{ls_tree}"
+    );
+    assert!(
+        !ls_tree.contains("build/huge.bin"),
+        "gitignored build/ must not be exported:\n{ls_tree}"
+    );
+}

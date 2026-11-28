@@ -3,6 +3,7 @@
 //! Reads loose objects, packfiles, delta chains, refs, commits, trees, and blobs directly
 //! from `.git` without spawning any `git` CLI subprocesses.
 
+use crate::objects::GitOid;
 use chrono::{DateTime, Utc};
 use gitx_core::{
     Actor, ChangeSetBuilder, DomainId, DomainTree, EntryKind, FileMode, GitxError, Identity,
@@ -11,7 +12,7 @@ use gitx_core::{
 use gitx_store::ObjectStore;
 use gix::bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// Summary of an import from an existing Git repository into `gitx-store`.
@@ -20,6 +21,8 @@ pub struct ImportReport {
     pub imported_commits: usize,
     pub head_changeset: Option<ObjectHash>,
     pub branch: String,
+    #[serde(default)]
+    pub commit_oid_map: BTreeMap<ObjectHash, GitOid>,
 }
 
 struct ParsedCommitMeta {
@@ -238,6 +241,7 @@ pub fn import_from_git_repo(
             imported_commits: 0,
             head_changeset: None,
             branch,
+            commit_oid_map: BTreeMap::new(),
         });
     }
 
@@ -248,6 +252,7 @@ pub fn import_from_git_repo(
                 imported_commits: 0,
                 head_changeset: None,
                 branch,
+                commit_oid_map: BTreeMap::new(),
             });
         }
     };
@@ -258,6 +263,7 @@ pub fn import_from_git_repo(
     let mut git_to_gitx: HashMap<gix::ObjectId, ObjectHash> = HashMap::with_capacity(commits.len());
     let mut git_to_pub_proj: HashMap<gix::ObjectId, ObjectHash> =
         HashMap::with_capacity(commits.len());
+    let mut commit_oid_map: BTreeMap<ObjectHash, GitOid> = BTreeMap::new();
     let mut blob_cache: HashMap<gix::ObjectId, (ObjectHash, u64)> = HashMap::new();
     let mut head_changeset: Option<ObjectHash> = None;
 
@@ -328,10 +334,15 @@ pub fn import_from_git_repo(
         let cs_id = store.put_changeset(&cs)?;
         git_to_gitx.insert(meta.oid, cs_id);
         git_to_pub_proj.insert(meta.oid, cs.public_projection_hash);
+        if let Ok(git_oid) = GitOid::from_hex(&meta.oid.to_string()) {
+            commit_oid_map.insert(cs_id, git_oid);
+        }
         head_changeset = Some(cs_id);
     }
 
-    if let Some(head_id) = head_changeset {
+    if let Some(head_id) = head_changeset
+        && branch != "HEAD"
+    {
         store.set_bookmark(&branch, head_id)?;
     }
 
@@ -339,5 +350,6 @@ pub fn import_from_git_repo(
         imported_commits: commits.len(),
         head_changeset,
         branch,
+        commit_oid_map,
     })
 }

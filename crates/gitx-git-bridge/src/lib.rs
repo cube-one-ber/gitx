@@ -30,7 +30,9 @@ pub use pktline::{
     encode_delim_pkt, encode_flush_pkt, encode_pkt_line, handle_receive_pack_with_protocol,
     handle_upload_pack, handle_upload_pack_with_protocol,
 };
-pub use project::{ProjectionReport, export_to_git_repo, export_to_git_repo_filtered};
+pub use project::{
+    ProjectionReport, export_to_git_repo, export_to_git_repo_colocated, export_to_git_repo_filtered,
+};
 pub use ssh::{
     GitSshService, GitSshSession, ParsedSshCommand, SshSessionReport,
     advertise_ssh_upload_pack_refs, export_receive_pack_staging,

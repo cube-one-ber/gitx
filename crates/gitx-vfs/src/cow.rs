@@ -36,6 +36,18 @@ impl IgnoreMatcher {
         let mut raw_patterns: Vec<String> =
             DEFAULT_IGNORES.iter().map(|s| (*s).to_string()).collect();
 
+        // Honor `.gitignore` before `.gitxignore` so colocated Git repositories never
+        // snapshot gitignored build artifacts while `.gitxignore` still takes precedence.
+        let gitignore_file = root.join(".gitignore");
+        let mut gitignore_patterns = Vec::new();
+        if gitignore_file.is_file()
+            && let Ok(contents) = fs::read_to_string(&gitignore_file)
+        {
+            for line in contents.lines() {
+                gitignore_patterns.push(line.to_string());
+            }
+        }
+
         let ignore_file = root.join(".gitxignore");
         if ignore_file.is_file() {
             let contents = fs::read_to_string(&ignore_file)?;
@@ -47,6 +59,11 @@ impl IgnoreMatcher {
         raw_patterns.extend(extra_patterns.iter().cloned());
 
         let mut rules = Vec::new();
+        for raw in gitignore_patterns {
+            if let Ok(Some(rule)) = Self::parse_rule(&raw) {
+                rules.push(rule);
+            }
+        }
         for raw in raw_patterns {
             if let Some(rule) = Self::parse_rule(&raw)? {
                 rules.push(rule);
@@ -196,7 +213,19 @@ impl CowWorkspace {
 
     /// Scan all non-ignored working files from disk without writing blobs to an `ObjectStore`.
     pub fn scan_files(&self) -> Result<Vec<(String, Vec<u8>, FileMode)>> {
-        self.scan_working_files()
+        self.scan_working_files_with(|_| false)
+    }
+
+    /// Scan working files from disk, allowing files matching `force_include` (such as `.env`
+    /// files routed to `secret:*` domains in `.gitxacl`) even if listed in `.gitignore`.
+    pub fn scan_files_allowing<F>(
+        &self,
+        force_include: F,
+    ) -> Result<Vec<(String, Vec<u8>, FileMode)>>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.scan_working_files_with(force_include)
     }
 
     /// Partition all non-ignored working files cleanly across Visibility Domains using
@@ -263,6 +292,16 @@ impl CowWorkspace {
     }
 
     fn scan_working_files(&self) -> Result<Vec<(String, Vec<u8>, FileMode)>> {
+        self.scan_working_files_with(|_| false)
+    }
+
+    fn scan_working_files_with<F>(
+        &self,
+        force_include: F,
+    ) -> Result<Vec<(String, Vec<u8>, FileMode)>>
+    where
+        F: Fn(&str) -> bool,
+    {
         let matcher = IgnoreMatcher::load(&self.root, &self.extra_ignores)?;
         let mut results = Vec::new();
 
@@ -277,7 +316,14 @@ impl CowWorkspace {
                     return false;
                 };
                 let rel_str = path_to_slash_string(rel);
-                !matcher.is_ignored(&rel_str, entry.file_type().is_dir())
+                if rel_str == ".git" || rel_str == ".gitx" {
+                    return false;
+                }
+                let is_dir = entry.file_type().is_dir();
+                if !is_dir && force_include(&rel_str) {
+                    return true;
+                }
+                !matcher.is_ignored(&rel_str, is_dir)
             });
 
         for entry_res in walker {
