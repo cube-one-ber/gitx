@@ -1,0 +1,36 @@
+# Generate packaging/PKGBUILD and its local source archive with source.sh.
+pkgname=gitx
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Visibility-domain VCS with native secrets, lock-free workspaces, stacked diffs, and GitHub-compatible Git colocation'
+arch=('x86_64')
+url='https://github.com/cube-one-ber/gitx'
+license=('Apache-2.0')
+depends=('gcc-libs' 'glibc')
+optdepends=('fuse3: mount lazy FUSE workspaces with gitx ws mount')
+makedepends=('cargo' 'protobuf' 'pkgconf')
+options=('!lto')
+source=('gitx-source.tar.gz')
+sha256sums=('@SOURCE_SHA256@')
+
+prepare() {
+  cd "$srcdir/gitx"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/gitx"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p gitx-cli
+}
+
+package() {
+  cd "$srcdir/gitx"
+  install -Dm755 target/release/gitx "$pkgdir/usr/bin/gitx"
+  if [[ -f assets/icon.png ]]; then
+    install -Dm644 assets/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/gitx.png"
+  fi
+  install -Dm644 README.md "$pkgdir/usr/share/doc/gitx/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/gitx/LICENSE"
+}

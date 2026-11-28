@@ -3,3 +3,7 @@
 .gitx/
 .DS_Store
 *.swp
+/packaging/*.tar.gz
+/packaging/*.pkg.tar.*
+/packaging/src/
+/packaging/pkg/
